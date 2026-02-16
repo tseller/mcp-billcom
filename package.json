@@ -10,7 +10,7 @@
     "start:http": "MCP_TRANSPORT=http node --env-file=.env dist/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "file:./modelcontextprotocol-sdk-1.26.0.tgz",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {

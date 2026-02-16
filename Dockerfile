@@ -1,6 +1,6 @@
 FROM node:22-alpine AS build
 WORKDIR /app
-COPY package*.json modelcontextprotocol-sdk-1.26.0.tgz ./
+COPY package*.json ./
 RUN npm ci
 COPY tsconfig.json ./
 COPY src/ src/

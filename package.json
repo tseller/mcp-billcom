@@ -1,0 +1,22 @@
+{
+  "name": "mcp-billcom",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "node --env-file=.env dist/index.js",
+    "dev": "node --env-file=.env --import=tsx src/index.ts",
+    "start:http": "MCP_TRANSPORT=http node --env-file=.env dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "file:./modelcontextprotocol-sdk-1.26.0.tgz",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}

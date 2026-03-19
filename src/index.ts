@@ -5,6 +5,8 @@ import { BillComClient } from "./billcom-client.js";
 import { registerVendorTools } from "./tools/vendors.js";
 import { registerBillTools } from "./tools/bills.js";
 import { startHttpServer } from "./http-server.js";
+import { DivvyClient } from "./divvy-client.js";
+import { registerDivvyTools } from "./tools/divvy.js";
 
 // Validate required env vars
 const required = [
@@ -40,6 +42,16 @@ if (process.env.MCP_TRANSPORT === "http") {
   );
   registerVendorTools(server, client);
   registerBillTools(server, client);
+
+  // Divvy (BILL Spend & Expense) tools — only register if token is present
+  const divvyApiToken = process.env.DIVVY_API_TOKEN;
+  if (divvyApiToken) {
+    const divvyClient = new DivvyClient(divvyApiToken);
+    registerDivvyTools(server, divvyClient);
+    console.error("[mcp-billcom] Divvy tools registered");
+  } else {
+    console.error("[mcp-billcom] DIVVY_API_TOKEN not set — Divvy tools skipped");
+  }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

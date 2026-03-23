@@ -27,10 +27,27 @@ gcloud config configurations activate mcp-billcom
 ## Architecture
 
 - **ESM project** using TypeScript with Node16 module resolution
-- `src/index.ts` — entry point: creates McpServer + StdioServerTransport
+- `src/index.ts` — entry point: registers Bill.com and/or QBO tools based on available env vars
 - `src/billcom-client.ts` — Bill.com REST API client with auto session management (30 min refresh + 401 retry)
-- `src/tools/vendors.ts` — list_vendors, get_vendor, create_vendor tools
-- `src/tools/bills.ts` — list_bills, get_bill, create_bill tools
-- SDK: `@modelcontextprotocol/sdk` v1.26.0 from local tarball
+- `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
+- `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
+- `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
+- `src/tools/vendors.ts` — Bill.com: list_vendors, get_vendor, create_vendor
+- `src/tools/bills.ts` — Bill.com: list_bills, get_bill, create_bill
+- `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
+- `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
+- `src/tools/qbo-transactions.ts` — QBO: list/get/update purchases, list deposits, list transfers
+- `src/tools/qbo-reports.ts` — QBO: transaction_report, profit_loss, balance_sheet
+- SDK: `@modelcontextprotocol/sdk` ^1.26.0
 - All logging goes to stderr (stdout is MCP protocol)
-- Env vars: `BILLCOM_API_BASE_URL`, `BILLCOM_USERNAME`, `BILLCOM_PASSWORD`, `BILLCOM_ORGANIZATION_ID`, `BILLCOM_DEV_KEY`
+
+## Environment Variables
+
+### Bill.com (optional — tools enabled if all are set)
+- `BILLCOM_API_BASE_URL`, `BILLCOM_USERNAME`, `BILLCOM_PASSWORD`, `BILLCOM_ORGANIZATION_ID`, `BILLCOM_DEV_KEY`
+
+### QuickBooks Online (optional — tools enabled if all are set)
+- `INTUIT_CLIENT_ID`, `INTUIT_CLIENT_SECRET` — OAuth2 app credentials
+- `QBO_REALM_ID` — QuickBooks company ID (obtained during OAuth authorization)
+- `QBO_REFRESH_TOKEN` — OAuth2 refresh token (rolling: update after each refresh)
+- `QBO_BASE_URL` — optional override (default: production)

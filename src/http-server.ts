@@ -6,11 +6,18 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { BillComConfig } from "./billcom-client.js";
 import { BillComClient } from "./billcom-client.js";
+import type { QboConfig } from "./qbo-client.js";
+import { QboClient } from "./qbo-client.js";
 import { registerVendorTools } from "./tools/vendors.js";
 import { registerBillTools } from "./tools/bills.js";
+import { registerQboAccountTools } from "./tools/qbo-accounts.js";
+import { registerQboVendorTools } from "./tools/qbo-vendors.js";
+import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
+import { registerQboReportTools } from "./tools/qbo-reports.js";
 import { createOAuthRouter, requireAuth } from "./oauth.js";
+// import { createQboAuthRouter } from "./qbo-auth-callback.js";
 
-export function startHttpServer(config: BillComConfig): void {
+export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboConfig): void {
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const serverUrl = process.env.SERVER_URL || `http://localhost:${process.env.PORT || "8080"}`;
@@ -34,6 +41,8 @@ export function startHttpServer(config: BillComConfig): void {
   } else {
     console.error("[http] OAuth disabled (no GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET)");
   }
+
+  // QBO auth routes removed — refresh token obtained 2026-03-23
 
   app.post("/mcp", async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -70,14 +79,25 @@ export function startHttpServer(config: BillComConfig): void {
       console.error(`[http] Session closed: ${sid}`);
     };
 
-    // Create a fresh McpServer + BillComClient for this session
-    const client = new BillComClient(config);
+    // Create a fresh McpServer + clients for this session
     const server = new McpServer(
-      { name: "billcom", version: "0.1.0" },
+      { name: "treasurer-mcp", version: "0.2.0" },
       { capabilities: { tools: {} } },
     );
-    registerVendorTools(server, client);
-    registerBillTools(server, client);
+
+    if (billcomConfig) {
+      const billcomClient = new BillComClient(billcomConfig);
+      registerVendorTools(server, billcomClient);
+      registerBillTools(server, billcomClient);
+    }
+
+    if (qboConfig) {
+      const qboClient = new QboClient(qboConfig);
+      registerQboAccountTools(server, qboClient);
+      registerQboVendorTools(server, qboClient);
+      registerQboTransactionTools(server, qboClient);
+      registerQboReportTools(server, qboClient);
+    }
 
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);

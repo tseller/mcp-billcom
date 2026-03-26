@@ -384,6 +384,15 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   }
 
   const token = authHeader.slice(7);
+
+  // Static API token for trusted agents (bypasses OAuth)
+  const apiToken = process.env.MCP_API_TOKEN;
+  if (apiToken && token === apiToken) {
+    next();
+    return;
+  }
+
+  // OAuth access token
   const stored = accessTokens.get(token);
   if (!stored || Date.now() > stored.expiresAt) {
     res.status(401).json({ error: "Unauthorized" });

@@ -15,7 +15,7 @@ import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
 import { registerQboReportTools } from "./tools/qbo-reports.js";
 import { createOAuthRouter, requireAuth } from "./oauth.js";
-// import { createQboAuthRouter } from "./qbo-auth-callback.js";
+import { createQboAuthRouter } from "./qbo-auth-callback.js";
 
 export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboConfig): void {
   const transports = new Map<string, StreamableHTTPServerTransport>();
@@ -42,7 +42,13 @@ export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboCo
     console.error("[http] OAuth disabled (no GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET)");
   }
 
-  // QBO auth routes removed — refresh token obtained 2026-03-23
+  // QBO auth routes — for re-auth when refresh token expires
+  const intuitClientId = process.env.INTUIT_CLIENT_ID;
+  const intuitClientSecret = process.env.INTUIT_CLIENT_SECRET;
+  if (intuitClientId && intuitClientSecret) {
+    app.use(createQboAuthRouter({ clientId: intuitClientId, clientSecret: intuitClientSecret, serverUrl }));
+    console.error("[http] QBO auth routes enabled at /qbo/auth");
+  }
 
   app.post("/mcp", async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;

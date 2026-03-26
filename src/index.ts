@@ -14,6 +14,17 @@ import { startHttpServer } from "./http-server.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
 
+/** Get an access token from Cloud Run's metadata server for Secret Manager API calls. */
+async function getAccessToken(): Promise<string> {
+  const res = await fetch(
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+    { headers: { "Metadata-Flavor": "Google" } },
+  );
+  if (!res.ok) throw new Error(`Metadata token fetch failed: ${res.status}`);
+  const data = (await res.json()) as { access_token: string };
+  return data.access_token;
+}
+
 // --- Bill.com config (optional) ---
 
 const billcomEnv = [
@@ -84,9 +95,30 @@ function registerAllTools(server: McpServer) {
 
   if (qboConfig) {
     const qboClient = new QboClient(qboConfig);
-    qboClient.onTokenRefresh = (newToken) => {
-      console.error(`[qbo] New refresh token issued — update QBO_REFRESH_TOKEN to persist across restarts`);
-      // In production, you'd persist this to Secret Manager here
+    qboClient.onTokenRefresh = async (newToken) => {
+      console.error(`[qbo] New refresh token issued — persisting to Secret Manager`);
+      try {
+        const res = await fetch(
+          `https://secretmanager.googleapis.com/v1/projects/mcp-servers-487419/secrets/QBO_REFRESH_TOKEN:addVersion`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${await getAccessToken()}`,
+            },
+            body: JSON.stringify({
+              payload: { data: Buffer.from(newToken).toString("base64") },
+            }),
+          },
+        );
+        if (res.ok) {
+          console.error("[qbo] Refresh token persisted to Secret Manager");
+        } else {
+          console.error(`[qbo] Failed to persist refresh token: ${res.status} ${await res.text()}`);
+        }
+      } catch (err) {
+        console.error("[qbo] Failed to persist refresh token:", err);
+      }
     };
     registerQboAccountTools(server, qboClient);
     registerQboVendorTools(server, qboClient);

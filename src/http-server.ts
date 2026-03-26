@@ -16,6 +16,8 @@ import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
 import { registerQboReportTools } from "./tools/qbo-reports.js";
 import { createOAuthRouter, requireAuth } from "./oauth.js";
 import { createQboAuthRouter } from "./qbo-auth-callback.js";
+import { DivvyClient } from "./divvy-client.js";
+import { registerDivvyTools } from "./tools/divvy.js";
 
 export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboConfig): void {
   const transports = new Map<string, StreamableHTTPServerTransport>();
@@ -103,6 +105,12 @@ export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboCo
       registerQboVendorTools(server, qboClient);
       registerQboTransactionTools(server, qboClient);
       registerQboReportTools(server, qboClient);
+    }
+
+    const divvyToken = process.env.DIVVY_API_TOKEN;
+    if (divvyToken) {
+      const divvyClient = new DivvyClient(divvyToken);
+      registerDivvyTools(server, divvyClient);
     }
 
     await server.connect(transport);

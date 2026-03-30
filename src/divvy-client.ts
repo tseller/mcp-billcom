@@ -10,8 +10,10 @@ export class DivvyClient {
   }
 
   private async request<T = unknown>(
+    method: string,
     path: string,
-    params?: Record<string, string | undefined>
+    params?: Record<string, string | undefined>,
+    body?: unknown,
   ): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (params) {
@@ -20,12 +22,15 @@ export class DivvyClient {
       }
     }
 
+    const headers: Record<string, string> = {
+      apiToken: this.apiToken,
+      'Content-Type': 'application/json',
+    };
+
     const response = await fetch(url.toString(), {
-      method: 'GET',
-      headers: {
-        apiToken: this.apiToken,
-        'Content-Type': 'application/json',
-      },
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
     });
 
     if (!response.ok) {
@@ -38,31 +43,76 @@ export class DivvyClient {
     return response.json() as Promise<T>;
   }
 
+  private async get<T = unknown>(
+    path: string,
+    params?: Record<string, string | undefined>,
+  ): Promise<T> {
+    return this.request('GET', path, params);
+  }
+
+  private async post<T = unknown>(
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    return this.request('POST', path, undefined, body);
+  }
+
   async listBudgets(): Promise<unknown> {
-    return this.request('/v3/spend/budgets');
+    return this.get('/v3/spend/budgets');
   }
 
   async listTransactions(params?: {
     startDate?: string;
     endDate?: string;
     budgetId?: string;
+    syncStatus?: string;
     page?: string;
     pageSize?: string;
   }): Promise<unknown> {
-    return this.request('/v3/spend/transactions', {
+    return this.get('/v3/spend/transactions', {
       start_date: params?.startDate,
       end_date: params?.endDate,
       budget_id: params?.budgetId,
+      sync_status: params?.syncStatus,
       page: params?.page,
       page_size: params?.pageSize,
     });
   }
 
+  async getTransaction(transactionId: string): Promise<unknown> {
+    return this.get(`/v3/spend/transactions/${transactionId}`);
+  }
+
   async listCards(): Promise<unknown> {
-    return this.request('/v3/spend/cards');
+    return this.get('/v3/spend/cards');
   }
 
   async listMembers(): Promise<unknown> {
-    return this.request('/v3/spend/members');
+    return this.get('/v3/spend/members');
+  }
+
+  /**
+   * Upload a receipt to a transaction. Three-step flow:
+   * 1. Get a pre-signed upload URL
+   * 2. Upload the image to that URL
+   * 3. Link the uploaded image to the transaction
+   */
+  async getReceiptUploadUrl(): Promise<{ uploadUrl: string; fileId: string }> {
+    return this.post('/v3/spend/transactions/receipt-upload-url') as Promise<{ uploadUrl: string; fileId: string }>;
+  }
+
+  async uploadReceiptFile(uploadUrl: string, imageData: Buffer, contentType: string): Promise<void> {
+    const response = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': contentType },
+      body: new Uint8Array(imageData.buffer, imageData.byteOffset, imageData.byteLength) as unknown as BodyInit,
+    });
+    if (!response.ok) {
+      throw new Error(`Receipt upload failed: ${response.status} ${response.statusText}`);
+    }
+  }
+
+  async attachReceiptToTransaction(transactionUuid: string, fileId: string): Promise<unknown> {
+    return this.post(`/v3/spend/transactions/${transactionUuid}/receipts`, { fileId });
   }
 }

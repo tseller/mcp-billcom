@@ -1,5 +1,41 @@
 import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
+
+/** Get an access token from Cloud Run's metadata server for Secret Manager API calls. */
+async function getAccessToken(): Promise<string> {
+  const res = await fetch(
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+    { headers: { "Metadata-Flavor": "Google" } },
+  );
+  if (!res.ok) throw new Error(`Metadata token fetch failed: ${res.status}`);
+  const data = (await res.json()) as { access_token: string };
+  return data.access_token;
+}
+
+async function persistRefreshToken(newToken: string): Promise<void> {
+  try {
+    const res = await fetch(
+      `https://secretmanager.googleapis.com/v1/projects/mcp-servers-487419/secrets/QBO_REFRESH_TOKEN:addVersion`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${await getAccessToken()}`,
+        },
+        body: JSON.stringify({
+          payload: { data: Buffer.from(newToken).toString("base64") },
+        }),
+      },
+    );
+    if (res.ok) {
+      console.error("[qbo] Refresh token persisted to Secret Manager");
+    } else {
+      console.error(`[qbo] Failed to persist refresh token: ${res.status} ${await res.text()}`);
+    }
+  } catch (err) {
+    console.error("[qbo] Failed to persist refresh token:", err);
+  }
+}
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -101,6 +137,10 @@ export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboCo
 
     if (qboConfig) {
       const qboClient = new QboClient(qboConfig);
+      qboClient.onTokenRefresh = (newToken) => {
+        console.error("[qbo] New refresh token issued — persisting to Secret Manager");
+        persistRefreshToken(newToken);
+      };
       registerQboAccountTools(server, qboClient);
       registerQboVendorTools(server, qboClient);
       registerQboTransactionTools(server, qboClient);

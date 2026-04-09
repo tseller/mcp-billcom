@@ -44,6 +44,16 @@ export class QboClient {
     this.config = config;
   }
 
+  /** Eagerly refresh tokens on startup so cold starts get a fresh token. */
+  async warmup(): Promise<void> {
+    try {
+      await this.refreshTokens();
+      console.error("[qbo] Warmup: token refreshed successfully");
+    } catch (err) {
+      console.error("[qbo] Warmup: token refresh failed:", (err as Error).message);
+    }
+  }
+
   private get baseUrl(): string {
     const base = this.config.baseUrl || PRODUCTION_BASE;
     return `${base}/${this.config.realmId}`;

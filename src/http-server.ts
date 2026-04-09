@@ -62,6 +62,16 @@ export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboCo
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
   const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
+  // Eagerly refresh QBO token on startup
+  if (qboConfig) {
+    const warmupClient = new QboClient(qboConfig);
+    warmupClient.onTokenRefresh = (newToken) => {
+      console.error("[qbo] Startup: persisting refreshed token");
+      persistRefreshToken(newToken);
+    };
+    warmupClient.warmup();
+  }
+
   const app = createMcpExpressApp({ host: "0.0.0.0" });
 
   // Mount OAuth routes if Google credentials are configured

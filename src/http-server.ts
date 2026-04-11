@@ -40,12 +40,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import type { BillComConfig } from "./billcom-client.js";
-import { BillComClient } from "./billcom-client.js";
 import type { QboConfig } from "./qbo-client.js";
 import { QboClient } from "./qbo-client.js";
-import { registerVendorTools } from "./tools/vendors.js";
-import { registerBillTools } from "./tools/bills.js";
 import { registerQboAccountTools } from "./tools/qbo-accounts.js";
 import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
@@ -55,7 +51,7 @@ import { createQboAuthRouter } from "./qbo-auth-callback.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
 
-export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboConfig): void {
+export function startHttpServer(qboConfig?: QboConfig): void {
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const serverUrl = process.env.SERVER_URL || `http://localhost:${process.env.PORT || "8080"}`;
@@ -138,12 +134,6 @@ export function startHttpServer(billcomConfig?: BillComConfig, qboConfig?: QboCo
       { name: "treasurer-mcp", version: "0.2.0" },
       { capabilities: { tools: {} } },
     );
-
-    if (billcomConfig) {
-      const billcomClient = new BillComClient(billcomConfig);
-      registerVendorTools(server, billcomClient);
-      registerBillTools(server, billcomClient);
-    }
 
     if (qboConfig) {
       const qboClient = new QboClient(qboConfig);

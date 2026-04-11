@@ -1,11 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { BillComConfig } from "./billcom-client.js";
-import { BillComClient } from "./billcom-client.js";
 import type { QboConfig } from "./qbo-client.js";
 import { QboClient } from "./qbo-client.js";
-import { registerVendorTools } from "./tools/vendors.js";
-import { registerBillTools } from "./tools/bills.js";
 import { registerQboAccountTools } from "./tools/qbo-accounts.js";
 import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
@@ -23,32 +19,6 @@ async function getAccessToken(): Promise<string> {
   if (!res.ok) throw new Error(`Metadata token fetch failed: ${res.status}`);
   const data = (await res.json()) as { access_token: string };
   return data.access_token;
-}
-
-// --- Bill.com config (optional) ---
-
-const billcomEnv = [
-  "BILLCOM_API_BASE_URL",
-  "BILLCOM_USERNAME",
-  "BILLCOM_PASSWORD",
-  "BILLCOM_ORGANIZATION_ID",
-  "BILLCOM_DEV_KEY",
-] as const;
-
-const hasBillcom = billcomEnv.every((k) => process.env[k]);
-
-let billcomConfig: BillComConfig | undefined;
-if (hasBillcom) {
-  billcomConfig = {
-    baseUrl: process.env.BILLCOM_API_BASE_URL!,
-    username: process.env.BILLCOM_USERNAME!,
-    password: process.env.BILLCOM_PASSWORD!,
-    organizationId: process.env.BILLCOM_ORGANIZATION_ID!,
-    devKey: process.env.BILLCOM_DEV_KEY!,
-  };
-  console.error("[mcp] Bill.com tools enabled");
-} else {
-  console.error("[mcp] Bill.com tools disabled (missing env vars)");
 }
 
 // --- QuickBooks config (optional) ---
@@ -79,20 +49,14 @@ if (divvyApiToken) {
   console.error("[mcp] Divvy tools disabled (missing DIVVY_API_TOKEN)");
 }
 
-if (!hasBillcom && !hasQbo && !divvyApiToken) {
-  console.error("ERROR: No integrations configured. Set Bill.com, QuickBooks, and/or Divvy env vars.");
+if (!hasQbo && !divvyApiToken) {
+  console.error("ERROR: No integrations configured. Set QuickBooks and/or Divvy env vars.");
   process.exit(1);
 }
 
 // --- Register tools and start ---
 
 function registerAllTools(server: McpServer) {
-  if (billcomConfig) {
-    const billcomClient = new BillComClient(billcomConfig);
-    registerVendorTools(server, billcomClient);
-    registerBillTools(server, billcomClient);
-  }
-
   if (qboConfig) {
     const qboClient = new QboClient(qboConfig);
     qboClient.onTokenRefresh = async (newToken) => {
@@ -133,7 +97,7 @@ function registerAllTools(server: McpServer) {
 }
 
 if (process.env.MCP_TRANSPORT === "http") {
-  startHttpServer(billcomConfig, qboConfig);
+  startHttpServer(qboConfig);
 } else {
   const server = new McpServer(
     { name: "treasurer-mcp", version: "0.2.0" },

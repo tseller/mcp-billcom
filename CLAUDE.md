@@ -27,13 +27,10 @@ gcloud config configurations activate mcp-billcom
 ## Architecture
 
 - **ESM project** using TypeScript with Node16 module resolution
-- `src/index.ts` — entry point: registers Bill.com and/or QBO tools based on available env vars
-- `src/billcom-client.ts` — Bill.com REST API client with auto session management (30 min refresh + 401 retry)
+- `src/index.ts` — entry point: registers QBO and/or Divvy tools based on available env vars
 - `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
 - `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
-- `src/tools/vendors.ts` — Bill.com: list_vendors, get_vendor, create_vendor
-- `src/tools/bills.ts` — Bill.com: list_bills, get_bill, create_bill
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
 - `src/tools/qbo-transactions.ts` — QBO: list/get/update purchases, list deposits, list transfers
@@ -42,9 +39,6 @@ gcloud config configurations activate mcp-billcom
 - All logging goes to stderr (stdout is MCP protocol)
 
 ## Environment Variables
-
-### Bill.com (optional — tools enabled if all are set)
-- `BILLCOM_API_BASE_URL`, `BILLCOM_USERNAME`, `BILLCOM_PASSWORD`, `BILLCOM_ORGANIZATION_ID`, `BILLCOM_DEV_KEY`
 
 ### QuickBooks Online (optional — tools enabled if all are set)
 - `INTUIT_CLIENT_ID`, `INTUIT_CLIENT_SECRET` — OAuth2 app credentials

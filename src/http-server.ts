@@ -10,7 +10,8 @@ import { registerQboAccountTools } from "./tools/qbo-accounts.js";
 import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
 import { registerQboReportTools } from "./tools/qbo-reports.js";
-import { createOAuthRouter, requireAuth } from "./oauth.js";
+import { createOAuthRouter, createRequireAuth } from "./oauth.js";
+import { FirestoreOAuthStore } from "./oauth-store.js";
 import { createQboAuthRouter } from "./qbo-auth-callback.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
@@ -34,16 +35,17 @@ export function startHttpServer(qboConfig?: QboConfig): void {
 
   // Mount OAuth routes if Google credentials are configured
   if (googleClientId && googleClientSecret) {
-    const oauthRouter = createOAuthRouter({
-      serverUrl,
-      googleClientId,
-      googleClientSecret,
-    });
+    const gcpProjectId = process.env.GCP_PROJECT_ID || "mcp-servers-487419";
+    const oauthStore = new FirestoreOAuthStore(gcpProjectId);
+    const oauthRouter = createOAuthRouter(
+      { serverUrl, googleClientId, googleClientSecret },
+      oauthStore,
+    );
     app.use(oauthRouter);
 
     // Protect MCP endpoints with OAuth
-    app.use("/mcp", requireAuth);
-    console.error("[http] OAuth enabled");
+    app.use("/mcp", createRequireAuth(oauthStore));
+    console.error("[http] OAuth enabled (Firestore-backed)");
   } else {
     console.error("[http] OAuth disabled (no GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET)");
   }

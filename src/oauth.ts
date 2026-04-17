@@ -1,6 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import express, { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
+import type { OAuthStore } from "./oauth-store.js";
 
 // --- Types ---
 
@@ -43,21 +44,15 @@ interface StoredToken {
   expiresAt: number;
 }
 
-// --- In-memory stores ---
+// --- Collection names (Firestore / in-memory buckets) ---
 
-const clients = new Map<string, RegisteredClient>();
-const pendingAuths = new Map<string, PendingAuth>(); // keyed by google state
-const authCodes = new Map<string, AuthCode>();
-const accessTokens = new Map<string, StoredToken>();
-const refreshTokens = new Map<string, StoredToken>(); // refresh tokens don't expire by default
+const C_CLIENTS = "oauth_clients";
+const C_PENDING = "oauth_pending_auths";
+const C_CODES = "oauth_auth_codes";
+const C_ACCESS = "oauth_access_tokens";
+const C_REFRESH = "oauth_refresh_tokens";
 
-// Cleanup expired entries every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of pendingAuths) if (now - v.createdAt > 10 * 60_000) pendingAuths.delete(k);
-  for (const [k, v] of authCodes) if (now > v.expiresAt) authCodes.delete(k);
-  for (const [k, v] of accessTokens) if (now > v.expiresAt) accessTokens.delete(k);
-}, 5 * 60_000);
+const PENDING_TTL_MS = 10 * 60_000;
 
 // --- Helpers ---
 
@@ -107,7 +102,7 @@ async function exchangeGoogleCode(
 
 // --- Router factory ---
 
-export function createOAuthRouter(config: OAuthConfig): Router {
+export function createOAuthRouter(config: OAuthConfig, store: OAuthStore): Router {
   const router = Router();
 
   // Parse URL-encoded bodies (OAuth token requests use application/x-www-form-urlencoded)
@@ -136,7 +131,7 @@ export function createOAuthRouter(config: OAuthConfig): Router {
   });
 
   // Dynamic Client Registration (RFC 7591)
-  router.post("/oauth/register", (req: Request, res: Response) => {
+  router.post("/oauth/register", async (req: Request, res: Response) => {
     const { client_name, redirect_uris } = req.body as {
       client_name?: string;
       redirect_uris?: string[];
@@ -156,7 +151,7 @@ export function createOAuthRouter(config: OAuthConfig): Router {
       redirectUris: redirect_uris,
       clientName: client_name || "unknown",
     };
-    clients.set(clientId, client);
+    await store.set(C_CLIENTS, clientId, client);
     console.error(`[oauth] Registered client: ${client.clientName} (${clientId})`);
 
     res.status(201).json({
@@ -169,7 +164,7 @@ export function createOAuthRouter(config: OAuthConfig): Router {
 
   // Authorization endpoint — redirects to Google OAuth
   // Accepts both registered clients and unregistered public clients (e.g. Claude Desktop)
-  router.get("/oauth/authorize", (req: Request, res: Response) => {
+  router.get("/oauth/authorize", async (req: Request, res: Response) => {
     const {
       response_type,
       client_id,
@@ -196,14 +191,15 @@ export function createOAuthRouter(config: OAuthConfig): Router {
 
     // Store pending auth request, keyed by a state we send to Google
     const googleState = randomUUID();
-    pendingAuths.set(googleState, {
+    const pending: PendingAuth = {
       clientId: client_id,
       redirectUri: redirect_uri,
       codeChallenge: code_challenge,
       codeChallengeMethod: code_challenge_method,
       clientState: state || "",
       createdAt: Date.now(),
-    });
+    };
+    await store.set(C_PENDING, googleState, pending);
 
     // Redirect to Google OAuth
     const googleAuthUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
@@ -227,12 +223,12 @@ export function createOAuthRouter(config: OAuthConfig): Router {
       return;
     }
 
-    const pending = pendingAuths.get(state);
-    if (!pending) {
+    const pending = await store.get<PendingAuth>(C_PENDING, state);
+    if (!pending || Date.now() - pending.createdAt > PENDING_TTL_MS) {
       res.status(400).send("Invalid or expired state parameter");
       return;
     }
-    pendingAuths.delete(state);
+    await store.delete(C_PENDING, state);
 
     try {
       const { email } = await exchangeGoogleCode(
@@ -253,7 +249,7 @@ export function createOAuthRouter(config: OAuthConfig): Router {
 
       // Generate our own auth code
       const ourCode = randomUUID();
-      authCodes.set(ourCode, {
+      const authCode: AuthCode = {
         code: ourCode,
         clientId: pending.clientId,
         redirectUri: pending.redirectUri,
@@ -261,7 +257,8 @@ export function createOAuthRouter(config: OAuthConfig): Router {
         codeChallengeMethod: pending.codeChallengeMethod,
         googleEmail: email,
         expiresAt: Date.now() + 5 * 60_000, // 5 min
-      });
+      };
+      await store.set(C_CODES, ourCode, authCode);
 
       // Redirect back to Claude Desktop with our auth code
       const redirectUrl = new URL(pending.redirectUri);
@@ -277,7 +274,7 @@ export function createOAuthRouter(config: OAuthConfig): Router {
 
   // Token endpoint — exchanges auth code or refresh token for access token
   // Supports both confidential clients (with client_secret) and public clients (PKCE only)
-  router.post("/oauth/token", (req: Request, res: Response) => {
+  router.post("/oauth/token", async (req: Request, res: Response) => {
     const { grant_type, code, redirect_uri, client_id, client_secret, code_verifier, refresh_token } =
       req.body as Record<string, string>;
 
@@ -288,19 +285,19 @@ export function createOAuthRouter(config: OAuthConfig): Router {
 
     // For registered (confidential) clients, validate client_secret
     // For unregistered (public) clients, skip — PKCE provides security
-    const client = clients.get(client_id);
+    const client = await store.get<RegisteredClient>(C_CLIENTS, client_id);
     if (client && client.clientSecret !== client_secret) {
       res.status(401).json({ error: "invalid_client" });
       return;
     }
 
     if (grant_type === "authorization_code") {
-      const authCode = authCodes.get(code);
+      const authCode = await store.get<AuthCode>(C_CODES, code);
       if (!authCode) {
         res.status(400).json({ error: "invalid_grant", error_description: "Invalid or expired code" });
         return;
       }
-      authCodes.delete(code);
+      await store.delete(C_CODES, code);
 
       if (Date.now() > authCode.expiresAt) {
         res.status(400).json({ error: "invalid_grant", error_description: "Code expired" });
@@ -323,13 +320,13 @@ export function createOAuthRouter(config: OAuthConfig): Router {
       const refreshTok = randomUUID();
       const expiresIn = 3600; // 1 hour
 
-      accessTokens.set(accessToken, {
+      await store.set<StoredToken>(C_ACCESS, accessToken, {
         clientId: client_id,
         googleEmail: authCode.googleEmail,
         expiresAt: Date.now() + expiresIn * 1000,
       });
 
-      refreshTokens.set(refreshTok, {
+      await store.set<StoredToken>(C_REFRESH, refreshTok, {
         clientId: client_id,
         googleEmail: authCode.googleEmail,
         expiresAt: 0, // doesn't expire
@@ -344,7 +341,7 @@ export function createOAuthRouter(config: OAuthConfig): Router {
         refresh_token: refreshTok,
       });
     } else if (grant_type === "refresh_token") {
-      const stored = refreshTokens.get(refresh_token);
+      const stored = await store.get<StoredToken>(C_REFRESH, refresh_token);
       if (!stored || stored.clientId !== client_id) {
         res.status(400).json({ error: "invalid_grant", error_description: "Invalid refresh token" });
         return;
@@ -353,7 +350,7 @@ export function createOAuthRouter(config: OAuthConfig): Router {
       const accessToken = randomUUID();
       const expiresIn = 3600;
 
-      accessTokens.set(accessToken, {
+      await store.set<StoredToken>(C_ACCESS, accessToken, {
         clientId: client_id,
         googleEmail: stored.googleEmail,
         expiresAt: Date.now() + expiresIn * 1000,
@@ -376,28 +373,33 @@ export function createOAuthRouter(config: OAuthConfig): Router {
 
 // --- Auth middleware for /mcp ---
 
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer ")) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
+export function createRequireAuth(store: OAuthStore) {
+  return async function requireAuth(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
 
-  const token = authHeader.slice(7);
+    const token = authHeader.slice(7);
 
-  // Static API token for trusted agents (bypasses OAuth)
-  const apiToken = process.env.MCP_API_TOKEN;
-  if (apiToken && token === apiToken) {
+    // Static API token for trusted agents (bypasses OAuth)
+    const apiToken = process.env.MCP_API_TOKEN;
+    if (apiToken && token === apiToken) {
+      next();
+      return;
+    }
+
+    const stored = await store.get<StoredToken>(C_ACCESS, token);
+    if (!stored || Date.now() > stored.expiresAt) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
     next();
-    return;
-  }
-
-  // OAuth access token
-  const stored = accessTokens.get(token);
-  if (!stored || Date.now() > stored.expiresAt) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-
-  next();
+  };
 }

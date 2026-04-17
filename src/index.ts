@@ -1,7 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { QboConfig } from "./qbo-client.js";
-import { QboClient } from "./qbo-client.js";
+import type { QboConfig, TokenStore } from "./qbo-client.js";
+import { InMemoryTokenStore, QboClient } from "./qbo-client.js";
+import { SecretManagerTokenStore } from "./secret-manager-store.js";
 import { registerQboAccountTools } from "./tools/qbo-accounts.js";
 import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
@@ -10,29 +11,33 @@ import { startHttpServer } from "./http-server.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
 
-/** Get an access token from Cloud Run's metadata server for Secret Manager API calls. */
-async function getAccessToken(): Promise<string> {
-  const res = await fetch(
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-    { headers: { "Metadata-Flavor": "Google" } },
-  );
-  if (!res.ok) throw new Error(`Metadata token fetch failed: ${res.status}`);
-  const data = (await res.json()) as { access_token: string };
-  return data.access_token;
-}
-
 // --- QuickBooks config (optional) ---
 
-const qboEnv = ["INTUIT_CLIENT_ID", "INTUIT_CLIENT_SECRET", "QBO_REALM_ID", "QBO_REFRESH_TOKEN"] as const;
-const hasQbo = qboEnv.every((k) => process.env[k]);
+const isHttp = process.env.MCP_TRANSPORT === "http";
+const hasQboBase = !!(
+  process.env.INTUIT_CLIENT_ID &&
+  process.env.INTUIT_CLIENT_SECRET &&
+  process.env.QBO_REALM_ID
+);
+// stdio bootstraps from an env-var refresh token; HTTP reads from Secret Manager.
+const hasQbo = hasQboBase && (isHttp || !!process.env.QBO_REFRESH_TOKEN);
 
 let qboConfig: QboConfig | undefined;
 if (hasQbo) {
+  let tokenStore: TokenStore;
+  if (isHttp) {
+    const projectId = process.env.GCP_PROJECT_ID || "mcp-servers-487419";
+    const secretId = process.env.QBO_REFRESH_TOKEN_SECRET || "QBO_REFRESH_TOKEN";
+    tokenStore = new SecretManagerTokenStore(projectId, secretId);
+  } else {
+    tokenStore = new InMemoryTokenStore(process.env.QBO_REFRESH_TOKEN!);
+  }
+
   qboConfig = {
     clientId: process.env.INTUIT_CLIENT_ID!,
     clientSecret: process.env.INTUIT_CLIENT_SECRET!,
     realmId: process.env.QBO_REALM_ID!,
-    refreshToken: process.env.QBO_REFRESH_TOKEN!,
+    tokenStore,
     baseUrl: process.env.QBO_BASE_URL,
   };
   console.error("[mcp] QuickBooks tools enabled");
@@ -59,31 +64,6 @@ if (!hasQbo && !divvyApiToken) {
 function registerAllTools(server: McpServer) {
   if (qboConfig) {
     const qboClient = new QboClient(qboConfig);
-    qboClient.onTokenRefresh = async (newToken) => {
-      console.error(`[qbo] New refresh token issued — persisting to Secret Manager`);
-      try {
-        const res = await fetch(
-          `https://secretmanager.googleapis.com/v1/projects/mcp-servers-487419/secrets/QBO_REFRESH_TOKEN:addVersion`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${await getAccessToken()}`,
-            },
-            body: JSON.stringify({
-              payload: { data: Buffer.from(newToken).toString("base64") },
-            }),
-          },
-        );
-        if (res.ok) {
-          console.error("[qbo] Refresh token persisted to Secret Manager");
-        } else {
-          console.error(`[qbo] Failed to persist refresh token: ${res.status} ${await res.text()}`);
-        }
-      } catch (err) {
-        console.error("[qbo] Failed to persist refresh token:", err);
-      }
-    };
     registerQboAccountTools(server, qboClient);
     registerQboVendorTools(server, qboClient);
     registerQboTransactionTools(server, qboClient);

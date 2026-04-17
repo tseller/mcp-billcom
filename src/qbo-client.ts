@@ -16,19 +16,40 @@ export class QboError extends Error {
   }
 }
 
+export interface TokenStore {
+  getRefreshToken(): Promise<string>;
+  saveRefreshToken(token: string): Promise<void>;
+}
+
+/** In-memory token store — for stdio/local use where persistence across restarts is not required. */
+export class InMemoryTokenStore implements TokenStore {
+  constructor(private token: string) {}
+  async getRefreshToken(): Promise<string> {
+    return this.token;
+  }
+  async saveRefreshToken(token: string): Promise<void> {
+    this.token = token;
+  }
+}
+
 export interface QboConfig {
   clientId: string;
   clientSecret: string;
   realmId: string;
-  refreshToken: string;
+  tokenStore: TokenStore;
   /** Override for sandbox testing */
   baseUrl?: string;
 }
 
 interface TokenPair {
   accessToken: string;
-  refreshToken: string;
   expiresAt: number;
+}
+
+interface IntuitTokenResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
 }
 
 const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
@@ -37,8 +58,7 @@ const PRODUCTION_BASE = "https://quickbooks.api.intuit.com/v3/company";
 export class QboClient {
   private config: QboConfig;
   private tokens: TokenPair | null = null;
-  /** Called whenever tokens are refreshed so the caller can persist them */
-  public onTokenRefresh?: (refreshToken: string) => void;
+  private refreshPromise: Promise<void> | null = null;
 
   constructor(config: QboConfig) {
     this.config = config;
@@ -66,8 +86,49 @@ export class QboClient {
   }
 
   private async refreshTokens(): Promise<void> {
-    const refreshToken = this.tokens?.refreshToken ?? this.config.refreshToken;
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.doRefresh().finally(() => {
+      this.refreshPromise = null;
+    });
+    return this.refreshPromise;
+  }
 
+  private async doRefresh(): Promise<void> {
+    const initial = await this.config.tokenStore.getRefreshToken();
+    let result = await this.tryRefresh(initial);
+
+    if (result === "invalid_grant") {
+      // A sibling instance may have rotated the token between our read and our refresh.
+      // Re-read the store; if it's the same value, give up (operator must re-auth).
+      const fresh = await this.config.tokenStore.getRefreshToken();
+      if (fresh === initial) {
+        throw new QboError(
+          "Token refresh failed: invalid_grant (re-authorize at /qbo/auth)",
+          400,
+          "invalid_grant",
+        );
+      }
+      console.error("[qbo] invalid_grant with stale token, retrying with fresh store value");
+      result = await this.tryRefresh(fresh);
+      if (result === "invalid_grant") {
+        throw new QboError(
+          "Token refresh failed: invalid_grant even after store re-read (re-authorize at /qbo/auth)",
+          400,
+          "invalid_grant",
+        );
+      }
+    }
+
+    this.tokens = {
+      accessToken: result.access_token,
+      expiresAt: Date.now() + result.expires_in * 1000 - 60_000, // 1 min buffer
+    };
+
+    await this.config.tokenStore.saveRefreshToken(result.refresh_token);
+    console.error("[qbo] Tokens refreshed and persisted");
+  }
+
+  private async tryRefresh(refreshToken: string): Promise<IntuitTokenResponse | "invalid_grant"> {
     const res = await fetch(TOKEN_URL, {
       method: "POST",
       headers: {
@@ -81,28 +142,16 @@ export class QboClient {
       }),
     });
 
+    if (res.status === 400) {
+      const text = await res.text();
+      if (text.includes("invalid_grant")) return "invalid_grant";
+      throw new QboError(`Token refresh failed: 400 ${text}`, 400, text);
+    }
     if (!res.ok) {
       const text = await res.text();
       throw new QboError(`Token refresh failed: ${res.status} ${text}`, res.status, text);
     }
-
-    const data = (await res.json()) as {
-      access_token: string;
-      refresh_token: string;
-      expires_in: number;
-    };
-
-    this.tokens = {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token,
-      expiresAt: Date.now() + data.expires_in * 1000 - 60_000, // 1 min buffer
-    };
-
-    // Persist the new refresh token (rolling expiration)
-    this.config.refreshToken = data.refresh_token;
-    this.onTokenRefresh?.(data.refresh_token);
-
-    console.error("[qbo] Tokens refreshed");
+    return (await res.json()) as IntuitTokenResponse;
   }
 
   private async ensureTokens(): Promise<void> {

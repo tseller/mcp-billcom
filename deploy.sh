@@ -7,12 +7,16 @@ set -euo pipefail
 
 SERVICE_URL="https://billcom-mcp-733083913968.us-central1.run.app"
 
-gcloud config configurations activate mcp-billcom
+# QBO_REFRESH_TOKEN is no longer wired as an env-var; the app reads it directly
+# from Secret Manager (SecretManagerTokenStore) so rotations write back safely
+# across concurrent instances.
 
 gcloud run deploy billcom-mcp \
+  --account=tseller@gmail.com \
+  --project=mcp-servers-487419 \
   --source . \
   --region us-central1 \
   --port 8080 \
   --allow-unauthenticated \
   --set-env-vars="MCP_TRANSPORT=http,SERVER_URL=${SERVICE_URL},ALLOWED_EMAILS=tseller@gmail.com" \
-  --set-secrets="BILLCOM_API_BASE_URL=BILLCOM_API_BASE_URL:latest,BILLCOM_USERNAME=BILLCOM_USERNAME:latest,BILLCOM_PASSWORD=BILLCOM_PASSWORD:latest,BILLCOM_ORGANIZATION_ID=BILLCOM_ORGANIZATION_ID:latest,BILLCOM_DEV_KEY=BILLCOM_DEV_KEY:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,INTUIT_CLIENT_ID=INTUIT_CLIENT_ID:latest,INTUIT_CLIENT_SECRET=INTUIT_CLIENT_SECRET:latest,QBO_REALM_ID=QBO_REALM_ID:latest,QBO_REFRESH_TOKEN=QBO_REFRESH_TOKEN:latest,MCP_API_TOKEN=MCP_API_TOKEN:latest,DIVVY_API_TOKEN=DIVVY_API_TOKEN:latest"
+  --set-secrets="BILLCOM_API_BASE_URL=BILLCOM_API_BASE_URL:latest,BILLCOM_USERNAME=BILLCOM_USERNAME:latest,BILLCOM_PASSWORD=BILLCOM_PASSWORD:latest,BILLCOM_ORGANIZATION_ID=BILLCOM_ORGANIZATION_ID:latest,BILLCOM_DEV_KEY=BILLCOM_DEV_KEY:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,INTUIT_CLIENT_ID=INTUIT_CLIENT_ID:latest,INTUIT_CLIENT_SECRET=INTUIT_CLIENT_SECRET:latest,QBO_REALM_ID=QBO_REALM_ID:latest,MCP_API_TOKEN=MCP_API_TOKEN:latest,DIVVY_API_TOKEN=DIVVY_API_TOKEN:latest"

@@ -1,25 +1,37 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
+import { runTool } from '../tool-logging.js';
+
+/** Sniff common receipt formats from the first bytes of a decoded buffer. */
+function sniffContentType(buf: Buffer): string | undefined {
+  if (buf.length < 4) return undefined;
+  // PDF: "%PDF"
+  if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return 'application/pdf';
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  // PNG: 89 50 4E 47
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  // GIF: "GIF8"
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif';
+  // WebP: "RIFF"...."WEBP"
+  if (buf.length >= 12 && buf.subarray(0, 4).toString() === 'RIFF' && buf.subarray(8, 12).toString() === 'WEBP') {
+    return 'image/webp';
+  }
+  // HEIC/HEIF: "ftyp" at offset 4, brand at 8
+  if (buf.length >= 12 && buf.subarray(4, 8).toString() === 'ftyp') {
+    const brand = buf.subarray(8, 12).toString();
+    if (['heic', 'heix', 'heis', 'mif1', 'msf1'].includes(brand)) return 'image/heic';
+  }
+  return undefined;
+}
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.tool(
     'divvy_list_budgets',
     'List all Divvy (BILL Spend & Expense) budgets',
     {},
-    async () => {
-      try {
-        const result = await client.listBudgets();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
+    (args) => runTool('divvy_list_budgets', args, () => client.listBudgets()),
   );
 
   server.tool(
@@ -33,26 +45,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       page: z.string().optional().describe('Page cursor for pagination (from nextPage in previous response)'),
       pageSize: z.string().optional().describe('Number of results per page'),
     },
-    async ({ startDate, endDate, budgetId, syncStatus, page, pageSize }) => {
-      try {
-        const result = await client.listTransactions({
-          startDate,
-          endDate,
-          budgetId,
-          syncStatus,
-          page,
-          pageSize,
-        });
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
+    (args) => runTool('divvy_list_transactions', args, (a) => client.listTransactions(a)),
   );
 
   server.tool(
@@ -61,90 +54,94 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
     {
       transactionId: z.string().describe('Transaction ID'),
     },
-    async ({ transactionId }) => {
-      try {
-        const result = await client.getTransaction(transactionId);
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
+    (args) =>
+      runTool('divvy_get_transaction', args, ({ transactionId }) =>
+        client.getTransaction(transactionId),
+      ),
   );
 
   server.tool(
     'divvy_upload_receipt',
-    'Upload a receipt image and attach it to a Divvy transaction. Provide the transaction UUID and the receipt image as a base64-encoded string.',
+    'Upload a receipt and attach it to a Divvy transaction. Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType.',
     {
       transactionUuid: z.string().describe('Transaction UUID (the uuid field, not the id field)'),
-      imageBase64: z.string().describe('Base64-encoded receipt image (JPEG or PNG)'),
-      contentType: z.string().optional().describe('Image MIME type (default: image/jpeg)'),
+      imageBase64: z.string().describe('Base64-encoded receipt bytes (image or PDF)'),
+      contentType: z.string().optional().describe('Optional MIME override. Only set this if the auto-detected type is wrong.'),
     },
-    async ({ transactionUuid, imageBase64, contentType }) => {
-      try {
-        const mime = contentType || 'image/jpeg';
+    (args) =>
+      runTool('divvy_upload_receipt', args, async ({ transactionUuid, imageBase64, contentType }) => {
         const imageData = Buffer.from(imageBase64, 'base64');
+        const sniffed = sniffContentType(imageData);
+        const mime = contentType || sniffed || 'application/octet-stream';
+        if (contentType && sniffed && contentType !== sniffed) {
+          console.error(
+            `[tool] divvy_upload_receipt warn=mime_mismatch override=${contentType} sniffed=${sniffed}`,
+          );
+        }
+        console.error(
+          `[tool] divvy_upload_receipt step=getUrl transactionUuid=${transactionUuid} mime=${mime} sniffed=${sniffed ?? 'unknown'} override=${contentType ?? 'none'} bytes=${imageData.length}`,
+        );
+        const { url } = await client.getReceiptUploadUrl();
+        console.error(`[tool] divvy_upload_receipt step=put urlHost=${new URL(url).host}`);
+        await client.uploadReceiptFile(url, imageData, mime);
+        console.error(`[tool] divvy_upload_receipt step=attach`);
+        const result = await client.attachReceiptToTransaction(transactionUuid, url);
+        return { success: true, result, detectedMime: sniffed };
+      }),
+  );
 
-        // Step 1: Get pre-signed upload URL
-        const { uploadUrl, fileId } = await client.getReceiptUploadUrl();
+  server.tool(
+    'divvy_list_custom_fields',
+    'List all Divvy custom field definitions (e.g. NAP CODES, Notes). Returns each field\'s customFieldId, name, and type.',
+    {},
+    (args) => runTool('divvy_list_custom_fields', args, () => client.listCustomFields()),
+  );
 
-        // Step 2: Upload the image
-        await client.uploadReceiptFile(uploadUrl, imageData, mime);
+  server.tool(
+    'divvy_list_custom_field_values',
+    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label.',
+    {
+      customFieldId: z.string().describe('Custom field ID from divvy_list_custom_fields'),
+    },
+    (args) =>
+      runTool('divvy_list_custom_field_values', args, ({ customFieldId }) =>
+        client.listCustomFieldValues(customFieldId),
+      ),
+  );
 
-        // Step 3: Link to transaction
-        const result = await client.attachReceiptToTransaction(transactionUuid, fileId);
-
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ success: true, fileId, result }, null, 2) }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
+  server.tool(
+    'divvy_update_transaction_custom_fields',
+    'Assign custom field values to a Divvy transaction (e.g. set the NAP CODE). Use divvy_list_custom_fields + divvy_list_custom_field_values first to resolve IDs. For SELECT-type fields pass selectedValues (value IDs); for NOTE-type fields pass note. Clearing selectedValues to [] clears the field.',
+    {
+      transactionUuid: z.string().describe('Transaction UUID (the uuid field, not the id field)'),
+      customFields: z
+        .array(
+          z.object({
+            customFieldId: z.string(),
+            selectedValues: z.array(z.string()).optional(),
+            note: z.string().optional(),
+          }),
+        )
+        .min(1)
+        .describe('One entry per custom field to set'),
+    },
+    (args) =>
+      runTool('divvy_update_transaction_custom_fields', args, ({ transactionUuid, customFields }) =>
+        client.updateTransactionCustomFields(transactionUuid, customFields),
+      ),
   );
 
   server.tool(
     'divvy_list_cards',
     'List all Divvy (BILL Spend & Expense) virtual and physical cards',
     {},
-    async () => {
-      try {
-        const result = await client.listCards();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
+    (args) => runTool('divvy_list_cards', args, () => client.listCards()),
   );
 
   server.tool(
     'divvy_list_members',
     'List all Divvy (BILL Spend & Expense) team members',
     {},
-    async () => {
-      try {
-        const result = await client.listMembers();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
+    (args) => runTool('divvy_list_members', args, () => client.listMembers()),
   );
 }

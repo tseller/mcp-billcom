@@ -93,12 +93,21 @@ export class DivvyClient {
 
   /**
    * Upload a receipt to a transaction. Three-step flow:
-   * 1. Get a pre-signed upload URL
-   * 2. Upload the image to that URL
-   * 3. Link the uploaded image to the transaction
+   * 1. Get a pre-signed upload URL from BILL
+   * 2. PUT the receipt bytes to that URL
+   * 3. POST the URL back to BILL to attach it to the transaction
    */
-  async getReceiptUploadUrl(): Promise<{ uploadUrl: string; fileId: string }> {
-    return this.post('/v3/spend/transactions/receipt-upload-url') as Promise<{ uploadUrl: string; fileId: string }>;
+  async getReceiptUploadUrl(): Promise<{ url: string }> {
+    const resp = await this.post<Record<string, unknown>>(
+      '/v3/spend/transactions/receipt-upload-url',
+    );
+    const url = resp && typeof resp === 'object' ? (resp as { url?: unknown }).url : undefined;
+    if (typeof url !== 'string') {
+      throw new Error(
+        `Divvy receipt-upload-url response missing 'url' field. Got: ${JSON.stringify(resp)}`,
+      );
+    }
+    return { url };
   }
 
   async uploadReceiptFile(uploadUrl: string, imageData: Buffer, contentType: string): Promise<void> {
@@ -108,11 +117,39 @@ export class DivvyClient {
       body: new Uint8Array(imageData.buffer, imageData.byteOffset, imageData.byteLength) as unknown as BodyInit,
     });
     if (!response.ok) {
-      throw new Error(`Receipt upload failed: ${response.status} ${response.statusText}`);
+      const text = await response.text().catch(() => '');
+      throw new Error(
+        `Receipt upload failed: ${response.status} ${response.statusText}${text ? ': ' + text : ''}`,
+      );
     }
   }
 
-  async attachReceiptToTransaction(transactionUuid: string, fileId: string): Promise<unknown> {
-    return this.post(`/v3/spend/transactions/${transactionUuid}/receipts`, { fileId });
+  async attachReceiptToTransaction(transactionUuid: string, uploadUrl: string): Promise<unknown> {
+    return this.post(`/v3/spend/transactions/${transactionUuid}/receipts`, { url: uploadUrl });
+  }
+
+  async listCustomFields(): Promise<unknown> {
+    return this.get('/v3/spend/custom-fields');
+  }
+
+  async listCustomFieldValues(customFieldId: string): Promise<unknown> {
+    return this.get(`/v3/spend/custom-fields/${customFieldId}/values`);
+  }
+
+  /**
+   * Assign custom field values to a transaction. Each entry needs
+   * `customFieldId` (the field's ID) and either `selectedValues` (value IDs,
+   * for SELECT-type fields) or `note` (for NOTE-type fields).
+   */
+  async updateTransactionCustomFields(
+    transactionUuid: string,
+    customFields: Array<{ customFieldId: string; selectedValues?: string[]; note?: string }>,
+  ): Promise<unknown> {
+    return this.request(
+      'PUT',
+      `/v3/spend/transactions/${transactionUuid}/custom-fields`,
+      undefined,
+      { customFields },
+    );
   }
 }

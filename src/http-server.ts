@@ -65,7 +65,9 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     if (sessionId) {
       const transport = transports.get(sessionId);
       if (!transport) {
-        res.status(400).json({ error: "Invalid session ID" });
+        // 404 per MCP Streamable HTTP spec — signals the client to
+      // start a new session via an initialize request.
+      res.status(404).json({ error: "Session not found" });
         return;
       }
       await transport.handleRequest(req, res, req.body);
@@ -124,7 +126,9 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     }
     const transport = transports.get(sessionId);
     if (!transport) {
-      res.status(400).json({ error: "Invalid session ID" });
+      // 404 per MCP Streamable HTTP spec — signals the client to
+      // start a new session via an initialize request.
+      res.status(404).json({ error: "Session not found" });
       return;
     }
     await transport.handleRequest(req, res);
@@ -138,7 +142,9 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     }
     const transport = transports.get(sessionId);
     if (!transport) {
-      res.status(400).json({ error: "Invalid session ID" });
+      // 404 per MCP Streamable HTTP spec — signals the client to
+      // start a new session via an initialize request.
+      res.status(404).json({ error: "Session not found" });
       return;
     }
     await transport.handleRequest(req, res);

@@ -99,13 +99,15 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
 
   server.tool(
     'divvy_list_custom_field_values',
-    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label.',
+    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label. Paginated — use page (from nextPage in the previous response) and pageSize to walk the full list.',
     {
       customFieldId: z.string().describe('Custom field ID from divvy_list_custom_fields'),
+      page: z.string().optional().describe('Page cursor from the previous response\'s nextPage'),
+      pageSize: z.string().optional().describe('Results per page (default per BILL API)'),
     },
     (args) =>
-      runTool('divvy_list_custom_field_values', args, ({ customFieldId }) =>
-        client.listCustomFieldValues(customFieldId),
+      runTool('divvy_list_custom_field_values', args, ({ customFieldId, page, pageSize }) =>
+        client.listCustomFieldValues(customFieldId, { page, pageSize }),
       ),
   );
 

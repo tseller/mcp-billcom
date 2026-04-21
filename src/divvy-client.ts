@@ -132,8 +132,14 @@ export class DivvyClient {
     return this.get('/v3/spend/custom-fields');
   }
 
-  async listCustomFieldValues(customFieldId: string): Promise<unknown> {
-    return this.get(`/v3/spend/custom-fields/${customFieldId}/values`);
+  async listCustomFieldValues(
+    customFieldId: string,
+    params?: { page?: string; pageSize?: string },
+  ): Promise<unknown> {
+    return this.get(`/v3/spend/custom-fields/${customFieldId}/values`, {
+      page: params?.page,
+      page_size: params?.pageSize,
+    });
   }
 
   /**

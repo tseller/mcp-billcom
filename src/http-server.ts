@@ -23,13 +23,12 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
   const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
-  // One QboClient per process — shared across sessions so warmup populates
-  // the access token for the first real request, and single-flight refresh
-  // applies across concurrent tool calls.
+  // One QboClient per process — shared across sessions so single-flight refresh
+  // applies across concurrent tool calls. Refresh happens lazily on the first
+  // real request rather than on cold start, so two near-simultaneous cold
+  // starts don't both race the same refresh token to Intuit (which would trip
+  // refresh-token-reuse detection and revoke the whole token family).
   const qboClient = qboConfig ? new QboClient(qboConfig) : undefined;
-  if (qboClient) {
-    void qboClient.warmup();
-  }
 
   const app = createMcpExpressApp({ host: "0.0.0.0" });
 

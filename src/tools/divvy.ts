@@ -146,4 +146,25 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
     {},
     (args) => runTool('divvy_list_members', args, () => client.listMembers()),
   );
+
+  server.tool(
+    'divvy_list_pending_action',
+    'List Divvy transactions that need action, in two buckets: (1) pendingFields — required NAP CODES / Notes / receipt are missing, the cardholder or the treasurer can fill them; (2) pendingReview — every required field is filled but a reviewer is still WAITING to approve. Each row carries a `blockers` array naming exactly what is missing, a `waitingReviewers` list for items in the second bucket, and a `reviewUrl` pointing to the transaction in BILL S&E (Tim can tap to open it directly — render this as a Markdown link in any summary you send him). Use this instead of divvy_list_transactions when triaging open work.',
+    {
+      reviewerUuid: z
+        .string()
+        .optional()
+        .describe(
+          'If set, only return pendingReview rows where this userUuid is the WAITING reviewer. Look it up via divvy_list_members.',
+        ),
+      since: z
+        .string()
+        .optional()
+        .describe('Optional lower bound on transaction date (YYYY-MM-DD). Defaults to all history.'),
+    },
+    (args) =>
+      runTool('divvy_list_pending_action', args, ({ reviewerUuid, since }) =>
+        client.listPendingAction({ reviewerUuid, since }),
+      ),
+  );
 }

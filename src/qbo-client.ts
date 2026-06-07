@@ -299,7 +299,37 @@ export class QboClient {
       throw new QboError(`QBO upload error ${res.status}: ${text}`, res.status, text);
     }
 
-    return res.json();
+    // QBO's /upload returns HTTP 200 even when an individual file fails: each
+    // AttachableResponse entry carries either an Attachable (success) or a Fault.
+    // Surface the Fault instead of reporting a fake success.
+    const json = (await res.json()) as {
+      AttachableResponse?: Array<{
+        Attachable?: unknown;
+        Fault?: { Error?: Array<{ Message?: string; Detail?: string; code?: string }>; type?: string };
+      }>;
+    };
+
+    const entries = json.AttachableResponse ?? [];
+    const fault = entries.find((e) => e.Fault)?.Fault;
+    if (fault) {
+      const detail = (fault.Error ?? [])
+        .map((e) => [e.Message, e.Detail, e.code && `code=${e.code}`].filter(Boolean).join(" — "))
+        .join("; ");
+      throw new QboError(
+        `QBO upload faulted (${fault.type ?? "unknown"}): ${detail || "no detail"}`,
+        200,
+        json,
+      );
+    }
+    if (!entries.some((e) => e.Attachable)) {
+      throw new QboError(
+        "QBO upload returned no Attachable and no Fault — file was not persisted",
+        200,
+        json,
+      );
+    }
+
+    return json;
   }
 
   // --- Convenience methods ---

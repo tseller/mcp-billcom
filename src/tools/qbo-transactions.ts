@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { QboClient, QboError } from "../qbo-client.js";
+import { sniffContentType } from "../mime.js";
 
 function err(e: unknown) {
   const msg = e instanceof QboError ? e.message : String(e);
@@ -138,6 +139,48 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         if (endDate) conditions.push(`TxnDate <= '${endDate}'`);
         const where = conditions.join(" AND ");
         const result = await client.queryTransfers(where, startPosition ?? 1, maxResults ?? 100);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
+    "qbo_attach_file",
+    "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
+    {
+      entityType: z
+        .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
+        .describe("QBO entity type of the transaction to attach to"),
+      entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
+      fileBase64: z.string().describe("Base64-encoded file bytes (image or PDF)"),
+      fileName: z.string().optional().describe("File name to store in QBO (default: attachment)"),
+      contentType: z
+        .string()
+        .optional()
+        .describe("Optional MIME override. Only set this if the auto-detected type is wrong."),
+    },
+    async ({ entityType, entityId, fileBase64, fileName, contentType }) => {
+      try {
+        const fileData = Buffer.from(fileBase64, "base64");
+        const sniffed = sniffContentType(fileData);
+        const mime = contentType || sniffed || "application/octet-stream";
+        if (contentType && sniffed && contentType !== sniffed) {
+          console.error(
+            `[tool] qbo_attach_file warn=mime_mismatch override=${contentType} sniffed=${sniffed}`,
+          );
+        }
+        const name = fileName || "attachment";
+        console.error(
+          `[tool] qbo_attach_file entityType=${entityType} entityId=${entityId} mime=${mime} sniffed=${sniffed ?? "unknown"} override=${contentType ?? "none"} bytes=${fileData.length}`,
+        );
+        const result = await client.uploadAttachment(entityType, entityId, name, mime, fileData);
+        const attachableId = (result as { AttachableResponse?: Array<{ Attachable?: { Id?: string } }> })
+          ?.AttachableResponse?.[0]?.Attachable?.Id;
+        console.error(
+          `[tool] qbo_attach_file step=done entityType=${entityType} entityId=${entityId} attachableId=${attachableId ?? "unknown"}`,
+        );
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (e) {
         return err(e);

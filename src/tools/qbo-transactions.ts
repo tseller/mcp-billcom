@@ -249,10 +249,13 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
 
   server.tool(
     "qbo_update_deposit",
-    "Update a deposit transaction — recategorize a line's income account and/or attributed entity, or change the memo. Parity with qbo_update_purchase. You must include Id and SyncToken (from get_deposit). Sparse update: only the fields you pass are changed. Note: passing lines REPLACES all existing lines, so include every line you want to keep.",
+    "Update a deposit transaction — recategorize a line's income account and/or attributed entity, or change the memo. Parity with qbo_update_purchase. You must include Id, SyncToken, and depositToAccountId (all from get_deposit) — QBO requires the deposit-to account even in a sparse update. Sparse update: only the fields you pass are changed. Note: passing lines REPLACES all existing lines, so include every line you want to keep.",
     {
       id: z.string().describe("Deposit ID"),
       syncToken: z.string().describe("SyncToken from the current version (required for optimistic locking)"),
+      depositToAccountId: z
+        .string()
+        .describe("Bank account the deposit lands in (DepositToAccountRef value, from get_deposit) — QBO requires this in the update payload"),
       memo: z.string().optional().describe("Private note/memo"),
       lines: z
         .array(
@@ -270,12 +273,14 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         .optional()
         .describe("Replace all line items with this new set"),
     },
-    async ({ id, syncToken, memo, lines }) => {
+    async ({ id, syncToken, depositToAccountId, memo, lines }) => {
       try {
         const update: Record<string, unknown> = {
           Id: id,
           SyncToken: syncToken,
           sparse: true,
+          // QBO rejects a sparse Deposit update without DepositToAccountRef (ValidationFault 2020).
+          DepositToAccountRef: { value: depositToAccountId },
         };
         if (memo) update.PrivateNote = memo;
         if (lines) {

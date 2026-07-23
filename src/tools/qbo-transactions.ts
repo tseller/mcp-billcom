@@ -101,6 +101,58 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
   );
 
   server.tool(
+    "qbo_create_purchase",
+    "Create an expense/purchase transaction in QuickBooks — the outflow side (bill-pay checks, Divvy eWallet debits, Bill.com payments). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the bank/CC account the money left, the payment type, one or more expense lines, and (for checks) the check number as docNumber.",
+    {
+      paymentType: z
+        .enum(["Check", "Cash", "CreditCard"])
+        .describe("How it was paid: Check, Cash, or CreditCard"),
+      accountId: z
+        .string()
+        .describe("Bank/CC account the money came out of (AccountRef value, e.g. 14 for Chase)"),
+      txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
+      vendorId: z.string().optional().describe("Payee vendor ID (EntityRef value)"),
+      docNumber: z.string().optional().describe("Document/check number"),
+      memo: z.string().optional().describe("Private note/memo"),
+      lines: z
+        .array(
+          z.object({
+            amount: z.number().describe("Line amount (positive)"),
+            accountId: z.string().describe("Expense account ID (from chart of accounts)"),
+            description: z.string().optional().describe("Line description"),
+          }),
+        )
+        .min(1)
+        .describe("Expense lines — at least one required"),
+    },
+    async ({ paymentType, accountId, txnDate, vendorId, docNumber, memo, lines }) => {
+      try {
+        const purchase: Record<string, unknown> = {
+          PaymentType: paymentType,
+          AccountRef: { value: accountId },
+          Line: lines.map((l) => ({
+            Amount: l.amount,
+            DetailType: "AccountBasedExpenseLineDetail",
+            AccountBasedExpenseLineDetail: {
+              AccountRef: { value: l.accountId },
+            },
+            Description: l.description,
+          })),
+        };
+        if (txnDate) purchase.TxnDate = txnDate;
+        if (vendorId) purchase.EntityRef = { type: "Vendor", value: vendorId };
+        if (docNumber) purchase.DocNumber = docNumber;
+        if (memo) purchase.PrivateNote = memo;
+
+        const result = await client.createPurchase(purchase);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
     "qbo_list_deposits",
     "List deposit transactions. Filter by date range.",
     {
@@ -124,6 +176,132 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
   );
 
   server.tool(
+    "qbo_get_deposit",
+    "Get a single deposit transaction by ID. Returns full details including line items and SyncToken (needed for update_deposit).",
+    {
+      id: z.string().describe("Deposit transaction ID"),
+    },
+    async ({ id }) => {
+      try {
+        const result = await client.getDeposit(id);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
+    "qbo_create_deposit",
+    "Create a deposit transaction in QuickBooks — the inflow side (e.g. Sports Connect ACH credits into Chase). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the deposit-to bank account and one or more lines, each crediting an income account and optionally attributing an entity (customer/vendor).",
+    {
+      depositToAccountId: z
+        .string()
+        .describe("Bank account the funds land in (DepositToAccountRef value, e.g. 14 for Chase)"),
+      txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
+      memo: z.string().optional().describe("Private note/memo"),
+      lines: z
+        .array(
+          z.object({
+            amount: z.number().describe("Line amount (positive)"),
+            accountId: z
+              .string()
+              .describe("Income account to credit (e.g. 4005 Registration Fees)"),
+            entityId: z.string().optional().describe("Attributed entity ID (customer/vendor/employee)"),
+            entityType: z
+              .enum(["Vendor", "Customer", "Employee"])
+              .optional()
+              .describe("Entity type for entityId (default Vendor)"),
+            description: z.string().optional().describe("Line description"),
+          }),
+        )
+        .min(1)
+        .describe("Deposit lines — at least one required"),
+    },
+    async ({ depositToAccountId, txnDate, memo, lines }) => {
+      try {
+        const deposit: Record<string, unknown> = {
+          DepositToAccountRef: { value: depositToAccountId },
+          Line: lines.map((l) => {
+            const detail: Record<string, unknown> = {
+              AccountRef: { value: l.accountId },
+            };
+            // Deposit line entity is a plain ReferenceType: lowercase { value, type }.
+            if (l.entityId) detail.Entity = { value: l.entityId, type: l.entityType ?? "Vendor" };
+            return {
+              Amount: l.amount,
+              DetailType: "DepositLineDetail",
+              DepositLineDetail: detail,
+              Description: l.description,
+            };
+          }),
+        };
+        if (txnDate) deposit.TxnDate = txnDate;
+        if (memo) deposit.PrivateNote = memo;
+
+        const result = await client.createDeposit(deposit);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
+    "qbo_update_deposit",
+    "Update a deposit transaction — recategorize a line's income account and/or attributed entity, or change the memo. Parity with qbo_update_purchase. You must include Id and SyncToken (from get_deposit). Sparse update: only the fields you pass are changed. Note: passing lines REPLACES all existing lines, so include every line you want to keep.",
+    {
+      id: z.string().describe("Deposit ID"),
+      syncToken: z.string().describe("SyncToken from the current version (required for optimistic locking)"),
+      memo: z.string().optional().describe("Private note/memo"),
+      lines: z
+        .array(
+          z.object({
+            amount: z.number().describe("Line amount (positive)"),
+            accountId: z.string().describe("Income account to credit"),
+            entityId: z.string().optional().describe("Attributed entity ID (customer/vendor/employee)"),
+            entityType: z
+              .enum(["Vendor", "Customer", "Employee"])
+              .optional()
+              .describe("Entity type for entityId (default Vendor)"),
+            description: z.string().optional().describe("Line description"),
+          }),
+        )
+        .optional()
+        .describe("Replace all line items with this new set"),
+    },
+    async ({ id, syncToken, memo, lines }) => {
+      try {
+        const update: Record<string, unknown> = {
+          Id: id,
+          SyncToken: syncToken,
+          sparse: true,
+        };
+        if (memo) update.PrivateNote = memo;
+        if (lines) {
+          update.Line = lines.map((l) => {
+            const detail: Record<string, unknown> = {
+              AccountRef: { value: l.accountId },
+            };
+            if (l.entityId) detail.Entity = { value: l.entityId, type: l.entityType ?? "Vendor" };
+            return {
+              Amount: l.amount,
+              DetailType: "DepositLineDetail",
+              DepositLineDetail: detail,
+              Description: l.description,
+            };
+          });
+        }
+
+        const result = await client.updateDeposit(update);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
     "qbo_list_transfers",
     "List bank transfer transactions. Filter by date range.",
     {
@@ -139,6 +317,107 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         if (endDate) conditions.push(`TxnDate <= '${endDate}'`);
         const where = conditions.join(" AND ");
         const result = await client.queryTransfers(where, startPosition ?? 1, maxResults ?? 100);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
+    "qbo_create_transfer",
+    "Create a bank transfer between two of your own accounts (e.g. Chase → Divvy payment booked as a transfer rather than a check). Moves the amount out of fromAccount and into toAccount.",
+    {
+      fromAccountId: z.string().describe("Source account ID (FromAccountRef value)"),
+      toAccountId: z.string().describe("Destination account ID (ToAccountRef value)"),
+      amount: z.number().describe("Transfer amount (positive)"),
+      txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
+      memo: z.string().optional().describe("Private note/memo"),
+    },
+    async ({ fromAccountId, toAccountId, amount, txnDate, memo }) => {
+      try {
+        const transfer: Record<string, unknown> = {
+          FromAccountRef: { value: fromAccountId },
+          ToAccountRef: { value: toAccountId },
+          Amount: amount,
+        };
+        if (txnDate) transfer.TxnDate = txnDate;
+        if (memo) transfer.PrivateNote = memo;
+
+        const result = await client.createTransfer(transfer);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
+    "qbo_create_journal_entry",
+    "Create a journal entry — debit and credit lines that must balance (total debits = total credits). Used for adjustments like moving fall pre-collections into 2510 Deferred Registration Fees and recognizing them when the season starts. Each line specifies a posting type (Debit or Credit), an account, and optionally an attributed entity.",
+    {
+      txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
+      memo: z.string().optional().describe("Private note/memo"),
+      lines: z
+        .array(
+          z.object({
+            amount: z.number().describe("Line amount (positive)"),
+            postingType: z.enum(["Debit", "Credit"]).describe("Debit or Credit"),
+            accountId: z.string().describe("Account ID (from chart of accounts)"),
+            entityId: z.string().optional().describe("Attributed entity ID (customer/vendor/employee)"),
+            entityType: z
+              .enum(["Vendor", "Customer", "Employee"])
+              .optional()
+              .describe("Entity type for entityId (default Vendor)"),
+            description: z.string().optional().describe("Line description"),
+          }),
+        )
+        .min(2)
+        .describe("At least two lines; total Debits must equal total Credits"),
+    },
+    async ({ txnDate, memo, lines }) => {
+      try {
+        const totalDebit = lines
+          .filter((l) => l.postingType === "Debit")
+          .reduce((s, l) => s + l.amount, 0);
+        const totalCredit = lines
+          .filter((l) => l.postingType === "Credit")
+          .reduce((s, l) => s + l.amount, 0);
+        // Guard client-side so we return a clear message instead of QBO's generic fault.
+        if (Math.abs(totalDebit - totalCredit) > 0.005) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: journal entry is unbalanced — debits ${totalDebit.toFixed(2)} vs credits ${totalCredit.toFixed(2)}. They must be equal.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const journalEntry: Record<string, unknown> = {
+          Line: lines.map((l) => {
+            const detail: Record<string, unknown> = {
+              PostingType: l.postingType,
+              AccountRef: { value: l.accountId },
+            };
+            // JournalEntry line entity nests differently from Deposit: { Type, EntityRef: { value } }.
+            if (l.entityId) {
+              detail.Entity = { Type: l.entityType ?? "Vendor", EntityRef: { value: l.entityId } };
+            }
+            return {
+              Amount: l.amount,
+              DetailType: "JournalEntryLineDetail",
+              JournalEntryLineDetail: detail,
+              Description: l.description,
+            };
+          }),
+        };
+        if (txnDate) journalEntry.TxnDate = txnDate;
+        if (memo) journalEntry.PrivateNote = memo;
+
+        const result = await client.createJournalEntry(journalEntry);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (e) {
         return err(e);

@@ -33,7 +33,7 @@ gcloud config configurations activate mcp-billcom
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
-- `src/tools/qbo-transactions.ts` — QBO: list/get/update purchases, list deposits, list transfers
+- `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits; list/create transfers; create journal entries; attach files
 - `src/tools/qbo-reports.ts` — QBO: transaction_report, profit_loss, balance_sheet
 - SDK: `@modelcontextprotocol/sdk` ^1.26.0
 - All logging goes to stderr (stdout is MCP protocol)

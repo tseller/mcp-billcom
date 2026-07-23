@@ -373,6 +373,10 @@ export class QboClient {
     return this.request("POST", "/purchase", purchase);
   }
 
+  async createPurchase(purchase: Record<string, unknown>) {
+    return this.request("POST", "/purchase", purchase);
+  }
+
   async queryDeposits(where: string, startPosition = 1, maxResults = 100) {
     const clause = where ? `WHERE ${where}` : "";
     return this.query(
@@ -384,10 +388,26 @@ export class QboClient {
     return this.request("GET", `/deposit/${id}`);
   }
 
+  async createDeposit(deposit: Record<string, unknown>) {
+    return this.request("POST", "/deposit", deposit);
+  }
+
+  async updateDeposit(deposit: Record<string, unknown>) {
+    return this.request("POST", "/deposit", deposit);
+  }
+
   async queryTransfers(where: string, startPosition = 1, maxResults = 100) {
     const clause = where ? `WHERE ${where}` : "";
     return this.query(
       `SELECT * FROM Transfer ${clause} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
     );
+  }
+
+  async createTransfer(transfer: Record<string, unknown>) {
+    return this.request("POST", "/transfer", transfer);
+  }
+
+  async createJournalEntry(journalEntry: Record<string, unknown>) {
+    return this.request("POST", "/journalentry", journalEntry);
   }
 }

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import express from "express";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { QboConfig } from "./qbo-client.js";
 import { QboClient } from "./qbo-client.js";
@@ -30,7 +30,15 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   // refresh-token-reuse detection and revoke the whole token family).
   const qboClient = qboConfig ? new QboClient(qboConfig) : undefined;
 
-  const app = createMcpExpressApp({ host: "0.0.0.0" });
+  // Build the Express app ourselves so we control the JSON body limit.
+  // The SDK's createMcpExpressApp hard-codes express.json() at express's
+  // default 100kb, which rejects receipt-photo attachments — a 2-3MB JPEG is
+  // ~3-4MB as base64 inside the JSON-RPC body. 25mb leaves ample headroom and
+  // stays under Cloud Run's 32MB request cap. For our 0.0.0.0 bind the SDK
+  // helper adds no DNS-rebinding middleware anyway, so this is otherwise
+  // equivalent (and /mcp is still bearer-protected below).
+  const app = express();
+  app.use(express.json({ limit: "25mb" }));
 
   // Mount OAuth routes if Google credentials are configured
   if (googleClientId && googleClientSecret) {

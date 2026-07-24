@@ -410,4 +410,10 @@ export class QboClient {
   async createJournalEntry(journalEntry: Record<string, unknown>) {
     return this.request("POST", "/journalentry", journalEntry);
   }
+
+  async queryAttachables(entityType: string, entityId: string) {
+    return this.query(
+      `SELECT * FROM attachable WHERE AttachableRef.EntityRef.Type = '${entityType}' AND AttachableRef.EntityRef.value = '${entityId}'`,
+    );
+  }
 }

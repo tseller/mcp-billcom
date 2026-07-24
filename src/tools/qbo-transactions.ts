@@ -2,6 +2,8 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { QboClient, QboError } from "../qbo-client.js";
 import { sniffContentType } from "../mime.js";
+import { IdempotencyStore, withIdempotency } from "../idempotency.js";
+import type { GmailClient } from "../gmail-client.js";
 
 function err(e: unknown) {
   const msg = e instanceof QboError ? e.message : String(e);
@@ -38,7 +40,33 @@ async function fetchFileFromUrl(
   return { data, contentType, fileName };
 }
 
-export function registerQboTransactionTools(server: McpServer, client: QboClient) {
+export interface QboTransactionToolDeps {
+  /** Enables optional idempotencyKey on the create tools. */
+  idempotency?: IdempotencyStore;
+  /** Enables the Gmail source on qbo_attach_file. */
+  gmail?: GmailClient;
+}
+
+const IDEMPOTENCY_KEY_DESC =
+  "Optional idempotency key (any unique string, e.g. a UUID per logical create). If a create with this key already succeeded, the original result is returned instead of creating a duplicate — makes retries after ambiguous 5xx errors safe.";
+
+export function registerQboTransactionTools(
+  server: McpServer,
+  client: QboClient,
+  deps: QboTransactionToolDeps = {},
+) {
+  const { idempotency, gmail } = deps;
+
+  /** Run a create under an optional idempotency key (no-op passthrough when no store is wired). */
+  async function idempotentCreate(
+    tool: string,
+    key: string | undefined,
+    create: () => Promise<unknown>,
+  ): Promise<unknown> {
+    if (!idempotency) return create();
+    return withIdempotency(idempotency, tool, key, create);
+  }
+
   server.tool(
     "qbo_list_purchases",
     "List expense/purchase transactions from QuickBooks. These include credit card charges, checks, and cash purchases. Filter by date range, account, or vendor.",
@@ -172,8 +200,9 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         )
         .min(1)
         .describe("Expense lines — at least one required"),
+      idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ paymentType, accountId, txnDate, vendorId, docNumber, memo, lines }) => {
+    async ({ paymentType, accountId, txnDate, vendorId, docNumber, memo, lines, idempotencyKey }) => {
       try {
         const purchase: Record<string, unknown> = {
           PaymentType: paymentType,
@@ -192,7 +221,9 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         if (docNumber) purchase.DocNumber = docNumber;
         if (memo) purchase.PrivateNote = memo;
 
-        const result = await client.createPurchase(purchase);
+        const result = await idempotentCreate("qbo_create_purchase", idempotencyKey, () =>
+          client.createPurchase(purchase),
+        );
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (e) {
         return err(e);
@@ -239,55 +270,67 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
     },
   );
 
+  const depositLineSchema = z.object({
+    amount: z.number().describe("Line amount (positive)"),
+    accountId: z.string().describe("Income account to credit (e.g. 4005 Registration Fees)"),
+    entityId: z.string().optional().describe("Attributed entity ID (customer/vendor/employee)"),
+    entityType: z
+      .enum(["Vendor", "Customer", "Employee"])
+      .optional()
+      .describe("Entity type for entityId (default Vendor)"),
+    description: z.string().optional().describe("Line description"),
+  });
+  type DepositLineInput = z.infer<typeof depositLineSchema>;
+
+  function buildDepositLines(lines: DepositLineInput[]) {
+    return lines.map((l) => {
+      const detail: Record<string, unknown> = {
+        AccountRef: { value: l.accountId },
+      };
+      // Deposit line entity is a plain ReferenceType: lowercase { value, type }.
+      if (l.entityId) detail.Entity = { value: l.entityId, type: l.entityType ?? "Vendor" };
+      return {
+        Amount: l.amount,
+        DetailType: "DepositLineDetail",
+        DepositLineDetail: detail,
+        Description: l.description,
+      };
+    });
+  }
+
+  function buildDeposit(item: {
+    depositToAccountId: string;
+    txnDate?: string;
+    memo?: string;
+    lines: DepositLineInput[];
+  }): Record<string, unknown> {
+    const deposit: Record<string, unknown> = {
+      DepositToAccountRef: { value: item.depositToAccountId },
+      Line: buildDepositLines(item.lines),
+    };
+    if (item.txnDate) deposit.TxnDate = item.txnDate;
+    if (item.memo) deposit.PrivateNote = item.memo;
+    return deposit;
+  }
+
   server.tool(
     "qbo_create_deposit",
-    "Create a deposit transaction in QuickBooks — the inflow side (e.g. Sports Connect ACH credits into Chase). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the deposit-to bank account and one or more lines, each crediting an income account and optionally attributing an entity (customer/vendor).",
+    "Create a deposit transaction in QuickBooks — the inflow side (e.g. Sports Connect ACH credits into Chase). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the deposit-to bank account and one or more lines, each crediting an income account and optionally attributing an entity (customer/vendor). For many similar deposits, prefer qbo_create_deposits_batch.",
     {
       depositToAccountId: z
         .string()
         .describe("Bank account the funds land in (DepositToAccountRef value, e.g. 14 for Chase)"),
       txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
       memo: z.string().optional().describe("Private note/memo"),
-      lines: z
-        .array(
-          z.object({
-            amount: z.number().describe("Line amount (positive)"),
-            accountId: z
-              .string()
-              .describe("Income account to credit (e.g. 4005 Registration Fees)"),
-            entityId: z.string().optional().describe("Attributed entity ID (customer/vendor/employee)"),
-            entityType: z
-              .enum(["Vendor", "Customer", "Employee"])
-              .optional()
-              .describe("Entity type for entityId (default Vendor)"),
-            description: z.string().optional().describe("Line description"),
-          }),
-        )
-        .min(1)
-        .describe("Deposit lines — at least one required"),
+      lines: z.array(depositLineSchema).min(1).describe("Deposit lines — at least one required"),
+      idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ depositToAccountId, txnDate, memo, lines }) => {
+    async ({ depositToAccountId, txnDate, memo, lines, idempotencyKey }) => {
       try {
-        const deposit: Record<string, unknown> = {
-          DepositToAccountRef: { value: depositToAccountId },
-          Line: lines.map((l) => {
-            const detail: Record<string, unknown> = {
-              AccountRef: { value: l.accountId },
-            };
-            // Deposit line entity is a plain ReferenceType: lowercase { value, type }.
-            if (l.entityId) detail.Entity = { value: l.entityId, type: l.entityType ?? "Vendor" };
-            return {
-              Amount: l.amount,
-              DetailType: "DepositLineDetail",
-              DepositLineDetail: detail,
-              Description: l.description,
-            };
-          }),
-        };
-        if (txnDate) deposit.TxnDate = txnDate;
-        if (memo) deposit.PrivateNote = memo;
-
-        const result = await client.createDeposit(deposit);
+        const deposit = buildDeposit({ depositToAccountId, txnDate, memo, lines });
+        const result = await idempotentCreate("qbo_create_deposit", idempotencyKey, () =>
+          client.createDeposit(deposit),
+        );
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (e) {
         return err(e);
@@ -296,14 +339,68 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
   );
 
   server.tool(
+    "qbo_create_deposits_batch",
+    "Create multiple deposits in one call — each item has the same shape as qbo_create_deposit. Items run sequentially server-side and every item reports its own success/failure, so one bad item doesn't abort the rest. Give each item an idempotencyKey so the whole batch can be safely re-sent after an ambiguous network error: already-created items replay instead of duplicating.",
+    {
+      deposits: z
+        .array(
+          z.object({
+            depositToAccountId: z
+              .string()
+              .describe("Bank account the funds land in (DepositToAccountRef value)"),
+            txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD"),
+            memo: z.string().optional().describe("Private note/memo"),
+            lines: z.array(depositLineSchema).min(1).describe("Deposit lines"),
+            idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
+          }),
+        )
+        .min(1)
+        .max(50)
+        .describe("Deposits to create, in order (max 50 per call)"),
+    },
+    async ({ deposits }) => {
+      const results: Array<Record<string, unknown>> = [];
+      for (const [i, item] of deposits.entries()) {
+        try {
+          const result = await idempotentCreate("qbo_create_deposit", item.idempotencyKey, () =>
+            client.createDeposit(buildDeposit(item)),
+          );
+          results.push({ index: i, ok: true, result });
+        } catch (e) {
+          const msg = e instanceof QboError ? e.message : String(e);
+          results.push({ index: i, ok: false, error: msg });
+        }
+      }
+      const failed = results.filter((r) => !r.ok).length;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { total: deposits.length, succeeded: deposits.length - failed, failed, results },
+              null,
+              2,
+            ),
+          },
+        ],
+        ...(failed === deposits.length ? { isError: true } : {}),
+      };
+    },
+  );
+
+  server.tool(
     "qbo_update_deposit",
-    "Update a deposit transaction — recategorize a line's income account and/or attributed entity, or change the memo. Parity with qbo_update_purchase. You must include Id, SyncToken, and depositToAccountId (all from get_deposit) — QBO requires the deposit-to account even in a sparse update. Sparse update: only the fields you pass are changed. Note: passing lines REPLACES all existing lines, so include every line you want to keep.",
+    "Update a deposit transaction — recategorize a line's income account and/or attributed entity, or change the memo. Parity with qbo_update_purchase. Sparse update: only the fields you pass are changed. The current DepositToAccountRef is fetched and carried over automatically (QBO requires it even in sparse updates), and SyncToken is auto-filled from the current version if omitted. Note: passing lines REPLACES all existing lines, so include every line you want to keep.",
     {
       id: z.string().describe("Deposit ID"),
-      syncToken: z.string().describe("SyncToken from the current version (required for optimistic locking)"),
+      syncToken: z
+        .string()
+        .optional()
+        .describe("SyncToken for optimistic locking. Omit to use the current version's token automatically."),
       depositToAccountId: z
         .string()
-        .describe("Bank account the deposit lands in (DepositToAccountRef value, from get_deposit) — QBO requires this in the update payload"),
+        .optional()
+        .describe("Bank account the deposit lands in (DepositToAccountRef value). Omit to keep the current account (fetched automatically)."),
       memo: z.string().optional().describe("Private note/memo"),
       lines: z
         .array(
@@ -323,12 +420,26 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
     },
     async ({ id, syncToken, depositToAccountId, memo, lines }) => {
       try {
+        // QBO rejects a sparse Deposit update without DepositToAccountRef
+        // (ValidationFault 2020) — fetch the current txn and carry it over.
+        const current = (await client.getDeposit(id)) as {
+          Deposit?: { DepositToAccountRef?: unknown; SyncToken?: string };
+        };
+        const existing = current.Deposit;
+        if (!existing) {
+          return {
+            content: [{ type: "text" as const, text: `Error: deposit ${id} not found` }],
+            isError: true,
+          };
+        }
+
         const update: Record<string, unknown> = {
           Id: id,
-          SyncToken: syncToken,
+          SyncToken: syncToken ?? existing.SyncToken,
           sparse: true,
-          // QBO rejects a sparse Deposit update without DepositToAccountRef (ValidationFault 2020).
-          DepositToAccountRef: { value: depositToAccountId },
+          DepositToAccountRef: depositToAccountId
+            ? { value: depositToAccountId }
+            : existing.DepositToAccountRef,
         };
         if (memo) update.PrivateNote = memo;
         if (lines) {
@@ -386,8 +497,9 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
       amount: z.number().describe("Transfer amount (positive)"),
       txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
       memo: z.string().optional().describe("Private note/memo"),
+      idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ fromAccountId, toAccountId, amount, txnDate, memo }) => {
+    async ({ fromAccountId, toAccountId, amount, txnDate, memo, idempotencyKey }) => {
       try {
         const transfer: Record<string, unknown> = {
           FromAccountRef: { value: fromAccountId },
@@ -397,7 +509,9 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         if (txnDate) transfer.TxnDate = txnDate;
         if (memo) transfer.PrivateNote = memo;
 
-        const result = await client.createTransfer(transfer);
+        const result = await idempotentCreate("qbo_create_transfer", idempotencyKey, () =>
+          client.createTransfer(transfer),
+        );
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (e) {
         return err(e);
@@ -427,8 +541,9 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         )
         .min(2)
         .describe("At least two lines; total Debits must equal total Credits"),
+      idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ txnDate, memo, lines }) => {
+    async ({ txnDate, memo, lines, idempotencyKey }) => {
       try {
         const totalDebit = lines
           .filter((l) => l.postingType === "Debit")
@@ -470,7 +585,9 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
         if (txnDate) journalEntry.TxnDate = txnDate;
         if (memo) journalEntry.PrivateNote = memo;
 
-        const result = await client.createJournalEntry(journalEntry);
+        const result = await idempotentCreate("qbo_create_journal_entry", idempotencyKey, () =>
+          client.createJournalEntry(journalEntry),
+        );
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (e) {
         return err(e);
@@ -480,7 +597,7 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
 
   server.tool(
     "qbo_attach_file",
-    "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Provide the file as either fileBase64 (raw bytes) or fileUrl (an https URL the server fetches directly — no base64 detour). Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
+    "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Provide the file ONE of three ways: fileUrl (https URL the server fetches directly), gmailMessageId + gmailAttachmentId (server pulls the attachment straight from Gmail — use the Gmail MCP to find the ids), or fileBase64 (raw bytes, fallback). File bytes are validated by magic numbers (PDF, JPEG, PNG, GIF, WebP, HEIC) before upload. Returns the created Attachable id and filename. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
     {
       entityType: z
         .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
@@ -489,65 +606,193 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
       fileBase64: z
         .string()
         .optional()
-        .describe("Base64-encoded file bytes (image or PDF). Provide exactly one of fileBase64 or fileUrl."),
+        .describe("Base64-encoded file bytes (image or PDF). Fallback — prefer fileUrl or the Gmail source."),
       fileUrl: z
         .string()
         .url()
         .optional()
+        .describe("https URL to fetch the file from server-side (e.g. an invoice download link)."),
+      gmailMessageId: z
+        .string()
+        .optional()
+        .describe("Gmail message id containing the attachment (pair with gmailAttachmentId)"),
+      gmailAttachmentId: z
+        .string()
+        .optional()
+        .describe("Gmail attachment id within the message (pair with gmailMessageId)"),
+      gmailAccount: z
+        .string()
+        .optional()
         .describe(
-          "https URL to fetch the file from server-side (e.g. an invoice download link). Provide exactly one of fileBase64 or fileUrl.",
+          "Gmail account email to fetch from. Optional when only one account is configured on the server.",
         ),
       fileName: z
         .string()
         .optional()
         .describe(
-          "File name to store in QBO (default: derived from the URL for fileUrl, else 'attachment')",
+          "File name to store in QBO (default: derived from the Gmail attachment or URL, else 'attachment')",
         ),
       contentType: z
         .string()
         .optional()
         .describe("Optional MIME override. Only set this if the auto-detected type is wrong."),
     },
-    async ({ entityType, entityId, fileBase64, fileUrl, fileName, contentType }) => {
+    async ({
+      entityType,
+      entityId,
+      fileBase64,
+      fileUrl,
+      gmailMessageId,
+      gmailAttachmentId,
+      gmailAccount,
+      fileName,
+      contentType,
+    }) => {
       try {
-        if (!fileBase64 === !fileUrl) {
+        const wantsGmail = !!(gmailMessageId || gmailAttachmentId || gmailAccount);
+        const sources = [!!fileBase64, !!fileUrl, wantsGmail].filter(Boolean).length;
+        if (sources !== 1) {
           return {
             content: [
               {
                 type: "text" as const,
-                text: "Error: provide exactly one of fileBase64 or fileUrl",
+                text: "Error: provide exactly one file source — fileBase64, fileUrl, or gmailMessageId + gmailAttachmentId",
               },
             ],
             isError: true,
           };
         }
+
         let fileData: Buffer;
-        let urlContentType: string | undefined;
-        let urlFileName: string | undefined;
+        let source: string;
+        let sourceContentType: string | undefined;
+        let sourceFileName: string | undefined;
         if (fileUrl) {
-          ({ data: fileData, contentType: urlContentType, fileName: urlFileName } =
+          source = "url";
+          ({ data: fileData, contentType: sourceContentType, fileName: sourceFileName } =
             await fetchFileFromUrl(fileUrl));
+        } else if (wantsGmail) {
+          if (!gmail) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Error: the Gmail source is not configured on this server. Set GMAIL_REFRESH_TOKENS (mint tokens with `npm run gmail:link`) — or use fileUrl/fileBase64.",
+                },
+              ],
+              isError: true,
+            };
+          }
+          if (!gmailMessageId || !gmailAttachmentId) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Error: the Gmail source needs both gmailMessageId and gmailAttachmentId",
+                },
+              ],
+              isError: true,
+            };
+          }
+          source = "gmail";
+          const fetched = await gmail.getAttachment(gmailAccount, gmailMessageId, gmailAttachmentId);
+          fileData = fetched.data;
+          sourceContentType = fetched.mimeType;
+          sourceFileName = fetched.fileName;
         } else {
+          source = "base64";
           fileData = Buffer.from(fileBase64!, "base64");
         }
+
+        // Validate magic bytes before uploading — catches truncated/corrupted
+        // transfers and non-document payloads. contentType is an explicit
+        // escape hatch for formats the sniffer doesn't know.
         const sniffed = sniffContentType(fileData);
-        const mime = contentType || sniffed || urlContentType || "application/octet-stream";
+        if (!sniffed && !contentType) {
+          const head = fileData.subarray(0, 8).toString("hex");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: file bytes don't match any supported format (PDF, JPEG, PNG, GIF, WebP, HEIC) — first bytes: ${head || "(empty)"}, size: ${fileData.length}. If the format is genuinely something else, pass contentType explicitly.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const mime = contentType || sniffed || sourceContentType || "application/octet-stream";
         if (contentType && sniffed && contentType !== sniffed) {
           console.error(
             `[tool] qbo_attach_file warn=mime_mismatch override=${contentType} sniffed=${sniffed}`,
           );
         }
-        const name = fileName || urlFileName || "attachment";
+        const name = fileName || sourceFileName || "attachment";
         console.error(
-          `[tool] qbo_attach_file entityType=${entityType} entityId=${entityId} mime=${mime} sniffed=${sniffed ?? "unknown"} override=${contentType ?? "none"} source=${fileUrl ? "url" : "base64"} bytes=${fileData.length}`,
+          `[tool] qbo_attach_file entityType=${entityType} entityId=${entityId} mime=${mime} sniffed=${sniffed ?? "unknown"} override=${contentType ?? "none"} source=${source} bytes=${fileData.length}`,
         );
         const result = await client.uploadAttachment(entityType, entityId, name, mime, fileData);
-        const attachableId = (result as { AttachableResponse?: Array<{ Attachable?: { Id?: string } }> })
-          ?.AttachableResponse?.[0]?.Attachable?.Id;
+        const attachable = (
+          result as {
+            AttachableResponse?: Array<{ Attachable?: { Id?: string; FileName?: string } }>;
+          }
+        )?.AttachableResponse?.[0]?.Attachable;
         console.error(
-          `[tool] qbo_attach_file step=done entityType=${entityType} entityId=${entityId} attachableId=${attachableId ?? "unknown"}`,
+          `[tool] qbo_attach_file step=done entityType=${entityType} entityId=${entityId} attachableId=${attachable?.Id ?? "unknown"}`,
         );
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        const summary = {
+          attachableId: attachable?.Id,
+          fileName: attachable?.FileName ?? name,
+          contentType: mime,
+          bytes: fileData.length,
+          source,
+          attachedTo: { entityType, entityId },
+        };
+        return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
+    "qbo_list_attachments",
+    "List the files already attached to a QuickBooks transaction — use before qbo_attach_file to avoid duplicate uploads. Returns each attachment's Attachable id, filename, size, and content type.",
+    {
+      entityType: z
+        .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
+        .describe("QBO entity type of the transaction"),
+      entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
+    },
+    async ({ entityType, entityId }) => {
+      try {
+        const result = (await client.queryAttachables(entityType, entityId)) as {
+          QueryResponse?: {
+            Attachable?: Array<{
+              Id?: string;
+              FileName?: string;
+              Size?: number;
+              ContentType?: string;
+              Note?: string;
+              MetaData?: { CreateTime?: string };
+            }>;
+          };
+        };
+        const attachments = (result.QueryResponse?.Attachable ?? []).map((a) => ({
+          attachableId: a.Id,
+          fileName: a.FileName,
+          size: a.Size,
+          contentType: a.ContentType,
+          note: a.Note,
+          createdAt: a.MetaData?.CreateTime,
+        }));
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ count: attachments.length, attachments }, null, 2),
+            },
+          ],
+        };
       } catch (e) {
         return err(e);
       }

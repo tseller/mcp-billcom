@@ -4,6 +4,38 @@ import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
 
+/** One-line-per-transaction shape for compact listings. */
+function compactTransaction(tx: Record<string, unknown>): Record<string, unknown> {
+  const customFields = Array.isArray(tx.customFields)
+    ? (tx.customFields as Array<{ name?: string; selectedValues?: unknown[]; note?: string }>)
+    : [];
+  const fields: Record<string, string> = {};
+  for (const f of customFields) {
+    if (!f.name) continue;
+    const selected = (f.selectedValues ?? [])
+      .map((v) => {
+        if (typeof v === 'string') return v;
+        const o = v as { value?: unknown; label?: unknown; name?: unknown };
+        return String(o.value ?? o.label ?? o.name ?? '');
+      })
+      .filter(Boolean);
+    const value = selected.length > 0 ? selected.join(', ') : (f.note ?? '').trim();
+    if (value) fields[f.name] = value;
+  }
+  return {
+    id: tx.id,
+    uuid: tx.uuid,
+    date: String(tx.occurredTime ?? '').slice(0, 10),
+    status: tx.status,
+    user: tx.userName,
+    merchant: tx.merchantName,
+    amount: tx.amount,
+    receiptStatus: tx.receiptStatus,
+    syncStatus: tx.syncStatus,
+    ...(Object.keys(fields).length > 0 ? { fields } : {}),
+  };
+}
+
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.tool(
     'divvy_list_budgets',
@@ -14,16 +46,49 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
 
   server.tool(
     'divvy_list_transactions',
-    'List Divvy (BILL Spend & Expense) transactions. Each transaction includes: userName (cardholder), merchantName, amount, receiptRequired, syncStatus (PENDING/SYNCED/NOT_SYNCED), and custom fields like NAP CODES and Notes.',
+    'List Divvy (BILL Spend & Expense) transactions. Each transaction includes: userName (cardholder), merchantName, amount, receiptRequired, syncStatus (PENDING/SYNCED/NOT_SYNCED), and custom fields like NAP CODES and Notes. Prefer compact:true unless you need raw fields — it returns one small row per transaction instead of ~2KB of scaffolding each. Use status:"DECLINED" to surface card declines.',
     {
       startDate: z.string().optional().describe('Start date filter (YYYY-MM-DD)'),
       endDate: z.string().optional().describe('End date filter (YYYY-MM-DD)'),
       budgetId: z.string().optional().describe('Filter by budget ID'),
       syncStatus: z.string().optional().describe('Filter by sync status: PENDING, SYNCED, ERROR, MANUAL_SYNCED, NOT_SYNCED'),
+      status: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by transaction status, e.g. CLEARED or DECLINED. Applied per page after fetch, so a page can return fewer rows than pageSize while nextPage is still set.',
+        ),
+      compact: z
+        .boolean()
+        .optional()
+        .describe(
+          'Return one small row per transaction: id, uuid, date, status, cardholder, merchant, amount, receiptStatus, syncStatus, and filled custom-field values (NAP CODES, Notes).',
+        ),
       page: z.string().optional().describe('Page cursor for pagination (from nextPage in previous response)'),
       pageSize: z.string().optional().describe('Number of results per page'),
     },
-    (args) => runTool('divvy_list_transactions', args, (a) => client.listTransactions(a)),
+    (args) =>
+      runTool('divvy_list_transactions', args, async ({ status, compact, ...query }) => {
+        const raw = (await client.listTransactions(query)) as {
+          results?: Array<Record<string, unknown>>;
+          nextPage?: string;
+        };
+        let results = Array.isArray(raw.results) ? raw.results : [];
+        if (status) {
+          results = results.filter(
+            (tx) => String(tx.status ?? '').toUpperCase() === status.toUpperCase(),
+          );
+        }
+        if (!compact) {
+          return status ? { ...raw, results, statusFilter: status } : raw;
+        }
+        return {
+          count: results.length,
+          transactions: results.map(compactTransaction),
+          nextPage: raw.nextPage,
+          ...(status ? { statusFilter: status } : {}),
+        };
+      }),
   );
 
   server.tool(

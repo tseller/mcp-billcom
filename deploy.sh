@@ -11,6 +11,16 @@ SERVICE_URL="https://billcom-mcp-733083913968.us-central1.run.app"
 # from Secret Manager (SecretManagerTokenStore) so rotations write back safely
 # across concurrent instances.
 
+# NOTE on secret rotation: every secret below is pinned to :latest, which Cloud
+# Run resolves at *instance start*. Disabling a secret's latest version bricks
+# all new instance startups (this caused the 2026-07-23 outage — every scale-up
+# 5xx'd until an enabled version existed). When rotating: add the new enabled
+# version first, and never disable the old one until the new one is live.
+
+# Optional Gmail source for qbo_attach_file: after `npm run gmail:link`, store
+# the printed JSON in a GMAIL_REFRESH_TOKENS secret and append to --set-secrets:
+#   GMAIL_REFRESH_TOKENS=GMAIL_REFRESH_TOKENS:latest
+
 gcloud run deploy billcom-mcp \
   --account=tseller@gmail.com \
   --project=mcp-servers-487419 \

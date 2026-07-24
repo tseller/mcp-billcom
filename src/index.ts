@@ -10,6 +10,9 @@ import { registerQboReportTools } from "./tools/qbo-reports.js";
 import { startHttpServer } from "./http-server.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
+import { IdempotencyStore } from "./idempotency.js";
+import { InMemoryOAuthStore } from "./oauth-store.js";
+import { gmailClientFromEnv } from "./gmail-client.js";
 
 // --- QuickBooks config (optional) ---
 
@@ -66,7 +69,12 @@ function registerAllTools(server: McpServer) {
     const qboClient = new QboClient(qboConfig);
     registerQboAccountTools(server, qboClient);
     registerQboVendorTools(server, qboClient);
-    registerQboTransactionTools(server, qboClient);
+    registerQboTransactionTools(server, qboClient, {
+      // stdio runs are single-process and short-lived; in-memory replay
+      // protection still covers retries within a session.
+      idempotency: new IdempotencyStore(new InMemoryOAuthStore()),
+      gmail: gmailClientFromEnv(),
+    });
     registerQboReportTools(server, qboClient);
   }
 

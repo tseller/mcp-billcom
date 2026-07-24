@@ -33,8 +33,11 @@ gcloud config configurations activate mcp-billcom
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
-- `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits; list/create transfers; create journal entries; attach files
+- `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit)
 - `src/tools/qbo-reports.ts` — QBO: transaction_report, profit_loss, balance_sheet
+- `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
+- `src/gmail-client.ts` — Gmail attachment fetch for qbo_attach_file (per-account refresh tokens)
+- `src/scripts/gmail-link.ts` — one-time bootstrap to mint a Gmail refresh token (`npm run gmail:link`)
 - SDK: `@modelcontextprotocol/sdk` ^1.26.0
 - All logging goes to stderr (stdout is MCP protocol)
 
@@ -45,3 +48,10 @@ gcloud config configurations activate mcp-billcom
 - `QBO_REALM_ID` — QuickBooks company ID (obtained during OAuth authorization)
 - `QBO_REFRESH_TOKEN` — OAuth2 refresh token (rolling: update after each refresh)
 - `QBO_BASE_URL` — optional override (default: production)
+
+### Gmail source for qbo_attach_file (optional)
+- `GMAIL_REFRESH_TOKENS` — JSON object mapping account email → OAuth refresh token (scope gmail.readonly). Mint with `npm run gmail:link` (requires the redirect URI, default `http://localhost:8766/callback`, to be allow-listed on the Google OAuth client). For Cloud Run, store as a Secret Manager secret and wire it in deploy.sh.
+- `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` — optional; default to `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`
+
+### Secret rotation (Cloud Run)
+Secrets are mounted as `:latest`, resolved at instance start. Never disable a secret version until a newer enabled version exists — a disabled `latest` aborts all new instance startups (the 2026-07-23 burst-502 outage).

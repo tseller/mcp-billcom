@@ -15,6 +15,8 @@ import { FirestoreOAuthStore } from "./oauth-store.js";
 import { createQboAuthRouter } from "./qbo-auth-callback.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
+import { IdempotencyStore } from "./idempotency.js";
+import { gmailClientFromEnv } from "./gmail-client.js";
 
 export function startHttpServer(qboConfig?: QboConfig): void {
   const transports = new Map<string, StreamableHTTPServerTransport>();
@@ -30,6 +32,13 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   // refresh-token-reuse detection and revoke the whole token family).
   const qboClient = qboConfig ? new QboClient(qboConfig) : undefined;
 
+  // Firestore-backed stores shared across sessions/instances. The Firestore
+  // store works off the metadata-server token, independent of the OAuth layer.
+  const gcpProjectId = process.env.GCP_PROJECT_ID || "mcp-servers-487419";
+  const firestore = new FirestoreOAuthStore(gcpProjectId);
+  const idempotency = new IdempotencyStore(firestore);
+  const gmail = gmailClientFromEnv();
+
   // Build the Express app ourselves so we control the JSON body limit.
   // The SDK's createMcpExpressApp hard-codes express.json() at express's
   // default 100kb, which rejects receipt-photo attachments — a 2-3MB JPEG is
@@ -42,8 +51,7 @@ export function startHttpServer(qboConfig?: QboConfig): void {
 
   // Mount OAuth routes if Google credentials are configured
   if (googleClientId && googleClientSecret) {
-    const gcpProjectId = process.env.GCP_PROJECT_ID || "mcp-servers-487419";
-    const oauthStore = new FirestoreOAuthStore(gcpProjectId);
+    const oauthStore = firestore;
     const oauthRouter = createOAuthRouter(
       { serverUrl, googleClientId, googleClientSecret },
       oauthStore,
@@ -64,6 +72,12 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     app.use(createQboAuthRouter({ clientId: intuitClientId, clientSecret: intuitClientSecret, serverUrl }));
     console.error("[http] QBO auth routes enabled at /qbo/auth");
   }
+
+  // Unauthenticated liveness probe — lets "container up" be distinguished
+  // from "instance failed to start" when diagnosing edge 5xx responses.
+  app.get("/health", (_req: Request, res: Response) => {
+    res.json({ ok: true });
+  });
 
   app.post("/mcp", async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -111,7 +125,7 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     if (qboClient) {
       registerQboAccountTools(server, qboClient);
       registerQboVendorTools(server, qboClient);
-      registerQboTransactionTools(server, qboClient);
+      registerQboTransactionTools(server, qboClient, { idempotency, gmail });
       registerQboReportTools(server, qboClient);
     }
 

@@ -17,9 +17,9 @@ SERVICE_URL="https://billcom-mcp-733083913968.us-central1.run.app"
 # 5xx'd until an enabled version existed). When rotating: add the new enabled
 # version first, and never disable the old one until the new one is live.
 
-# Optional Gmail source for qbo_attach_file: after `npm run gmail:link`, store
-# the printed JSON in a GMAIL_REFRESH_TOKENS secret and append to --set-secrets:
-#   GMAIL_REFRESH_TOKENS=GMAIL_REFRESH_TOKENS:latest
+# GMAIL_REFRESH_TOKENS (JSON: account email -> refresh token) powers the Gmail
+# source on qbo_attach_file. Mint additional accounts with `npm run gmail:link`
+# and merge them into the secret.
 
 gcloud run deploy billcom-mcp \
   --account=tseller@gmail.com \
@@ -29,4 +29,4 @@ gcloud run deploy billcom-mcp \
   --port 8080 \
   --allow-unauthenticated \
   --set-env-vars="MCP_TRANSPORT=http,SERVER_URL=${SERVICE_URL},ALLOWED_EMAILS=tseller@gmail.com" \
-  --set-secrets="BILLCOM_API_BASE_URL=BILLCOM_API_BASE_URL:latest,BILLCOM_USERNAME=BILLCOM_USERNAME:latest,BILLCOM_PASSWORD=BILLCOM_PASSWORD:latest,BILLCOM_ORGANIZATION_ID=BILLCOM_ORGANIZATION_ID:latest,BILLCOM_DEV_KEY=BILLCOM_DEV_KEY:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,INTUIT_CLIENT_ID=INTUIT_CLIENT_ID:latest,INTUIT_CLIENT_SECRET=INTUIT_CLIENT_SECRET:latest,QBO_REALM_ID=QBO_REALM_ID:latest,MCP_API_TOKEN=MCP_API_TOKEN:latest,DIVVY_API_TOKEN=DIVVY_API_TOKEN:latest"
+  --set-secrets="BILLCOM_API_BASE_URL=BILLCOM_API_BASE_URL:latest,BILLCOM_USERNAME=BILLCOM_USERNAME:latest,BILLCOM_PASSWORD=BILLCOM_PASSWORD:latest,BILLCOM_ORGANIZATION_ID=BILLCOM_ORGANIZATION_ID:latest,BILLCOM_DEV_KEY=BILLCOM_DEV_KEY:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,INTUIT_CLIENT_ID=INTUIT_CLIENT_ID:latest,INTUIT_CLIENT_SECRET=INTUIT_CLIENT_SECRET:latest,QBO_REALM_ID=QBO_REALM_ID:latest,MCP_API_TOKEN=MCP_API_TOKEN:latest,DIVVY_API_TOKEN=DIVVY_API_TOKEN:latest,GMAIL_REFRESH_TOKENS=GMAIL_REFRESH_TOKENS:latest"

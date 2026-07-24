@@ -8,6 +8,36 @@ function err(e: unknown) {
   return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
 }
 
+// QBO's documented attachment ceiling is 100MB, but we buffer the whole file in
+// memory on Cloud Run, so cap URL fetches well below that.
+const MAX_URL_FILE_BYTES = 30 * 1024 * 1024;
+
+async function fetchFileFromUrl(
+  fileUrl: string,
+): Promise<{ data: Buffer; contentType?: string; fileName?: string }> {
+  const parsed = new URL(fileUrl);
+  if (parsed.protocol !== "https:") {
+    throw new Error(`fileUrl must be https (got ${parsed.protocol}//)`);
+  }
+  const res = await fetch(fileUrl, { redirect: "follow" });
+  if (!res.ok) {
+    throw new Error(`fetching fileUrl failed: ${res.status} ${res.statusText}`);
+  }
+  const data = Buffer.from(await res.arrayBuffer());
+  if (data.length === 0) throw new Error("fileUrl returned an empty body");
+  if (data.length > MAX_URL_FILE_BYTES) {
+    throw new Error(
+      `fileUrl body is ${data.length} bytes, over the ${MAX_URL_FILE_BYTES}-byte limit`,
+    );
+  }
+  const contentType = res.headers.get("content-type")?.split(";")[0].trim() || undefined;
+  const disposition = res.headers.get("content-disposition") ?? "";
+  const dispositionName = /filename="?([^";]+)"?/i.exec(disposition)?.[1];
+  const lastSegment = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).pop() ?? "");
+  const fileName = dispositionName || (lastSegment.includes(".") ? lastSegment : undefined);
+  return { data, contentType, fileName };
+}
+
 export function registerQboTransactionTools(server: McpServer, client: QboClient) {
   server.tool(
     "qbo_list_purchases",
@@ -54,10 +84,13 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
 
   server.tool(
     "qbo_update_purchase",
-    "Update a purchase transaction — categorize it by setting the expense account, vendor, and/or memo. You must include Id and SyncToken (from get_purchase). Use sparse update: only include fields you want to change plus Id, SyncToken, and sparse=true.",
+    "Update a purchase transaction — categorize it by setting the expense account, vendor, and/or memo. Sparse update: only the fields you pass are changed. The current PaymentType and AccountRef are fetched and carried over automatically (QBO rejects a sparse Purchase update without them), and SyncToken is auto-filled from the current version if omitted.",
     {
       id: z.string().describe("Purchase ID"),
-      syncToken: z.string().describe("SyncToken from the current version (required for optimistic locking)"),
+      syncToken: z
+        .string()
+        .optional()
+        .describe("SyncToken for optimistic locking. Omit to use the current version's token automatically."),
       vendorId: z.string().optional().describe("Set/change the vendor (EntityRef value)"),
       memo: z.string().optional().describe("Private memo/note"),
       lines: z
@@ -73,10 +106,25 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
     },
     async ({ id, syncToken, vendorId, memo, lines }) => {
       try {
+        // QBO rejects a sparse Purchase update without PaymentType and AccountRef
+        // (ValidationFault), so fetch the current transaction and carry them over.
+        const current = (await client.getPurchase(id)) as {
+          Purchase?: { PaymentType?: string; AccountRef?: unknown; SyncToken?: string };
+        };
+        const existing = current.Purchase;
+        if (!existing) {
+          return {
+            content: [{ type: "text" as const, text: `Error: purchase ${id} not found` }],
+            isError: true,
+          };
+        }
+
         const update: Record<string, unknown> = {
           Id: id,
-          SyncToken: syncToken,
+          SyncToken: syncToken ?? existing.SyncToken,
           sparse: true,
+          PaymentType: existing.PaymentType,
+          AccountRef: existing.AccountRef,
         };
 
         if (vendorId) update.EntityRef = { type: "Vendor", value: vendorId };
@@ -432,32 +480,66 @@ export function registerQboTransactionTools(server: McpServer, client: QboClient
 
   server.tool(
     "qbo_attach_file",
-    "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
+    "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Provide the file as either fileBase64 (raw bytes) or fileUrl (an https URL the server fetches directly — no base64 detour). Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
     {
       entityType: z
         .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
         .describe("QBO entity type of the transaction to attach to"),
       entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
-      fileBase64: z.string().describe("Base64-encoded file bytes (image or PDF)"),
-      fileName: z.string().optional().describe("File name to store in QBO (default: attachment)"),
+      fileBase64: z
+        .string()
+        .optional()
+        .describe("Base64-encoded file bytes (image or PDF). Provide exactly one of fileBase64 or fileUrl."),
+      fileUrl: z
+        .string()
+        .url()
+        .optional()
+        .describe(
+          "https URL to fetch the file from server-side (e.g. an invoice download link). Provide exactly one of fileBase64 or fileUrl.",
+        ),
+      fileName: z
+        .string()
+        .optional()
+        .describe(
+          "File name to store in QBO (default: derived from the URL for fileUrl, else 'attachment')",
+        ),
       contentType: z
         .string()
         .optional()
         .describe("Optional MIME override. Only set this if the auto-detected type is wrong."),
     },
-    async ({ entityType, entityId, fileBase64, fileName, contentType }) => {
+    async ({ entityType, entityId, fileBase64, fileUrl, fileName, contentType }) => {
       try {
-        const fileData = Buffer.from(fileBase64, "base64");
+        if (!fileBase64 === !fileUrl) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "Error: provide exactly one of fileBase64 or fileUrl",
+              },
+            ],
+            isError: true,
+          };
+        }
+        let fileData: Buffer;
+        let urlContentType: string | undefined;
+        let urlFileName: string | undefined;
+        if (fileUrl) {
+          ({ data: fileData, contentType: urlContentType, fileName: urlFileName } =
+            await fetchFileFromUrl(fileUrl));
+        } else {
+          fileData = Buffer.from(fileBase64!, "base64");
+        }
         const sniffed = sniffContentType(fileData);
-        const mime = contentType || sniffed || "application/octet-stream";
+        const mime = contentType || sniffed || urlContentType || "application/octet-stream";
         if (contentType && sniffed && contentType !== sniffed) {
           console.error(
             `[tool] qbo_attach_file warn=mime_mismatch override=${contentType} sniffed=${sniffed}`,
           );
         }
-        const name = fileName || "attachment";
+        const name = fileName || urlFileName || "attachment";
         console.error(
-          `[tool] qbo_attach_file entityType=${entityType} entityId=${entityId} mime=${mime} sniffed=${sniffed ?? "unknown"} override=${contentType ?? "none"} bytes=${fileData.length}`,
+          `[tool] qbo_attach_file entityType=${entityType} entityId=${entityId} mime=${mime} sniffed=${sniffed ?? "unknown"} override=${contentType ?? "none"} source=${fileUrl ? "url" : "base64"} bytes=${fileData.length}`,
         );
         const result = await client.uploadAttachment(entityType, entityId, name, mime, fileData);
         const attachableId = (result as { AttachableResponse?: Array<{ Attachable?: { Id?: string } }> })

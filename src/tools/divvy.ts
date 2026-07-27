@@ -121,6 +121,25 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
             `[tool] divvy_upload_receipt warn=mime_mismatch override=${contentType} sniffed=${sniffed}`,
           );
         }
+        // Cheap pre-check: BILL refuses receipt-attach on locked (settled/
+        // reconciled) transactions and returns an opaque 500 "Please retry".
+        // Detect it *before* uploading bytes to S3, so we neither orphan an
+        // S3 object nor surface BILL's misleading error. (issue #2)
+        console.error(
+          `[tool] divvy_upload_receipt step=lockCheck transactionUuid=${transactionUuid}`,
+        );
+        const tx = (await client.getTransaction(transactionUuid)) as { isLocked?: unknown };
+        if (tx && tx.isLocked === true) {
+          console.error(
+            `[tool] divvy_upload_receipt blocked=locked transactionUuid=${transactionUuid}`,
+          );
+          throw new Error(
+            `Transaction ${transactionUuid} is locked/reconciled in BILL; receipts can't be attached via the API ` +
+              `(BILL returns an opaque 500 "Please retry"). Attach the receipt in the BILL Spend & Expense app/UI, ` +
+              `or unlock the transaction first. Tip: attach receipts while a transaction is still fresh/unlocked — ` +
+              `once settled and locked, attach must happen in the BILL UI.`,
+          );
+        }
         console.error(
           `[tool] divvy_upload_receipt step=getUrl transactionUuid=${transactionUuid} mime=${mime} sniffed=${sniffed ?? 'unknown'} override=${contentType ?? 'none'} bytes=${imageData.length}`,
         );

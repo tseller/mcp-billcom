@@ -10,23 +10,21 @@ function err(e: unknown) {
 export function registerQboReportTools(server: McpServer, client: QboClient) {
   server.tool(
     "qbo_transaction_report",
-    "Get a transaction list report for an account and date range. Useful for reconciliation — shows all transactions across types for a given account.",
+    "Get a company-wide TransactionList report for a date range, optionally filtered by reconcile status. NOTE: QBO silently ignores this report's account filter, so this returns ALL accounts — to get transactions for a single account (e.g. for reconciliation) use qbo_reconcile_worksheet or qbo_cleared_transactions, which filter by account client-side.",
     {
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
-      accountId: z.string().optional().describe("Filter by account ID"),
       cleared: z
         .enum(["Reconciled", "Cleared", "Uncleared"])
         .optional()
-        .describe("Filter by reconcile status. For a full reconcile worksheet use qbo_reconcile_worksheet instead."),
+        .describe("Filter by reconcile status. For a per-account reconcile worksheet use qbo_reconcile_worksheet instead."),
     },
-    async ({ startDate, endDate, accountId, cleared }) => {
+    async ({ startDate, endDate, cleared }) => {
       try {
         const params: Record<string, string> = {
           start_date: startDate,
           end_date: endDate,
         };
-        if (accountId) params.account = accountId;
         if (cleared) params.cleared = cleared;
         const result = await client.report("TransactionList", params);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };

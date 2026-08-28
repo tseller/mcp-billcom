@@ -416,4 +416,105 @@ export class QboClient {
       `SELECT * FROM attachable WHERE AttachableRef.EntityRef.Type = '${entityType}' AND AttachableRef.EntityRef.value = '${entityId}'`,
     );
   }
+
+  /**
+   * Fetch the TransactionList report for a single account, optionally filtered
+   * by reconcile status. QBO exposes `cleared` only as a *filter* (values:
+   * "Reconciled", "Cleared", "Uncleared"), never as a per-row column — so a
+   * reconcile worksheet must run one call per status and stitch the results.
+   */
+  async transactionList(params: {
+    accountId: string;
+    startDate: string;
+    endDate: string;
+    cleared?: "Reconciled" | "Cleared" | "Uncleared";
+  }): Promise<unknown> {
+    const q: Record<string, string> = {
+      account: params.accountId,
+      start_date: params.startDate,
+      end_date: params.endDate,
+    };
+    if (params.cleared) q.cleared = params.cleared;
+    return this.report("TransactionList", q);
+  }
+}
+
+// --- TransactionList report parsing ---
+
+export interface ReconcileTxn {
+  date: string;
+  type: string;
+  docNumber: string;
+  name: string;
+  memo: string;
+  /** Signed amount as reported in the account register (deposits +, payments −). */
+  amount: number;
+  raw: Record<string, string>;
+}
+
+interface QboReportColData {
+  value?: string;
+  id?: string;
+}
+interface QboReportRow {
+  ColData?: QboReportColData[];
+  Rows?: { Row?: QboReportRow[] };
+  type?: string;
+  group?: string;
+}
+interface QboReport {
+  Columns?: { Column?: Array<{ ColTitle?: string; ColType?: string }> };
+  Rows?: { Row?: QboReportRow[] };
+}
+
+/**
+ * Flatten a TransactionList report into typed rows plus a signed total.
+ * Handles the report's nested/grouped `Rows` and skips summary rows (which have
+ * no `ColData`). Amounts are parsed from the "Amount" column.
+ */
+export function parseTransactionList(report: unknown): {
+  transactions: ReconcileTxn[];
+  total: number;
+} {
+  const r = report as QboReport;
+  const cols = (r.Columns?.Column ?? []).map((c) => c.ColTitle ?? "");
+  const idx = (title: string) =>
+    cols.findIndex((c) => c.toLowerCase() === title.toLowerCase());
+  const amountIdx = idx("Amount");
+  const dateIdx = idx("Date");
+  const typeIdx = idx("Transaction Type");
+  const numIdx = idx("Num");
+  const nameIdx = idx("Name");
+  const memoIdx = idx("Memo/Description");
+
+  const txns: ReconcileTxn[] = [];
+
+  const walk = (rows: QboReportRow[] | undefined) => {
+    for (const row of rows ?? []) {
+      if (row.Rows?.Row) walk(row.Rows.Row);
+      const cd = row.ColData;
+      // Skip section/summary rows: real transaction rows carry a full ColData
+      // set with an Amount cell.
+      if (!cd || amountIdx < 0 || !cd[amountIdx]?.value) continue;
+      const raw: Record<string, string> = {};
+      cols.forEach((c, i) => {
+        if (c) raw[c] = cd[i]?.value ?? "";
+      });
+      const amount = Number((cd[amountIdx].value ?? "0").replace(/,/g, ""));
+      if (Number.isNaN(amount)) continue;
+      txns.push({
+        date: dateIdx >= 0 ? cd[dateIdx]?.value ?? "" : "",
+        type: typeIdx >= 0 ? cd[typeIdx]?.value ?? "" : "",
+        docNumber: numIdx >= 0 ? cd[numIdx]?.value ?? "" : "",
+        name: nameIdx >= 0 ? cd[nameIdx]?.value ?? "" : "",
+        memo: memoIdx >= 0 ? cd[memoIdx]?.value ?? "" : "",
+        amount,
+        raw,
+      });
+    }
+  };
+  walk(r.Rows?.Row);
+
+  const total = txns.reduce((s, t) => s + t.amount, 0);
+  return { transactions: txns, total: Math.round(total * 100) / 100 };
 }

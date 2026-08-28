@@ -15,14 +15,19 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
       accountId: z.string().optional().describe("Filter by account ID"),
+      cleared: z
+        .enum(["Reconciled", "Cleared", "Uncleared"])
+        .optional()
+        .describe("Filter by reconcile status. For a full reconcile worksheet use qbo_reconcile_worksheet instead."),
     },
-    async ({ startDate, endDate, accountId }) => {
+    async ({ startDate, endDate, accountId, cleared }) => {
       try {
         const params: Record<string, string> = {
           start_date: startDate,
           end_date: endDate,
         };
         if (accountId) params.account = accountId;
+        if (cleared) params.cleared = cleared;
         const result = await client.report("TransactionList", params);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (e) {

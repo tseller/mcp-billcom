@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "build": "tsc",
+    "test": "tsx --test src/**/*.test.ts",
     "start": "node --env-file=.env dist/index.js",
     "dev": "node --env-file=.env --import=tsx src/index.ts",
     "start:http": "MCP_TRANSPORT=http node --env-file=.env dist/index.js",

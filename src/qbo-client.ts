@@ -418,26 +418,55 @@ export class QboClient {
   }
 
   /**
-   * Fetch the TransactionList report for a single account, optionally filtered
-   * by reconcile status. QBO exposes `cleared` only as a *filter* (values:
-   * "Reconciled", "Cleared", "Uncleared"), never as a per-row column — so a
-   * reconcile worksheet must run one call per status and stitch the results.
+   * Fetch the TransactionList report, optionally filtered by reconcile status.
+   *
+   * Two hard QBO API facts shape this:
+   *  - The `cleared` *filter* works (values "Reconciled" | "Cleared" |
+   *    "Uncleared") but is filter-only — never returned per row.
+   *  - The `account` filter param is SILENTLY IGNORED (verified against live
+   *    QBO: passing account=14, account=20, or none returns identical rows).
+   *    So we never pass it; instead we request the `account_name` column and
+   *    filter client-side by account name.
+   *
+   * `columns` selects which columns the report returns (and their order). We
+   * request account_name + a signed natural-amount column so a reconcile
+   * worksheet can attribute each row to its bank/CC account and sum it.
    */
   async transactionList(params: {
-    accountId: string;
     startDate: string;
     endDate: string;
     cleared?: "Reconciled" | "Cleared" | "Uncleared";
+    columns?: string[];
   }): Promise<unknown> {
     const q: Record<string, string> = {
-      account: params.accountId,
       start_date: params.startDate,
       end_date: params.endDate,
     };
     if (params.cleared) q.cleared = params.cleared;
+    if (params.columns?.length) q.columns = params.columns.join(",");
     return this.report("TransactionList", q);
   }
+
+  /** Look up an account's display name by Id (used to filter reports client-side). */
+  async getAccountName(id: string): Promise<string | undefined> {
+    const r = (await this.query(`SELECT Id, Name FROM Account WHERE Id = '${id}'`)) as {
+      QueryResponse?: { Account?: Array<{ Name?: string }> };
+    };
+    return r.QueryResponse?.Account?.[0]?.Name;
+  }
 }
+
+/** Columns we request from the TransactionList report for reconcile worksheets. */
+export const RECONCILE_COLUMNS = [
+  "tx_date",
+  "txn_type",
+  "doc_num",
+  "name",
+  "memo",
+  "account_name",
+  "split_acc",
+  "subt_nat_amount",
+];
 
 // --- TransactionList report parsing ---
 
@@ -447,6 +476,8 @@ export interface ReconcileTxn {
   docNumber: string;
   name: string;
   memo: string;
+  /** The bank/CC (register) account this row posts to, from the report's Account column. */
+  account: string;
   /** Signed amount as reported in the account register (deposits +, payments −). */
   amount: number;
   raw: Record<string, string>;
@@ -477,15 +508,29 @@ export function parseTransactionList(report: unknown): {
   total: number;
 } {
   const r = report as QboReport;
-  const cols = (r.Columns?.Column ?? []).map((c) => c.ColTitle ?? "");
+  const columnDefs = r.Columns?.Column ?? [];
+  const cols = columnDefs.map((c) => c.ColTitle ?? "");
   const idx = (title: string) =>
     cols.findIndex((c) => c.toLowerCase() === title.toLowerCase());
-  const amountIdx = idx("Amount");
+  // Amount column: match by title, else by the report's ColType metadata
+  // (custom `columns` requests can retitle it, but ColType stays "Amount"/"Money").
+  let amountIdx = idx("Amount");
+  if (amountIdx < 0)
+    amountIdx = columnDefs.findIndex((c) => /amount|money/i.test(c.ColType ?? ""));
+  if (amountIdx < 0)
+    amountIdx = cols.findIndex((c) => /amount/i.test(c));
   const dateIdx = idx("Date");
   const typeIdx = idx("Transaction Type");
   const numIdx = idx("Num");
   const nameIdx = idx("Name");
   const memoIdx = idx("Memo/Description");
+  // account_name column comes back titled "Account" (fall back to any title
+  // containing "account" that isn't the split column).
+  let accountIdx = idx("Account");
+  if (accountIdx < 0)
+    accountIdx = cols.findIndex(
+      (c) => /account/i.test(c) && !/split/i.test(c),
+    );
 
   const txns: ReconcileTxn[] = [];
 
@@ -508,6 +553,7 @@ export function parseTransactionList(report: unknown): {
         docNumber: numIdx >= 0 ? cd[numIdx]?.value ?? "" : "",
         name: nameIdx >= 0 ? cd[nameIdx]?.value ?? "" : "",
         memo: memoIdx >= 0 ? cd[memoIdx]?.value ?? "" : "",
+        account: accountIdx >= 0 ? cd[accountIdx]?.value ?? "" : "",
         amount,
         raw,
       });

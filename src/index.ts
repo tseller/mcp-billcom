@@ -7,6 +7,7 @@ import { registerQboAccountTools } from "./tools/qbo-accounts.js";
 import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
 import { registerQboReportTools } from "./tools/qbo-reports.js";
+import { registerQboReconcileTools } from "./tools/qbo-reconcile.js";
 import { startHttpServer } from "./http-server.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
@@ -76,6 +77,7 @@ function registerAllTools(server: McpServer) {
       gmail: gmailClientFromEnv(),
     });
     registerQboReportTools(server, qboClient);
+    registerQboReconcileTools(server, qboClient);
   }
 
   if (divvyApiToken) {

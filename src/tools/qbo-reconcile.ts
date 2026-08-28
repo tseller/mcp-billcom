@@ -15,6 +15,14 @@ function err(e: unknown) {
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 const norm = (s: string) => s.trim().toLowerCase();
+// The report's Account column is fully-qualified with the chart-of-accounts
+// number, e.g. "1100 Chase Checking", while the Account entity's Name is just
+// "Chase Checking". Strip a leading "<number> " prefix before comparing.
+const stripAcctNum = (s: string) => s.replace(/^\s*\d[\d.\-]*\s+/, "").trim();
+const matchesAccount = (rowAccount: string, name: string) => {
+  const t = norm(name);
+  return norm(rowAccount) === t || norm(stripAcctNum(rowAccount)) === t;
+};
 
 /** Fetch company-wide TransactionList for a cleared status, then keep only rows posting to `accountName`. */
 async function txnsForAccount(
@@ -31,8 +39,7 @@ async function txnsForAccount(
     columns: RECONCILE_COLUMNS,
   });
   const { transactions } = parseTransactionList(report);
-  const target = norm(accountName);
-  const matched = transactions.filter((t) => norm(t.account) === target);
+  const matched = transactions.filter((t) => matchesAccount(t.account, accountName));
   const total = round2(matched.reduce((s, t) => s + t.amount, 0));
   const accountsSeen = [...new Set(transactions.map((t) => t.account).filter(Boolean))].sort();
   return { matched, total, accountsSeen };

@@ -119,15 +119,18 @@ test("client-side account filter separates two accounts in one company-wide repo
     },
     Rows: {
       Row: [
-        { ColData: [{ value: "2026-07-03" }, { value: "Deposit" }, { value: "" }, { value: "A" }, { value: "" }, { value: "Chase Checking" }, { value: "x" }, { value: "1000.00" }] },
-        { ColData: [{ value: "2026-07-04" }, { value: "Expense" }, { value: "" }, { value: "B" }, { value: "" }, { value: "Divvy Credit Card Payable" }, { value: "x" }, { value: "40.00" }] },
-        { ColData: [{ value: "2026-07-05" }, { value: "Check" }, { value: "" }, { value: "C" }, { value: "" }, { value: "Chase Checking" }, { value: "x" }, { value: "-250.00" }] },
+        { ColData: [{ value: "2026-07-03" }, { value: "Deposit" }, { value: "" }, { value: "A" }, { value: "" }, { value: "1100 Chase Checking" }, { value: "x" }, { value: "1000.00" }] },
+        { ColData: [{ value: "2026-07-04" }, { value: "Expense" }, { value: "" }, { value: "B" }, { value: "" }, { value: "2150 Divvy Credit Card Payable" }, { value: "x" }, { value: "40.00" }] },
+        { ColData: [{ value: "2026-07-05" }, { value: "Check" }, { value: "" }, { value: "C" }, { value: "" }, { value: "1100 Chase Checking" }, { value: "x" }, { value: "-250.00" }] },
       ],
     },
   };
   const { transactions } = parseTransactionList(mixed);
+  // Report Account column is number-prefixed ("1100 Chase Checking") while the
+  // Account entity Name is bare ("Chase Checking"); strip the prefix to match.
   const norm = (s: string) => s.trim().toLowerCase();
-  const chase = transactions.filter((t) => norm(t.account) === norm("chase checking"));
+  const stripAcctNum = (s: string) => s.replace(/^\s*\d[\d.\-]*\s+/, "").trim();
+  const chase = transactions.filter((t) => norm(stripAcctNum(t.account)) === norm("chase checking"));
   const chaseTotal = Math.round(chase.reduce((s, t) => s + t.amount, 0) * 100) / 100;
   assert.equal(chase.length, 2);
   assert.equal(chaseTotal, 750); // 1000 - 250; the 40.00 Divvy row is excluded

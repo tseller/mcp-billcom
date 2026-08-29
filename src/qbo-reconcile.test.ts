@@ -157,20 +157,19 @@ test("findAccountBalanceInReport reads the account row from a BalanceSheet", () 
   assert.equal(findAccountBalanceInReport(balanceSheet, "Nonexistent Account"), undefined);
 });
 
-test("reconcile verdict: credit card reconciles to $0 after sign-normalizing BalanceSheet", () => {
-  // BalanceSheet reports the credit card as +158.68 (positive liability); the
-  // register/reconcile convention negates it. A statement showing -158.68 owed
-  // then reconciles to $0.  (Mirrors Tim's 04/30 Divvy oracle, generalised.)
-  const bsValue = 158.68;
-  const registerEnd = -bsValue; // credit-card normalization
+test("reconcile verdict: credit card reconciles to $0 using BalanceSheet value as-is", () => {
+  // QBO's reconcile register balance matches BalanceSheet sign (verified against
+  // Tim's 04/30 Divvy oracle: register/statement beginning both -158.68). No
+  // credit-card negation — the statement value matches the BalanceSheet value.
+  const registerEnd = -158.68; // BalanceSheet as-of (a credit/prepaid balance)
   const statementEndingBalance = -158.68;
   const difference = Math.round((statementEndingBalance - registerEnd) * 100) / 100;
   assert.equal(difference, 0);
 });
 
 test("reconcile verdict: detects a sign-flipped statement entry", () => {
-  const registerEnd = -158.68; // register convention (owed, negative)
-  const statementEndingBalance = 158.68; // Tim typed positive amount-owed
+  const registerEnd = -158.68; // register/BalanceSheet convention
+  const statementEndingBalance = 158.68; // user typed the opposite sign
   const difference = Math.round((statementEndingBalance - registerEnd) * 100) / 100;
   const altDifference = Math.round((statementEndingBalance + registerEnd) * 100) / 100;
   assert.notEqual(difference, 0);

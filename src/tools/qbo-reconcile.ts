@@ -15,7 +15,6 @@ function err(e: unknown) {
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
-/** BalanceSheet reports credit-card/liability balances as positive; the register/reconcile convention is negative-when-owed. */
 const isCreditCard = (accountType: string) => /credit\s*card/i.test(accountType);
 const dayBefore = (isoDate: string) => {
   const [y, m, d] = isoDate.split("-").map(Number);
@@ -72,10 +71,12 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
           return err(new Error(`No account found with Id ${accountId} (use qbo_account_balances to list accounts).`));
         }
         const cc = isCreditCard(account.accountType);
-        // Register convention: banks match BalanceSheet as-is; credit cards are negated
-        // so a balance owed reads negative, matching QBO's reconcile/register display.
+        // QBO's reconcile "register balance as of <date>" matches the BalanceSheet
+        // value and sign (positive = owed for a credit card, matching how the
+        // statement reads), verified against Tim's 04/30 Divvy reconciliation
+        // report (beginning −158.68 == BalanceSheet as-of 03/31). So: use as-is.
         const toRegister = (bsValue: number | undefined) =>
-          bsValue === undefined ? undefined : round2(cc ? -bsValue : bsValue);
+          bsValue === undefined ? undefined : round2(bsValue);
 
         const registerEnd = toRegister(await client.accountBalanceAsOf(account.name, statementEndDate));
         if (registerEnd === undefined) {

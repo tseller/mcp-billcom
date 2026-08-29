@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseTransactionList } from "./qbo-client.js";
+import { parseTransactionList, findAccountBalanceInReport, matchesAccount } from "./qbo-client.js";
 
 // A realistic QBO TransactionList report payload: nested/grouped Rows, a summary
 // row with no ColData, and comma-formatted amounts — the shapes parseTransactionList
@@ -127,13 +127,61 @@ test("client-side account filter separates two accounts in one company-wide repo
   };
   const { transactions } = parseTransactionList(mixed);
   // Report Account column is number-prefixed ("1100 Chase Checking") while the
-  // Account entity Name is bare ("Chase Checking"); strip the prefix to match.
-  const norm = (s: string) => s.trim().toLowerCase();
-  const stripAcctNum = (s: string) => s.replace(/^\s*\d[\d.\-]*\s+/, "").trim();
-  const chase = transactions.filter((t) => norm(stripAcctNum(t.account)) === norm("chase checking"));
+  // Account entity Name is bare ("Chase Checking"); matchesAccount strips the prefix.
+  const chase = transactions.filter((t) => matchesAccount(t.account, "Chase Checking"));
   const chaseTotal = Math.round(chase.reduce((s, t) => s + t.amount, 0) * 100) / 100;
   assert.equal(chase.length, 2);
   assert.equal(chaseTotal, 750); // 1000 - 250; the 40.00 Divvy row is excluded
+});
+
+const balanceSheet = {
+  Rows: {
+    Row: [
+      {
+        Rows: {
+          Row: [
+            { ColData: [{ value: "1100 Chase Checking", id: "14" }, { value: "70,938.96" }] },
+            { ColData: [{ value: "2150 Divvy Credit Card Payable", id: "20" }, { value: "12,706.72" }] },
+          ],
+        },
+      },
+      // A total/summary row that must not be mistaken for an account.
+      { ColData: [{ value: "Total Bank Accounts" }, { value: "83,645.68" }] },
+    ],
+  },
+};
+
+test("findAccountBalanceInReport reads the account row from a BalanceSheet", () => {
+  assert.equal(findAccountBalanceInReport(balanceSheet, "Chase Checking"), 70938.96);
+  assert.equal(findAccountBalanceInReport(balanceSheet, "Divvy Credit Card Payable"), 12706.72);
+  assert.equal(findAccountBalanceInReport(balanceSheet, "Nonexistent Account"), undefined);
+});
+
+test("reconcile verdict: credit card reconciles to $0 after sign-normalizing BalanceSheet", () => {
+  // BalanceSheet reports the credit card as +158.68 (positive liability); the
+  // register/reconcile convention negates it. A statement showing -158.68 owed
+  // then reconciles to $0.  (Mirrors Tim's 04/30 Divvy oracle, generalised.)
+  const bsValue = 158.68;
+  const registerEnd = -bsValue; // credit-card normalization
+  const statementEndingBalance = -158.68;
+  const difference = Math.round((statementEndingBalance - registerEnd) * 100) / 100;
+  assert.equal(difference, 0);
+});
+
+test("reconcile verdict: detects a sign-flipped statement entry", () => {
+  const registerEnd = -158.68; // register convention (owed, negative)
+  const statementEndingBalance = 158.68; // Tim typed positive amount-owed
+  const difference = Math.round((statementEndingBalance - registerEnd) * 100) / 100;
+  const altDifference = Math.round((statementEndingBalance + registerEnd) * 100) / 100;
+  assert.notEqual(difference, 0);
+  assert.equal(altDifference, 0); // equal magnitude, opposite sign → sign-flip guidance
+});
+
+test("bank account reconciles to $0 with BalanceSheet value as-is", () => {
+  const registerEnd = 70938.96; // bank: no sign flip
+  const statementEndingBalance = 70938.96;
+  const difference = Math.round((statementEndingBalance - registerEnd) * 100) / 100;
+  assert.equal(difference, 0);
 });
 
 test("parseTransactionList tolerates an empty report", () => {

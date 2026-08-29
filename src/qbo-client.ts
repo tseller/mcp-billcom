@@ -449,11 +449,67 @@ export class QboClient {
 
   /** Look up an account's display name by Id (used to filter reports client-side). */
   async getAccountName(id: string): Promise<string | undefined> {
-    const r = (await this.query(`SELECT Id, Name FROM Account WHERE Id = '${id}'`)) as {
-      QueryResponse?: { Account?: Array<{ Name?: string }> };
-    };
-    return r.QueryResponse?.Account?.[0]?.Name;
+    return (await this.getAccount(id))?.name;
   }
+
+  /** Look up an account's name + type by Id. */
+  async getAccount(id: string): Promise<{ name: string; accountType: string; accountSubType: string } | undefined> {
+    const r = (await this.query(
+      `SELECT Id, Name, AccountType, AccountSubType FROM Account WHERE Id = '${id}'`,
+    )) as {
+      QueryResponse?: { Account?: Array<{ Name?: string; AccountType?: string; AccountSubType?: string }> };
+    };
+    const a = r.QueryResponse?.Account?.[0];
+    if (!a?.Name) return undefined;
+    return { name: a.Name, accountType: a.AccountType ?? "", accountSubType: a.AccountSubType ?? "" };
+  }
+
+  /**
+   * The account's register balance as of a date, read from the BalanceSheet
+   * report — this is QBO's own "register balance as of <date>" (both posting
+   * sides, all statuses), the number the reconcile compares against the
+   * statement ending balance.
+   *
+   * NOTE the sign: BalanceSheet reports liabilities (incl. credit cards) as
+   * POSITIVE, whereas the account register / reconcile convention shows a
+   * credit-card balance owed as NEGATIVE. Callers reconciling a credit card
+   * should negate this (see qbo-reconcile). Returns undefined if the account
+   * isn't found on the sheet.
+   */
+  async accountBalanceAsOf(accountName: string, asOfDate: string): Promise<number | undefined> {
+    const report = await this.report("BalanceSheet", { start_date: asOfDate, end_date: asOfDate });
+    return findAccountBalanceInReport(report, accountName);
+  }
+}
+
+/** Strip a leading chart-of-accounts number ("1100 Chase Checking" → "Chase Checking"). */
+export const stripAcctNum = (s: string) => s.replace(/^\s*\d[\d.\-]*\s+/, "").trim();
+const normName = (s: string) => s.trim().toLowerCase();
+/** True if a report's number-prefixed account label refers to the given account name. */
+export function matchesAccount(rowAccount: string, name: string): boolean {
+  const t = normName(name);
+  return normName(rowAccount) === t || normName(stripAcctNum(rowAccount)) === t;
+}
+
+/** Walk a BalanceSheet (or similar) report and return the amount for the matching account row. */
+export function findAccountBalanceInReport(report: unknown, accountName: string): number | undefined {
+  let found: number | undefined;
+  const walk = (rows: QboReportRow[] | undefined) => {
+    for (const row of rows ?? []) {
+      const cd = row.ColData;
+      if (cd && cd.length >= 2) {
+        const label = cd[0]?.value ?? "";
+        if (label && matchesAccount(label, accountName)) {
+          const raw = (cd[cd.length - 1]?.value ?? "").replace(/,/g, "");
+          const n = Number(raw);
+          if (!Number.isNaN(n)) found = n;
+        }
+      }
+      if (row.Rows?.Row) walk(row.Rows.Row);
+    }
+  };
+  walk((report as QboReport).Rows?.Row);
+  return found;
 }
 
 /** Columns we request from the TransactionList report for reconcile worksheets. */

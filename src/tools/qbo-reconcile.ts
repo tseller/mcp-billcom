@@ -4,6 +4,7 @@ import {
   QboClient,
   QboError,
   parseTransactionList,
+  matchesAccount,
   RECONCILE_COLUMNS,
   type ReconcileTxn,
 } from "../qbo-client.js";
@@ -14,136 +15,124 @@ function err(e: unknown) {
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
-const norm = (s: string) => s.trim().toLowerCase();
-// The report's Account column is fully-qualified with the chart-of-accounts
-// number, e.g. "1100 Chase Checking", while the Account entity's Name is just
-// "Chase Checking". Strip a leading "<number> " prefix before comparing.
-const stripAcctNum = (s: string) => s.replace(/^\s*\d[\d.\-]*\s+/, "").trim();
-const matchesAccount = (rowAccount: string, name: string) => {
-  const t = norm(name);
-  return norm(rowAccount) === t || norm(stripAcctNum(rowAccount)) === t;
+/** BalanceSheet reports credit-card/liability balances as positive; the register/reconcile convention is negative-when-owed. */
+const isCreditCard = (accountType: string) => /credit\s*card/i.test(accountType);
+const dayBefore = (isoDate: string) => {
+  const [y, m, d] = isoDate.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - 1);
+  return dt.toISOString().slice(0, 10);
 };
 
-/** Fetch company-wide TransactionList for a cleared status, then keep only rows posting to `accountName`. */
+/** Fetch company-wide TransactionList for a status, then keep rows whose register account matches. */
 async function txnsForAccount(
   client: QboClient,
   accountName: string,
   startDate: string,
   endDate: string,
   cleared: "Reconciled" | "Cleared" | "Uncleared",
-): Promise<{ matched: ReconcileTxn[]; total: number; accountsSeen: string[] }> {
-  const report = await client.transactionList({
-    startDate,
-    endDate,
-    cleared,
-    columns: RECONCILE_COLUMNS,
-  });
+): Promise<{ matched: ReconcileTxn[]; total: number }> {
+  const report = await client.transactionList({ startDate, endDate, cleared, columns: RECONCILE_COLUMNS });
   const { transactions } = parseTransactionList(report);
   const matched = transactions.filter((t) => matchesAccount(t.account, accountName));
-  const total = round2(matched.reduce((s, t) => s + t.amount, 0));
-  const accountsSeen = [...new Set(transactions.map((t) => t.account).filter(Boolean))].sort();
-  return { matched, total, accountsSeen };
+  return { matched, total: round2(matched.reduce((s, t) => s + t.amount, 0)) };
 }
 
 /**
  * QBO reconcile support.
  *
  * The QuickBooks Online Accounting API has NO public Reconcile entity — you
- * cannot create, read, or finalize a reconciliation, nor flip a transaction's
- * cleared flag, over the API. Finalizing (checking items off and saving) is a
- * manual step in the QBO web UI.
+ * cannot finalize a reconcile via API; that (the check-off + Finish) stays a
+ * manual step in the QBO web UI. So the deliverable here is VERIFICATION: is
+ * every statement transaction correctly reflected in QBO? That reduces to
  *
- * Worse, the TransactionList report's `account` filter is silently ignored by
- * QBO (verified live), so these tools fetch company-wide with the *working*
- * `cleared` filter, request the `account_name` column, and filter to the target
- * account client-side. Given the paper statement's beginning/ending balance
- * they compute whether the account reconciles to zero and surface the
- * difference to investigate.
+ *     difference = statement ending balance − QBO register balance as-of the statement date
+ *
+ * where the register balance comes from the BalanceSheet report (QBO's own
+ * "register balance as of <date>", correct on BOTH posting sides — so it
+ * handles credit-card payments that post from the bank account, which a
+ * per-account transaction scan misses). $0 difference ⇒ everything matches;
+ * otherwise there's a missing/duplicate/mismatched transaction to investigate.
  */
 export function registerQboReconcileTools(server: McpServer, client: QboClient) {
   server.tool(
     "qbo_reconcile_worksheet",
-    "Build a reconciliation worksheet for one bank/credit-card account against a paper (Chase/Divvy) statement. Pulls the account's Uncleared and Cleared transactions through the statement end date and, given the statement's beginning + ending balance, computes the cleared total and remaining difference — telling you whether the account reconciles to zero and, if not, which transactions to investigate. NOTE: QBO's API cannot check items off or finalize a reconcile — that final step is manual in the QBO web UI. Use this to prep and verify, then finalize in the UI.",
+    "Verify one bank/credit-card account against a paper (Chase/Divvy) statement, for the monthly reconcile. Compares the statement's ending balance to QBO's register balance as-of the statement date (from the BalanceSheet — correct on both posting sides, so it handles credit-card payments too) and reports the DIFFERENCE: $0 means every statement transaction is correctly in QBO. Also lists the period's transactions to review if it doesn't balance. NOTE: QBO's API cannot finalize a reconcile — after this shows $0, do the check-off + Finish manually in the QBO web UI. Provide the beginning + ending balance from the paper statement.",
     {
-      accountId: z.string().describe("Bank/credit-card Account ID to reconcile (from qbo_account_balances)"),
-      statementEndDate: z.string().describe("Statement ending date YYYY-MM-DD (the reconcile 'through' date)"),
-      statementBeginningBalance: z
-        .number()
-        .optional()
-        .describe("Beginning balance from the paper statement (QBO's last reconciled balance). Provide to compute the difference."),
-      statementEndingBalance: z
-        .number()
-        .optional()
-        .describe("Ending balance from the paper statement. Provide to compute the difference."),
-      startDate: z
-        .string()
-        .optional()
-        .describe("Lower bound for the transaction listing YYYY-MM-DD. Defaults to 2000-01-01 so ALL outstanding uncleared items are captured, matching QBO's reconcile view."),
+      accountId: z.string().describe("Bank/credit-card Account ID (from qbo_account_balances)"),
+      statementEndDate: z.string().describe("Statement ending date YYYY-MM-DD"),
+      statementEndingBalance: z.number().describe("Ending balance from the paper statement. For a credit card, enter it the way QBO's reconcile shows it (amount owed as a negative number), OR as a positive amount-owed — the tool detects and flags a sign mismatch either way."),
+      statementBeginningBalance: z.number().optional().describe("Beginning balance from the paper statement — cross-checked against QBO's register balance as-of the day before the period starts."),
+      statementStartDate: z.string().optional().describe("Statement start date YYYY-MM-DD — enables the beginning-balance cross-check and bounds the review listing."),
     },
-    async ({ accountId, statementEndDate, statementBeginningBalance, statementEndingBalance, startDate }) => {
+    async ({ accountId, statementEndDate, statementEndingBalance, statementBeginningBalance, statementStartDate }) => {
       try {
-        const accountName = await client.getAccountName(accountId);
-        if (!accountName) {
+        const account = await client.getAccount(accountId);
+        if (!account) {
           return err(new Error(`No account found with Id ${accountId} (use qbo_account_balances to list accounts).`));
         }
-        const start = startDate ?? "2000-01-01";
-        const [uncleared, cleared] = await Promise.all([
-          txnsForAccount(client, accountName, start, statementEndDate, "Uncleared"),
-          txnsForAccount(client, accountName, start, statementEndDate, "Cleared"),
-        ]);
+        const cc = isCreditCard(account.accountType);
+        // Register convention: banks match BalanceSheet as-is; credit cards are negated
+        // so a balance owed reads negative, matching QBO's reconcile/register display.
+        const toRegister = (bsValue: number | undefined) =>
+          bsValue === undefined ? undefined : round2(cc ? -bsValue : bsValue);
+
+        const registerEnd = toRegister(await client.accountBalanceAsOf(account.name, statementEndDate));
+        if (registerEnd === undefined) {
+          return err(new Error(`Account "${account.name}" not found on the BalanceSheet as of ${statementEndDate}.`));
+        }
+
+        const difference = round2(statementEndingBalance - registerEnd);
+        const altDifference = round2(statementEndingBalance + registerEnd);
+        const reconcilesToZero = Math.abs(difference) < 0.005;
+        const likelySignFlip = !reconcilesToZero && Math.abs(altDifference) < 0.005;
 
         const summary: Record<string, unknown> = {
           accountId,
-          accountName,
+          accountName: account.name,
+          accountType: account.accountType,
           statementEndDate,
-          startDate: start,
-          clearedCount: cleared.matched.length,
-          clearedTotal: cleared.total,
-          unclearedCount: uncleared.matched.length,
-          unclearedTotal: uncleared.total,
-          note:
-            "QBO's API cannot mark items cleared or finalize the reconcile. Match the uncleared items below against the paper statement, then check them off and Finish in the QBO web UI. Amounts are register-signed (deposits/credits +, payments/charges −).",
+          statementEndingBalance,
+          qboRegisterBalanceAsOf: registerEnd,
+          difference,
+          reconcilesToZero,
+          verdict: reconcilesToZero
+            ? "$0.00 difference — every statement transaction is correctly reflected in QBO. Do the check-off + Finish in the QBO web UI to finalize."
+            : likelySignFlip
+              ? `The difference is ${difference.toFixed(2)}, but the statement and QBO register balance are equal in magnitude and opposite in sign. Re-enter statementEndingBalance with the opposite sign (for a credit card, QBO's reconcile shows the balance owed as negative).`
+              : `${Math.abs(difference).toFixed(2)} difference — a transaction is missing, duplicated, or has the wrong amount in QBO (or the statement ending balance is off). Review the period's transactions below against the statement.`,
+          note: "QBO's API cannot finalize a reconcile — the check-off + Finish is manual in the QBO UI. This tool VERIFIES the books match the statement (difference should be $0).",
         };
-        if (uncleared.matched.length === 0 && cleared.matched.length === 0) {
-          summary.warning = `No transactions posted to "${accountName}" in this window. Accounts seen in the report: ${uncleared.accountsSeen.join(", ") || "(none)"}. Check the accountId.`;
+
+        // Beginning-balance cross-check (optional).
+        if (statementBeginningBalance !== undefined && statementStartDate) {
+          const registerBegin = toRegister(await client.accountBalanceAsOf(account.name, dayBefore(statementStartDate)));
+          summary.beginningCheck = {
+            statementBeginningBalance,
+            qboRegisterBalanceAsOfDayBeforeStart: registerBegin,
+            matches: registerBegin !== undefined && Math.abs(round2(statementBeginningBalance - registerBegin)) < 0.005,
+            note: "Should match — if not, the PRIOR period wasn't fully reconciled.",
+          };
         }
 
-        if (statementBeginningBalance !== undefined && statementEndingBalance !== undefined) {
-          const statementChange = round2(statementEndingBalance - statementBeginningBalance);
-          const differenceClearedOnly = round2(
-            statementEndingBalance - (statementBeginningBalance + cleared.total),
-          );
-          const differenceClearAll = round2(
-            statementEndingBalance - (statementBeginningBalance + cleared.total + uncleared.total),
-          );
-          summary.statement = {
-            beginningBalance: statementBeginningBalance,
-            endingBalance: statementEndingBalance,
-            statementChange,
-          };
-          summary.difference = {
-            ifClearingOnlyAlreadyClearedItems: differenceClearedOnly,
-            ifClearingAllOutstandingItems: differenceClearAll,
-            reconcilesToZero: differenceClearAll === 0,
-            interpretation:
-              differenceClearAll === 0
-                ? "Clearing every outstanding item brings the difference to 0.00 — the account reconciles cleanly. Check all uncleared items off in the QBO UI and Finish."
-                : `A ${Math.abs(differenceClearAll).toFixed(2)} difference remains even after clearing every outstanding item — there is a discrepancy (a missing, duplicate, or mismatched-amount transaction, or the statement balances are off). Investigate before finalizing.`,
-          };
-        }
+        // Review listing: the period's transactions posting to this account's register.
+        // (For a credit card, payments post from the bank account and won't appear here —
+        // they surface on the bank account's worksheet; the DIFFERENCE above already accounts
+        // for them via the BalanceSheet.)
+        const listStart = statementStartDate ?? "2000-01-01";
+        const [uncleared, cleared] = await Promise.all([
+          txnsForAccount(client, account.name, listStart, statementEndDate, "Uncleared"),
+          txnsForAccount(client, account.name, listStart, statementEndDate, "Cleared"),
+        ]);
 
         const fmt = (t: ReconcileTxn) =>
           `  ${t.date}  ${t.amount.toFixed(2).padStart(12)}  ${t.type}  ${t.docNumber ? `#${t.docNumber} ` : ""}${t.name}${t.memo ? ` — ${t.memo}` : ""}`;
-        const lines: string[] = [];
-        lines.push(JSON.stringify(summary, null, 2));
-        lines.push("");
-        lines.push(`Uncleared transactions (${uncleared.matched.length}) — match these against the statement:`);
+        const lines: string[] = [JSON.stringify(summary, null, 2), ""];
+        lines.push(`Register transactions posting to "${account.name}" in ${listStart}..${statementEndDate}${cc ? " (charges/credits; card payments post from the bank account)" : ""}:`);
+        lines.push(`  Uncleared (${uncleared.matched.length}, total ${uncleared.total.toFixed(2)}):`);
         lines.push(...uncleared.matched.map(fmt));
-        if (cleared.matched.length) {
-          lines.push("");
-          lines.push(`Already-Cleared (in-progress) transactions (${cleared.matched.length}):`);
-          lines.push(...cleared.matched.map(fmt));
-        }
+        lines.push(`  Cleared (${cleared.matched.length}, total ${cleared.total.toFixed(2)}):`);
+        lines.push(...cleared.matched.map(fmt));
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (e) {
@@ -154,47 +143,23 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
 
   server.tool(
     "qbo_cleared_transactions",
-    "List one account's transactions filtered by QBO reconcile status (Reconciled, Cleared, or Uncleared) for a date range. Useful for hunting reconciliation discrepancies — e.g. list Uncleared items to find what's outstanding. (QBO exposes reconcile status only as a report filter and ignores its account filter, so this fetches company-wide and filters to your account client-side.)",
+    "List one account's transactions filtered by QBO reconcile status (Reconciled, Cleared, or Uncleared) for a date range. Useful for hunting reconciliation discrepancies. (QBO exposes reconcile status only as a report filter and ignores its account filter, so this fetches company-wide and filters to your account client-side by the register-account column. For credit cards, payments recorded from the bank account post under that bank account, not here.)",
     {
       accountId: z.string().describe("Account ID"),
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
-      status: z
-        .enum(["Reconciled", "Cleared", "Uncleared"])
-        .describe("Reconcile status to filter by"),
+      status: z.enum(["Reconciled", "Cleared", "Uncleared"]).describe("Reconcile status to filter by"),
     },
     async ({ accountId, startDate, endDate, status }) => {
       try {
         const accountName = await client.getAccountName(accountId);
-        if (!accountName) {
-          return err(new Error(`No account found with Id ${accountId}.`));
-        }
-        const { matched, total, accountsSeen } = await txnsForAccount(
-          client,
-          accountName,
-          startDate,
-          endDate,
-          status,
-        );
+        if (!accountName) return err(new Error(`No account found with Id ${accountId}.`));
+        const { matched, total } = await txnsForAccount(client, accountName, startDate, endDate, status);
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  accountId,
-                  accountName,
-                  status,
-                  startDate,
-                  endDate,
-                  count: matched.length,
-                  total,
-                  ...(matched.length === 0 ? { accountsSeen } : {}),
-                  transactions: matched,
-                },
-                null,
-                2,
-              ),
+              text: JSON.stringify({ accountId, accountName, status, startDate, endDate, count: matched.length, total, transactions: matched }, null, 2),
             },
           ],
         };

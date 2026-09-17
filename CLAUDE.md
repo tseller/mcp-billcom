@@ -39,10 +39,11 @@ gcloud config configurations activate mcp-billcom
 - `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
 - `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
-- `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
-- `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
+- `src/tools/qbo-accounts.ts` — QBO: list_accounts (flattened rows + paging), account_balances
+- `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors (both flattened rows + paging), create_vendor
+- `src/tools/list-paging.ts` — `listPaging(defaultMaxResults)`, the one `startPosition`/`maxResults`/`format` schema every list tool takes, so paging is spelled the same way everywhere
 - `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit). The three list tools return **flattened rows** and **page by size as well as row count** — see "Tool result size" below
-- `src/qbo-rows.ts` — the flattened row shapes for those list tools (`slimPurchase`/`slimDeposit`/`slimTransfer`) plus `buildEntityList()`, which packs one page and states `rowCount` / `hasMore` / `nextStartPosition`
+- `src/qbo-rows.ts` — the flattened row shapes for every list tool (`slimPurchase`/`slimDeposit`/`slimTransfer`/`slimAccount`/`slimVendor`) plus `buildEntityList()`, which packs one page and states `rowCount` / `hasMore` / `nextStartPosition`. `sumField: null` omits `pageTotal` for a listing where a per-page sum states nothing true (a chart of accounts adds assets to liabilities)
 - `src/tool-logging.ts` — `runTool()`, the single response path every tool goes through: start/finish logging, `compact()` serialization, and the result-size budget. A handler returns plain data (or a string) and never builds an MCP response itself
 - `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
 - `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Enforced for **every** tool by `runTool`, not opted into per tool
@@ -82,6 +83,16 @@ What this means in practice:
 - `qbo_transaction_report` and `qbo_cleared_transactions` accept `offset`/`limit`
   and page. **No date range is too long** — a long one just takes more calls.
   Aggregates (`total`) always cover the whole range, not the page.
+- `qbo_list_accounts` / `qbo_list_vendors` / `qbo_search_vendors` page the same
+  way. An `Account` row keeps id, name, account number, type, classification,
+  balance and a sub-account's parent (dropping `FullyQualifiedName`,
+  `AccountSubType`, `CurrentBalanceWithSubAccounts`, `CurrencyRef` and the
+  usual envelope); a `Vendor` row keeps id, display name, company (only when it
+  differs from the display name), email, phone and a non-zero balance (dropping
+  `BillRate`, `CostRate`, `Vendor1099`, `V4IDPseudonym`, `PrintOnCheckName` and
+  the `GivenName`/`MiddleName`/`FamilyName` re-spellings). `active` is emitted
+  only when a row is INACTIVE — these listings are active-only, so `true` on
+  every row is a repeated constant. Neither states a `pageTotal`.
 - `qbo_list_purchases` / `qbo_list_deposits` / `qbo_list_transfers` return
   flattened rows (`src/qbo-rows.ts`) and page on ONE coordinate: when `hasMore`
   is true, call again with `startPosition: nextStartPosition`. `rowCount` is a

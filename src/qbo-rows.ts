@@ -1,5 +1,6 @@
 /**
- * Flattened rows for the QBO entity list tools (purchases, deposits, transfers).
+ * Flattened rows for the QBO entity list tools (purchases, deposits, transfers,
+ * accounts, vendors).
  *
  * QBO returns the full entity on a query, and most of it is envelope rather
  * than information: on live books a Purchase is ~2,083 characters, of which
@@ -129,6 +130,58 @@ export function slimTransfer(t: Entity): Record<string, unknown> {
   });
 }
 
+/**
+ * A chart-of-accounts row: what you read to pick an account, plus the id every
+ * other tool asks for. QBO's `Account` adds `domain`, `sparse`, `SyncToken`,
+ * `MetaData`, `FullyQualifiedName` (the parent name re-spelled), `CurrencyRef`,
+ * `AccountSubType` and `CurrentBalanceWithSubAccounts` — 53,799 characters for
+ * one live chart of accounts, past the tool-result budget with no argument to
+ * narrow, since the tool took none.
+ *
+ * `active` is emitted only when the account is INACTIVE: the listing filters to
+ * active accounts by default, so `true` on every row is a repeated constant.
+ */
+export function slimAccount(a: Entity): Record<string, unknown> {
+  const parent = ref(a.ParentRef);
+  return trim({
+    id: a.Id,
+    name: a.Name,
+    num: a.AcctNum,
+    type: a.AccountType,
+    classification: a.Classification,
+    balance: a.CurrentBalance,
+    parent: a.SubAccount ? parent.name : undefined,
+    parentId: a.SubAccount ? parent.value : undefined,
+    active: a.Active === false ? false : undefined,
+    currency: currency(a),
+  });
+}
+
+/**
+ * A vendor row: who they are, how to reach them, what we owe them, and the id.
+ * QBO's `Vendor` adds `BillRate`, `CostRate`, `Vendor1099`, `CurrencyRef`,
+ * `domain`, `sparse`, `SyncToken`, `MetaData`, `V4IDPseudonym` and the
+ * `GivenName`/`MiddleName`/`FamilyName`/`PrintOnCheckName` re-spellings of the
+ * display name — which is why `maxResults: 1000`, the tool's own advertised
+ * maximum, came back over budget.
+ *
+ * `company` is dropped when it merely repeats the display name (the common case
+ * on these books), and `active` is emitted only when the vendor is inactive.
+ */
+export function slimVendor(v: Entity): Record<string, unknown> {
+  const company = v.CompanyName as string | undefined;
+  return trim({
+    id: v.Id,
+    name: v.DisplayName,
+    company: company === v.DisplayName ? undefined : company,
+    email: (v.PrimaryEmailAddr as { Address?: string } | undefined)?.Address,
+    phone: (v.PrimaryPhone as { FreeFormNumber?: string } | undefined)?.FreeFormNumber,
+    balance: v.Balance ? v.Balance : undefined,
+    active: v.Active === false ? false : undefined,
+    currency: currency(v),
+  });
+}
+
 /** Pull the entity array out of a QBO `QueryResponse` (absent when nothing matched). */
 export function queryRows(raw: unknown, entity: string): Entity[] {
   const list = (raw as { QueryResponse?: Record<string, unknown> } | undefined)?.QueryResponse?.[
@@ -150,6 +203,13 @@ export interface EntityListInput {
   maxResults: number;
   /** COUNT(*) over the whole filter, when the count query succeeded. */
   rowCount?: number;
+  /**
+   * Row field summed into `pageTotal` (default `amount`). Pass `null` for a
+   * listing where a per-page sum states nothing true: a chart of accounts adds
+   * assets to liabilities to income, and a page of vendor balances is a slice
+   * of what we owe, not a total. An omitted `pageTotal` beats a misleading one.
+   */
+  sumField?: string | null;
   /** Echoed filters (date range, account, vendor) for a self-describing result. */
   filters?: Record<string, unknown>;
 }
@@ -169,6 +229,7 @@ export function buildEntityList({
   startPosition,
   maxResults,
   rowCount,
+  sumField = "amount",
   filters = {},
 }: EntityListInput): Record<string, unknown> {
   const page = packRows(rows, 0, maxResults);
@@ -182,9 +243,15 @@ export function buildEntityList({
   const hasMore = sizeTruncated || morePastWindow;
   const nextStartPosition = startPosition + returned;
 
-  const pageTotal = round2(
-    page.rows.reduce((s, r) => s + (typeof r.amount === "number" ? r.amount : 0), 0),
-  );
+  const pageTotal =
+    sumField === null
+      ? undefined
+      : round2(
+          page.rows.reduce((s, r) => {
+            const v = r[sumField];
+            return s + (typeof v === "number" ? v : 0);
+          }, 0),
+        );
 
   const lastShown = startPosition + returned - 1;
   return {
@@ -193,7 +260,7 @@ export function buildEntityList({
     ...(rowCount !== undefined ? { rowCount } : {}),
     startPosition,
     returned,
-    pageTotal,
+    ...(pageTotal !== undefined ? { pageTotal } : {}),
     hasMore,
     ...(hasMore
       ? {
@@ -203,7 +270,8 @@ export function buildEntityList({
             `Showing ${returned === 0 ? "no rows" : `${startPosition}-${lastShown}`}` +
             `${rowCount !== undefined ? ` of ${rowCount}` : ""}. ` +
             `Call again with startPosition: ${nextStartPosition} for the rest. ` +
-            `\`rowCount\` covers the whole range; \`pageTotal\` is this page only.`,
+            `\`rowCount\` covers the whole range` +
+            `${pageTotal !== undefined ? "; `pageTotal` is this page only" : ""}.`,
         }
       : {}),
     [key]: page.rows,

@@ -1,34 +1,69 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { QboClient } from "../qbo-client.js";
+import { ACTIVE_VENDORS, QboClient, vendorNameWhere } from "../qbo-client.js";
 import { runTool } from "../tool-logging.js";
+import { listPaging } from "./list-paging.js";
+import { buildEntityList, queryRows, slimVendor } from "../qbo-rows.js";
+
+const VENDOR_ROWS_DOC =
+  "Returns flattened rows: id, display name, company (when it differs from the display name), email, phone, and balance when we owe them anything. " +
+  "`active` appears only on an inactive vendor. " +
+  "Paged by size as well as row count: when `hasMore` is true, call again with `startPosition: nextStartPosition`.";
 
 export function registerQboVendorTools(server: McpServer, client: QboClient) {
   server.tool(
     "qbo_list_vendors",
-    "List active vendors in QuickBooks with pagination.",
-    {
-      startPosition: z.number().int().min(1).optional().describe("1-based start position (default 1)"),
-      maxResults: z.number().int().min(1).max(1000).optional().describe("Max results (default 100)"),
-    },
+    "List active vendors in QuickBooks. " + VENDOR_ROWS_DOC,
+    { ...listPaging(100) },
     (args) =>
-      runTool("qbo_list_vendors", args, ({ startPosition, maxResults }) =>
-        client.listVendors(startPosition ?? 1, maxResults ?? 100),
-      ),
+      runTool("qbo_list_vendors", args, async ({ startPosition, maxResults, format }) => {
+        const start = startPosition ?? 1;
+        const max = maxResults ?? 100;
+
+        const raw = await client.listVendors(start, max);
+        if (format === "raw") return raw;
+
+        const rowCount = await client.countEntities("Vendor", ACTIVE_VENDORS);
+        return buildEntityList({
+          entity: "Vendor",
+          key: "vendors",
+          rows: queryRows(raw, "Vendor").map(slimVendor),
+          startPosition: start,
+          maxResults: max,
+          rowCount,
+          // A page of vendor balances is a slice of what we owe, not a total.
+          sumField: null,
+        });
+      }),
   );
 
   server.tool(
     "qbo_search_vendors",
-    "Search for vendors by name (partial match).",
+    "Search for vendors by name (partial match). " + VENDOR_ROWS_DOC,
     {
       name: z.string().describe("Vendor name to search for (supports % wildcards)"),
+      ...listPaging(100),
     },
     (args) =>
-      runTool("qbo_search_vendors", args, ({ name }) => {
-        const searchName = name.includes("%") ? name : `%${name}%`;
-        return client.query(
-          `SELECT * FROM Vendor WHERE DisplayName LIKE '${searchName}' MAXRESULTS 50`,
-        );
+      runTool("qbo_search_vendors", args, async ({ name, startPosition, maxResults, format }) => {
+        const pattern = name.includes("%") ? name : `%${name}%`;
+        const start = startPosition ?? 1;
+        const max = maxResults ?? 100;
+
+        const raw = await client.searchVendors(pattern, start, max);
+        if (format === "raw") return raw;
+
+        const rowCount = await client.countEntities("Vendor", vendorNameWhere(pattern));
+        return buildEntityList({
+          entity: "Vendor",
+          key: "vendors",
+          rows: queryRows(raw, "Vendor").map(slimVendor),
+          startPosition: start,
+          maxResults: max,
+          rowCount,
+          sumField: null,
+          filters: { name },
+        });
       }),
   );
 

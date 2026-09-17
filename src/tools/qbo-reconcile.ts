@@ -8,6 +8,7 @@ import {
   RECONCILE_COLUMNS,
   type ReconcileTxn,
 } from "../qbo-client.js";
+import { MAX_RESULT_CHARS, compact, packRows } from "../result-size.js";
 
 function err(e: unknown) {
   const msg = e instanceof QboError ? e.message : String(e);
@@ -135,7 +136,29 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
         lines.push(`  Cleared (${cleared.matched.length}, total ${cleared.total.toFixed(2)}):`);
         lines.push(...cleared.matched.map(fmt));
 
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        // The verdict is the deliverable; the listing is supporting detail. If a
+        // long period pushes the whole thing past the result budget, drop the
+        // tail of the listing and say so — never hand back a payload the client
+        // will reject, and never drop rows silently.
+        let text = lines.join("\n");
+        if (text.length > MAX_RESULT_CHARS) {
+          const keep: string[] = [];
+          let used = 0;
+          for (const l of lines) {
+            if (used + l.length + 1 > MAX_RESULT_CHARS - 400) break;
+            keep.push(l);
+            used += l.length + 1;
+          }
+          keep.push(
+            `  … listing truncated at ${keep.length} of ${lines.length} lines to stay inside the ${MAX_RESULT_CHARS.toLocaleString()}-character result budget.`,
+            `  The balances and difference above cover the FULL period. For the rest of the listing use qbo_cleared_transactions (accountId ${accountId}, paged), or run a shorter statementStartDate..statementEndDate.`,
+          );
+          text = keep.join("\n");
+        }
+        console.error(
+          `[tool] qbo_reconcile_worksheet account=${accountId} ${listStart}..${statementEndDate} uncleared=${uncleared.matched.length} cleared=${cleared.matched.length} chars=${text.length}`,
+        );
+        return { content: [{ type: "text", text }] };
       } catch (e) {
         return err(e);
       }
@@ -150,20 +173,42 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
       status: z.enum(["Reconciled", "Cleared", "Uncleared"]).describe("Reconcile status to filter by"),
+      offset: z.number().int().min(0).optional().describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
+      limit: z.number().int().min(1).optional().describe("Max rows in this page. The response is also capped by a size budget, whichever is smaller."),
     },
-    async ({ accountId, startDate, endDate, status }) => {
+    async ({ accountId, startDate, endDate, status, offset, limit }) => {
       try {
         const accountName = await client.getAccountName(accountId);
         if (!accountName) return err(new Error(`No account found with Id ${accountId}.`));
         const { matched, total } = await txnsForAccount(client, accountName, startDate, endDate, status);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ accountId, accountName, status, startDate, endDate, count: matched.length, total, transactions: matched }, null, 2),
-            },
-          ],
-        };
+        // `raw` echoes every report column the typed fields already carry —
+        // pure duplicate payload, and the reason this result used to be the
+        // fattest in the server. Drop it and page what's left.
+        const rows = matched.map(({ raw: _raw, ...t }) => t);
+        const page = packRows(rows, offset ?? 0, limit);
+        const text = compact({
+          accountId,
+          accountName,
+          status,
+          startDate,
+          endDate,
+          count: rows.length,
+          total,
+          offset: page.offset,
+          returned: page.rows.length,
+          hasMore: page.hasMore,
+          ...(page.hasMore
+            ? {
+                nextOffset: page.nextOffset,
+                note: `Showing rows ${page.offset}-${page.offset + page.rows.length - 1} of ${rows.length}. Call again with offset: ${page.nextOffset}. \`total\` already covers every row.`,
+              }
+            : {}),
+          transactions: page.rows,
+        });
+        console.error(
+          `[tool] qbo_cleared_transactions account=${accountId} ${startDate}..${endDate} status=${status} rows=${rows.length} returned=${page.rows.length} hasMore=${page.hasMore} chars=${text.length}`,
+        );
+        return { content: [{ type: "text", text }] };
       } catch (e) {
         return err(e);
       }

@@ -16,6 +16,24 @@ export class QboError extends Error {
   }
 }
 
+/**
+ * QBO answers some failures with HTTP 200 and a `Fault` body instead of an
+ * error status (a malformed `start_date`, for one, comes back 200 + SystemFault).
+ * Without this check a Fault flows on as if it were report data and the caller
+ * sees an empty/nonsense result rather than an error — the same trap already
+ * guarded on /upload. Returns a human message when the body is a Fault.
+ */
+export function qboFaultMessage(json: unknown): string | undefined {
+  const fault = (json as {
+    Fault?: { Error?: Array<{ Message?: string; Detail?: string; code?: string }>; type?: string };
+  })?.Fault;
+  if (!fault) return undefined;
+  const detail = (fault.Error ?? [])
+    .map((e) => [e.Message, e.Detail, e.code && `code=${e.code}`].filter(Boolean).join(" — "))
+    .join("; ");
+  return `${fault.type ?? "unknown"}: ${detail || "no detail"}`;
+}
+
 export interface TokenStore {
   getRefreshToken(): Promise<string>;
   saveRefreshToken(token: string): Promise<void>;
@@ -187,7 +205,12 @@ export class QboClient {
       throw new QboError(`QBO API error ${res.status}: ${text}`, res.status, text);
     }
 
-    return (await res.json()) as T;
+    const json = await res.json();
+    const fault = qboFaultMessage(json);
+    if (fault) {
+      throw new QboError(`QBO ${method} ${path} faulted (${fault})`, 200, json);
+    }
+    return json as T;
   }
 
   /** Run a QBO query (SQL-like syntax). */
@@ -213,7 +236,12 @@ export class QboClient {
       throw new QboError(`QBO query error ${res.status}: ${text}`, res.status, text);
     }
 
-    return (await res.json()) as T;
+    const json = await res.json();
+    const fault = qboFaultMessage(json);
+    if (fault) {
+      throw new QboError(`QBO query faulted (${fault})`, 200, json);
+    }
+    return json as T;
   }
 
   /** Fetch a report (ProfitAndLoss, BalanceSheet, TransactionList, etc.) */
@@ -243,7 +271,12 @@ export class QboClient {
       throw new QboError(`QBO report error ${res.status}: ${text}`, res.status, text);
     }
 
-    return res.json();
+    const json = await res.json();
+    const fault = qboFaultMessage(json);
+    if (fault) {
+      throw new QboError(`QBO ${reportName} report faulted (${fault})`, 200, json);
+    }
+    return json;
   }
 
   /**
@@ -536,6 +569,12 @@ export interface ReconcileTxn {
   account: string;
   /** Signed amount as reported in the account register (deposits +, payments −). */
   amount: number;
+  /** The other side of the entry, from the report's Split column. */
+  split: string;
+  /** QBO transaction Id, carried on the Transaction Type cell (lets a caller fetch the txn). */
+  id: string;
+  /** QBO Id of the register account, carried on the Account cell. */
+  accountId: string;
   raw: Record<string, string>;
 }
 
@@ -587,6 +626,7 @@ export function parseTransactionList(report: unknown): {
     accountIdx = cols.findIndex(
       (c) => /account/i.test(c) && !/split/i.test(c),
     );
+  const splitIdx = idx("Split");
 
   const txns: ReconcileTxn[] = [];
 
@@ -611,6 +651,9 @@ export function parseTransactionList(report: unknown): {
         memo: memoIdx >= 0 ? cd[memoIdx]?.value ?? "" : "",
         account: accountIdx >= 0 ? cd[accountIdx]?.value ?? "" : "",
         amount,
+        split: splitIdx >= 0 ? cd[splitIdx]?.value ?? "" : "",
+        id: typeIdx >= 0 ? cd[typeIdx]?.id ?? "" : "",
+        accountId: accountIdx >= 0 ? cd[accountIdx]?.id ?? "" : "",
         raw,
       });
     }

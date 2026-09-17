@@ -8,6 +8,10 @@ import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
 import { registerQboReportTools } from "./tools/qbo-reports.js";
 import { registerQboReconcileTools } from "./tools/qbo-reconcile.js";
+import { registerQboClassTools } from "./tools/qbo-classes.js";
+import { registerQboClassReportTools } from "./tools/qbo-class-reports.js";
+import { registerQboClassWriteTools } from "./tools/qbo-class-writes.js";
+import { registerQboBudgetTools } from "./tools/qbo-budgets.js";
 import { startHttpServer } from "./http-server.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
@@ -68,16 +72,21 @@ if (!hasQbo && !divvyApiToken) {
 function registerAllTools(server: McpServer) {
   if (qboConfig) {
     const qboClient = new QboClient(qboConfig);
+    // stdio runs are single-process and short-lived; in-memory replay
+    // protection still covers retries within a session.
+    const idempotency = new IdempotencyStore(new InMemoryOAuthStore());
     registerQboAccountTools(server, qboClient);
     registerQboVendorTools(server, qboClient);
     registerQboTransactionTools(server, qboClient, {
-      // stdio runs are single-process and short-lived; in-memory replay
-      // protection still covers retries within a session.
-      idempotency: new IdempotencyStore(new InMemoryOAuthStore()),
+      idempotency,
       gmail: gmailClientFromEnv(),
     });
     registerQboReportTools(server, qboClient);
     registerQboReconcileTools(server, qboClient);
+    registerQboClassTools(server, qboClient, { idempotency });
+    registerQboClassReportTools(server, qboClient);
+    registerQboClassWriteTools(server, qboClient);
+    registerQboBudgetTools(server, qboClient);
   }
 
   if (divvyApiToken) {

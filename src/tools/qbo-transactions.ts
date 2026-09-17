@@ -4,6 +4,7 @@ import { QboClient, QboError } from "../qbo-client.js";
 import { sniffContentType } from "../mime.js";
 import { IdempotencyStore, withIdempotency } from "../idempotency.js";
 import type { GmailClient } from "../gmail-client.js";
+import { mergeLinePatches, type LineFieldPatch, type QboLine } from "../class-lines.js";
 import { runTool, ToolFailure } from "../tool-logging.js";
 import {
   buildEntityList,
@@ -13,6 +14,16 @@ import {
   slimTransfer,
 } from "../qbo-rows.js";
 import { LIST_PAGING, LIST_PAGING_DOC, LIST_PAGING_NARROWING } from "./list-paging.js";
+
+const CLASS_ID_DESC =
+  "Optional Class id (the season tag, from qbo_list_classes) for this line. This company tracks one class per LINE, so it goes here rather than on the transaction.";
+
+/**
+ * Explains what a full line replace costs, so the tools can say it out loud
+ * instead of letting a caller find out from their books.
+ */
+const REPLACE_WARNING =
+  "Replacing lines discards every field the schema below cannot express — the line Id, TaxCodeRef, BillableStatus, CustomerRef and LineNum that QuickBooks put there. To change one field on an existing line, pass its lineId and only the fields you want changed; to add a class to an existing transaction, use qbo_set_transaction_class instead.";
 
 // QBO's documented attachment ceiling is 100MB, but we buffer the whole file in
 // memory on Cloud Run, so cap URL fetches well below that.
@@ -42,6 +53,112 @@ async function fetchFileFromUrl(
   const lastSegment = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).pop() ?? "");
   const fileName = dispositionName || (lastSegment.includes(".") ? lastSegment : undefined);
   return { data, contentType, fileName };
+}
+
+export interface LineInput {
+  lineId?: string;
+  amount?: number;
+  accountId?: string;
+  description?: string;
+  classId?: string;
+  entityId?: string;
+  entityType?: "Vendor" | "Customer" | "Employee";
+}
+
+/**
+ * Turn a caller's `lines` argument into the array to send QBO.
+ *
+ * Two modes, and the caller has to pick one on purpose:
+ *  - **every line carries a lineId** → edit in place. Existing lines are
+ *    deep-copied and only named fields are written, so TaxCodeRef,
+ *    BillableStatus, CustomerRef, LineNum and the line Id all survive.
+ *  - **no line carries a lineId** → full replace, which requires
+ *    `replaceAllLines: true` because it discards everything the schema can't
+ *    express. It used to be the silent default; that was the bug.
+ */
+function buildLineUpdate(
+  entityType: "Purchase" | "Deposit",
+  existing: QboLine[],
+  inputs: LineInput[],
+  replaceAllLines: boolean,
+  buildFresh: (inputs: LineInput[]) => QboLine[],
+): { lines: QboLine[] } | { error: string } {
+  const withIds = inputs.filter((l) => l.lineId);
+
+  if (withIds.length && withIds.length !== inputs.length) {
+    return {
+      error:
+        "Error: mixed line modes — some lines have a lineId and some don't. Either give every line its lineId (edit in place) or none of them (full replace with replaceAllLines: true).",
+    };
+  }
+
+  if (withIds.length) {
+    const patches = inputs as LineFieldPatch[];
+    const { lines, unmatched } = mergeLinePatches(entityType, existing, patches);
+    if (unmatched.length) {
+      return {
+        error: `Error: no line with id ${unmatched.join(", ")} on this transaction (it has lines ${existing
+          .map((l) => l.Id)
+          .filter(Boolean)
+          .join(", ")}). Nothing was changed.`,
+      };
+    }
+    return { lines };
+  }
+
+  if (!replaceAllLines) {
+    return {
+      error: `Error: replacing all lines needs replaceAllLines: true. ${REPLACE_WARNING}`,
+    };
+  }
+
+  const incomplete = inputs.findIndex((l) => l.amount === undefined || !l.accountId);
+  if (incomplete >= 0) {
+    return {
+      error: `Error: line ${incomplete + 1} is missing amount or accountId — both are required when replacing lines.`,
+    };
+  }
+
+  return { lines: buildFresh(inputs) };
+}
+
+export function buildPurchaseLineUpdate(
+  existing: QboLine[],
+  inputs: LineInput[],
+  replaceAllLines: boolean,
+): { lines: QboLine[] } | { error: string } {
+  return buildLineUpdate("Purchase", existing, inputs, replaceAllLines, (ls) =>
+    ls.map((l) => {
+      const detail: Record<string, unknown> = { AccountRef: { value: l.accountId } };
+      if (l.classId) detail.ClassRef = { value: l.classId };
+      return {
+        Amount: l.amount,
+        DetailType: "AccountBasedExpenseLineDetail",
+        AccountBasedExpenseLineDetail: detail,
+        Description: l.description,
+      };
+    }),
+  );
+}
+
+export function buildDepositLineUpdate(
+  existing: QboLine[],
+  inputs: LineInput[],
+  replaceAllLines: boolean,
+): { lines: QboLine[] } | { error: string } {
+  return buildLineUpdate("Deposit", existing, inputs, replaceAllLines, (ls) =>
+    ls.map((l) => {
+      const detail: Record<string, unknown> = { AccountRef: { value: l.accountId } };
+      if (l.entityId) detail.Entity = { value: l.entityId, type: l.entityType ?? "Vendor" };
+      if (l.classId) detail.ClassRef = { value: l.classId };
+      return {
+        Amount: l.amount,
+        DetailType: "DepositLineDetail",
+        DepositLineDetail: detail,
+        Description: l.description,
+      };
+    }),
+  );
 }
 
 export interface QboTransactionToolDeps {
@@ -125,7 +242,7 @@ export function registerQboTransactionTools(
 
   server.tool(
     "qbo_update_purchase",
-    "Update a purchase transaction — categorize it by setting the expense account, vendor, and/or memo. Sparse update: only the fields you pass are changed. The current PaymentType and AccountRef are fetched and carried over automatically (QBO rejects a sparse Purchase update without them), and SyncToken is auto-filled from the current version if omitted.",
+    `Update a purchase transaction — categorize it by setting the expense account, vendor, class and/or memo. Sparse update: only the fields you pass are changed. The current PaymentType and AccountRef are fetched and carried over automatically (QBO rejects a sparse Purchase update without them), and SyncToken is auto-filled from the current version if omitted. Pass each line's lineId to edit that line in place, preserving every field you don't name. ${REPLACE_WARNING}`,
     {
       id: z.string().describe("Purchase ID"),
       syncToken: z
@@ -137,20 +254,39 @@ export function registerQboTransactionTools(
       lines: z
         .array(
           z.object({
-            amount: z.number().describe("Line amount"),
-            accountId: z.string().describe("Expense account ID (from chart of accounts)"),
+            lineId: z
+              .string()
+              .optional()
+              .describe(
+                "Existing line Id (from qbo_get_purchase). Given, only the fields you pass are changed and everything else on that line survives. Omitted on every line, this becomes a full replace and needs replaceAllLines.",
+              ),
+            amount: z.number().optional().describe("Line amount (required when creating a replacement line)"),
+            accountId: z
+              .string()
+              .optional()
+              .describe("Expense account ID (required when creating a replacement line)"),
             description: z.string().optional().describe("Line description"),
+            classId: z.string().optional().describe(CLASS_ID_DESC),
           }),
         )
         .optional()
-        .describe("Replace line items with new categorization"),
+        .describe("Edit lines in place by lineId, or replace all lines (see replaceAllLines)"),
+      replaceAllLines: z
+        .boolean()
+        .optional()
+        .describe(
+          `Required to replace the whole line array when no lineIds are given. ${REPLACE_WARNING}`,
+        ),
     },
     (args) =>
-      runTool("qbo_update_purchase", args, async ({ id, syncToken, vendorId, memo, lines }) => {
+      runTool(
+        "qbo_update_purchase",
+        args,
+        async ({ id, syncToken, vendorId, memo, lines, replaceAllLines }) => {
         // QBO rejects a sparse Purchase update without PaymentType and AccountRef
         // (ValidationFault), so fetch the current transaction and carry them over.
         const current = (await client.getPurchase(id)) as {
-          Purchase?: { PaymentType?: string; AccountRef?: unknown; SyncToken?: string };
+          Purchase?: { PaymentType?: string; AccountRef?: unknown; SyncToken?: string; Line?: QboLine[] };
         };
         const existing = current.Purchase;
         if (!existing) throw new Error(`purchase ${id} not found`);
@@ -165,19 +301,15 @@ export function registerQboTransactionTools(
 
         if (vendorId) update.EntityRef = { type: "Vendor", value: vendorId };
         if (memo) update.PrivateNote = memo;
-        if (lines) {
-          update.Line = lines.map((l) => ({
-            Amount: l.amount,
-            DetailType: "AccountBasedExpenseLineDetail",
-            AccountBasedExpenseLineDetail: {
-              AccountRef: { value: l.accountId },
-            },
-            Description: l.description,
-          }));
-        }
+          if (lines) {
+            const built = buildPurchaseLineUpdate(existing.Line ?? [], lines, replaceAllLines ?? false);
+            if ("error" in built) throw new Error(built.error.replace(/^Error: /, ""));
+            update.Line = built.lines;
+          }
 
-        return client.updatePurchase(update);
-      }),
+          return client.updatePurchase(update);
+        },
+      ),
   );
 
   server.tool(
@@ -200,6 +332,7 @@ export function registerQboTransactionTools(
             amount: z.number().describe("Line amount (positive)"),
             accountId: z.string().describe("Expense account ID (from chart of accounts)"),
             description: z.string().optional().describe("Line description"),
+            classId: z.string().optional().describe(CLASS_ID_DESC),
           }),
         )
         .min(1)
@@ -211,14 +344,16 @@ export function registerQboTransactionTools(
         const purchase: Record<string, unknown> = {
           PaymentType: paymentType,
           AccountRef: { value: accountId },
-          Line: lines.map((l) => ({
-            Amount: l.amount,
-            DetailType: "AccountBasedExpenseLineDetail",
-            AccountBasedExpenseLineDetail: {
-              AccountRef: { value: l.accountId },
-            },
-            Description: l.description,
-          })),
+          Line: lines.map((l) => {
+            const detail: Record<string, unknown> = { AccountRef: { value: l.accountId } };
+            if (l.classId) detail.ClassRef = { value: l.classId };
+            return {
+              Amount: l.amount,
+              DetailType: "AccountBasedExpenseLineDetail",
+              AccountBasedExpenseLineDetail: detail,
+              Description: l.description,
+            };
+          }),
         };
         if (txnDate) purchase.TxnDate = txnDate;
         if (vendorId) purchase.EntityRef = { type: "Vendor", value: vendorId };
@@ -284,6 +419,7 @@ export function registerQboTransactionTools(
       .optional()
       .describe("Entity type for entityId (default Vendor)"),
     description: z.string().optional().describe("Line description"),
+    classId: z.string().optional().describe(CLASS_ID_DESC),
   });
   type DepositLineInput = z.infer<typeof depositLineSchema>;
 
@@ -294,6 +430,7 @@ export function registerQboTransactionTools(
       };
       // Deposit line entity is a plain ReferenceType: lowercase { value, type }.
       if (l.entityId) detail.Entity = { value: l.entityId, type: l.entityType ?? "Vendor" };
+      if (l.classId) detail.ClassRef = { value: l.classId };
       return {
         Amount: l.amount,
         DetailType: "DepositLineDetail",
@@ -387,7 +524,7 @@ export function registerQboTransactionTools(
 
   server.tool(
     "qbo_update_deposit",
-    "Update a deposit transaction — recategorize a line's income account and/or attributed entity, or change the memo. Parity with qbo_update_purchase. Sparse update: only the fields you pass are changed. The current DepositToAccountRef is fetched and carried over automatically (QBO requires it even in sparse updates), and SyncToken is auto-filled from the current version if omitted. Note: passing lines REPLACES all existing lines, so include every line you want to keep.",
+    `Update a deposit transaction — recategorize a line's income account, attributed entity and/or class, or change the memo. Parity with qbo_update_purchase. Sparse update: only the fields you pass are changed. The current DepositToAccountRef is fetched and carried over automatically (QBO requires it even in sparse updates), and SyncToken is auto-filled from the current version if omitted. Pass each line's lineId to edit that line in place, preserving every field you don't name. ${REPLACE_WARNING}`,
     {
       id: z.string().describe("Deposit ID"),
       syncToken: z
@@ -402,25 +539,44 @@ export function registerQboTransactionTools(
       lines: z
         .array(
           z.object({
-            amount: z.number().describe("Line amount (positive)"),
-            accountId: z.string().describe("Income account to credit"),
+            lineId: z
+              .string()
+              .optional()
+              .describe(
+                "Existing line Id (from qbo_get_deposit). Given, only the fields you pass are changed and everything else on that line survives. Omitted on every line, this becomes a full replace and needs replaceAllLines.",
+              ),
+            amount: z.number().optional().describe("Line amount (required when creating a replacement line)"),
+            accountId: z
+              .string()
+              .optional()
+              .describe("Income account to credit (required when creating a replacement line)"),
             entityId: z.string().optional().describe("Attributed entity ID (customer/vendor/employee)"),
             entityType: z
               .enum(["Vendor", "Customer", "Employee"])
               .optional()
               .describe("Entity type for entityId (default Vendor)"),
             description: z.string().optional().describe("Line description"),
+            classId: z.string().optional().describe(CLASS_ID_DESC),
           }),
         )
         .optional()
-        .describe("Replace all line items with this new set"),
+        .describe("Edit lines in place by lineId, or replace all lines (see replaceAllLines)"),
+      replaceAllLines: z
+        .boolean()
+        .optional()
+        .describe(
+          `Required to replace the whole line array when no lineIds are given. ${REPLACE_WARNING}`,
+        ),
     },
     (args) =>
-      runTool("qbo_update_deposit", args, async ({ id, syncToken, depositToAccountId, memo, lines }) => {
+      runTool(
+        "qbo_update_deposit",
+        args,
+        async ({ id, syncToken, depositToAccountId, memo, lines, replaceAllLines }) => {
         // QBO rejects a sparse Deposit update without DepositToAccountRef
         // (ValidationFault 2020) — fetch the current txn and carry it over.
         const current = (await client.getDeposit(id)) as {
-          Deposit?: { DepositToAccountRef?: unknown; SyncToken?: string };
+          Deposit?: { DepositToAccountRef?: unknown; SyncToken?: string; Line?: QboLine[] };
         };
         const existing = current.Deposit;
         if (!existing) throw new Error(`deposit ${id} not found`);
@@ -434,23 +590,15 @@ export function registerQboTransactionTools(
             : existing.DepositToAccountRef,
         };
         if (memo) update.PrivateNote = memo;
-        if (lines) {
-          update.Line = lines.map((l) => {
-            const detail: Record<string, unknown> = {
-              AccountRef: { value: l.accountId },
-            };
-            if (l.entityId) detail.Entity = { value: l.entityId, type: l.entityType ?? "Vendor" };
-            return {
-              Amount: l.amount,
-              DetailType: "DepositLineDetail",
-              DepositLineDetail: detail,
-              Description: l.description,
-            };
-          });
-        }
+          if (lines) {
+            const built = buildDepositLineUpdate(existing.Line ?? [], lines, replaceAllLines ?? false);
+            if ("error" in built) throw new Error(built.error.replace(/^Error: /, ""));
+            update.Line = built.lines;
+          }
 
-        return client.updateDeposit(update);
-      }),
+          return client.updateDeposit(update);
+        },
+      ),
   );
 
   server.tool(
@@ -533,6 +681,7 @@ export function registerQboTransactionTools(
               .optional()
               .describe("Entity type for entityId (default Vendor)"),
             description: z.string().optional().describe("Line description"),
+            classId: z.string().optional().describe(CLASS_ID_DESC),
           }),
         )
         .min(2)
@@ -564,6 +713,7 @@ export function registerQboTransactionTools(
             if (l.entityId) {
               detail.Entity = { Type: l.entityType ?? "Vendor", EntityRef: { value: l.entityId } };
             }
+            if (l.classId) detail.ClassRef = { value: l.classId };
             return {
               Amount: l.amount,
               DetailType: "JournalEntryLineDetail",

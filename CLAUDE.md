@@ -230,7 +230,18 @@ Traps worth knowing:
 - When client-side filtering empties a page, the tool walks BILL's cursor to
   refill it, bounded at 10 BILL pages per call and entered **only** when rows
   were actually dropped — so the healthy path is still one BILL call. The
-  result states `billPages` when more than one was consumed.
+  result states `billPages` when more than one was consumed. One consequence:
+  `returned` can **exceed** `pageSize`, because a result may span more than one
+  BILL page and a partial BILL page has no cursor to hand back.
+
+Live books, measured on revision `billcom-mcp-00064-rnq`. Asking for
+2026-05-01..2026-06-30 returned 50 rows dated 2026-08-02..2026-09-16 (all 50
+outside the range); it now returns the 6 rows that are in it, `hasMore: false`,
+and none outside. Walked to the last page, the row count grows with the range —
+6 / 53 / 105 / 185 for two months, three, four and a half, and fourteen —
+where before every one of those asks returned the same newest 50 rows. A
+single-day ask (`2026-06-26`..`2026-06-26`) returns the one transaction that
+day, which is the midnight-`lte` trap above.
 
 ## Protocol version
 

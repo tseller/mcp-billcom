@@ -41,13 +41,15 @@ gcloud config configurations activate mcp-billcom
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts (flattened rows + paging), account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors (both flattened rows + paging), create_vendor
-- `src/tools/list-paging.ts` — `listPaging(defaultMaxResults)`, the one `startPosition`/`maxResults`/`format` schema every list tool takes, so paging is spelled the same way everywhere
+- `src/tools/list-paging.ts` — the paging vocabularies, each paired with the sentence that names its knobs when a result is over budget (so advice and schema can't drift): `listPaging(defaultMaxResults)` (`startPosition`/`maxResults`/`format`, the QBO entity queries), `OFFSET_PAGING_NARROWING` (the `offset`/`limit` report tools) and `CURSOR_PAGING` (`page`/`pageSize`/`format`, BILL's opaque cursor)
 - `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit). The three list tools return **flattened rows** and **page by size as well as row count** — see "Tool result size" below
 - `src/qbo-rows.ts` — the flattened row shapes for every list tool (`slimPurchase`/`slimDeposit`/`slimTransfer`/`slimAccount`/`slimVendor`) plus `buildEntityList()`, which packs one page and states `rowCount` / `hasMore` / `nextStartPosition`. `sumField: null` omits `pageTotal` for a listing where a per-page sum states nothing true (a chart of accounts adds assets to liabilities)
 - `src/tool-logging.ts` — `runTool()`, the single response path every tool goes through: start/finish logging, `compact()` serialization, and the result-size budget. A handler returns plain data (or a string) and never builds an MCP response itself
 - `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
 - `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Enforced for **every** tool by `runTool`, not opted into per tool
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
+- `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions (flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, cards, members, budgets, list_pending_action
+- `src/divvy-rows.ts` — the flattened Divvy row (`slimTransaction`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
 - `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
 - `src/gmail-client.ts` — Gmail attachment fetch for qbo_attach_file (per-account refresh tokens)
@@ -76,7 +78,13 @@ paging is what turns that refusal into a usable answer.
   and the budget; the result carries `rowCount` (whole range), `offset`,
   `returned`, `hasMore`, `nextOffset` and a `note` saying how to get the rest.
 - Over budget is a named error stating the size and how to narrow the request —
-  never a silent oversized payload.
+  never a silent oversized payload. The advice names **this** tool's paging
+  knobs: each vocabulary in `src/tools/list-paging.ts` carries its own sentence
+  (`startPosition`/`maxResults`, `offset`/`limit`, `page`/`pageSize`) and the
+  tool passes it to `runTool`. One shared sentence naming QBO's knobs was how
+  `divvy_list_transactions` came to tell callers to pass four parameters it does
+  not accept; a tool with no paging arguments now names none rather than
+  borrowing another tool's.
 
 What this means in practice:
 
@@ -118,6 +126,18 @@ What this means in practice:
   The same range with `format: "raw"` is 123,152 chars and is refused by name.
 - Live books, 2026-05-01..2026-06-30: 62 rows, 52,180 chars before → 19,789
   after (2.6x), one page. Roughly 120-180 rows per page at those memo lengths.
+- `divvy_list_transactions` returns flattened rows (`src/divvy-rows.ts`) **by
+  default**. The row shape existed from the start but behind `compact: true`,
+  so the everyday call — the default, at BILL's own maximum page size of 50 —
+  was 93,704 chars and failed; the same call with the flag was 14,973. A
+  default nobody has to know about is the fix, so `format: "raw"` is now the
+  opt-in (for one transaction in full, `divvy_get_transaction`).
+  BILL's cursor is an opaque `nextPage` string, not a row offset, so this list
+  keeps `page`/`pageSize` rather than pretending to be `startPosition`; every
+  other field means what it does on the QBO lists. When `truncatedBy` is
+  `size` the cursor is **withheld**: it points past the whole BILL page, so
+  following it would skip the rows the budget dropped — the note says to
+  re-request the same `page` with a smaller `pageSize`.
 - `qbo_reconcile_worksheet` truncates the *listing* (never the balances or the
   verdict) with an explicit note pointing at the paged tool.
 - `qbo_profit_loss` / `qbo_balance_sheet` are hierarchical with nothing sane to

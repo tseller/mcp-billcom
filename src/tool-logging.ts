@@ -55,6 +55,16 @@ export class ToolFailure<T = unknown> {
   constructor(readonly data: T) {}
 }
 
+export interface RunToolOptions {
+  /**
+   * What to tell the caller when this tool's result is over budget — the
+   * sentence naming THIS tool's paging knobs (see `src/tools/list-paging.ts`).
+   * Omitted means the knob-free default: a tool with no paging arguments has
+   * none to name, and naming another tool's is worse than naming none.
+   */
+  narrowing?: string;
+}
+
 /**
  * Wrap an async tool body. Logs start/finish, serializes the result as the
  * MCP text response (compact, and refused if over the result-size budget),
@@ -68,6 +78,7 @@ export async function runTool<A, R>(
   name: string,
   args: A,
   fn: (args: A) => Promise<R>,
+  { narrowing }: RunToolOptions = {},
 ): Promise<ToolResult> {
   const start = Date.now();
   console.error(`[tool] ${name} start args=${summarizeArgs(args)}`);
@@ -82,7 +93,7 @@ export async function runTool<A, R>(
         `[tool] ${name} over-budget duration=${duration}ms chars=${text.length} budget=${MAX_RESULT_CHARS}`,
       );
       return {
-        content: [{ type: "text", text: `Error: ${overBudget(name, text.length)}` }],
+        content: [{ type: "text", text: `Error: ${overBudget(name, text.length, narrowing)}` }],
         isError: true,
       };
     }

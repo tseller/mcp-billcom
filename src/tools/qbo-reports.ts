@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { QboClient, parseTransactionList } from "../qbo-client.js";
 import { packRows } from "../result-size.js";
 import { runTool } from "../tool-logging.js";
+import { OFFSET_PAGING_NARROWING } from "./list-paging.js";
 
 /**
  * A TransactionList row, trimmed to what a treasurer actually reads.
@@ -97,7 +98,9 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
         // keeps it honest, so there is nothing to guard here.
         if (format === "raw") return report;
         return buildTransactionReport(report, { startDate, endDate, cleared, offset, limit });
-      }),
+      },
+      { narrowing: OFFSET_PAGING_NARROWING },
+      ),
   );
 
   server.tool(

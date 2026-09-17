@@ -12,7 +12,7 @@ import {
   slimPurchase,
   slimTransfer,
 } from "../qbo-rows.js";
-import { LIST_PAGING, LIST_PAGING_DOC } from "./list-paging.js";
+import { LIST_PAGING, LIST_PAGING_DOC, LIST_PAGING_NARROWING } from "./list-paging.js";
 
 // QBO's documented attachment ceiling is 100MB, but we buffer the whole file in
 // memory on Cloud Run, so cap URL fetches well below that.
@@ -110,6 +110,7 @@ export function registerQboTransactionTools(
             filters: { startDate, endDate, accountId, vendorId },
           });
         },
+        { narrowing: LIST_PAGING_NARROWING },
       ),
   );
 
@@ -260,7 +261,9 @@ export function registerQboTransactionTools(
           rowCount,
           filters: { startDate, endDate },
         });
-      }),
+      },
+      { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -480,7 +483,9 @@ export function registerQboTransactionTools(
           rowCount,
           filters: { startDate, endDate },
         });
-      }),
+      },
+      { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(

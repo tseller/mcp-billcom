@@ -197,6 +197,11 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
             : {}),
           transactions: page.rows,
         };
-      }),
+      },
+      {
+        narrowing:
+          "Narrow the request — a shorter date range, a smaller `limit`, or the next page (`offset: nextOffset`).",
+      },
+      ),
   );
 }

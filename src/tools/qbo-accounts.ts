@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ACTIVE_ACCOUNTS, QboClient } from "../qbo-client.js";
 import { runTool } from "../tool-logging.js";
-import { listPaging } from "./list-paging.js";
+import { LIST_PAGING_NARROWING, listPaging } from "./list-paging.js";
 import { buildEntityList, queryRows, slimAccount } from "../qbo-rows.js";
 
 export function registerQboAccountTools(server: McpServer, client: QboClient) {
@@ -35,7 +35,9 @@ export function registerQboAccountTools(server: McpServer, client: QboClient) {
           // a page total would be a number that means nothing.
           sumField: null,
         });
-      }),
+      },
+      { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(

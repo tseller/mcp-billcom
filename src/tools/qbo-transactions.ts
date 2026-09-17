@@ -5,6 +5,15 @@ import { sniffContentType } from "../mime.js";
 import { IdempotencyStore, withIdempotency } from "../idempotency.js";
 import type { GmailClient } from "../gmail-client.js";
 import { mergeLinePatches, type LineFieldPatch, type QboLine } from "../class-lines.js";
+import { runTool, ToolFailure } from "../tool-logging.js";
+import {
+  buildEntityList,
+  queryRows,
+  slimDeposit,
+  slimPurchase,
+  slimTransfer,
+} from "../qbo-rows.js";
+import { LIST_PAGING, LIST_PAGING_DOC, LIST_PAGING_NARROWING } from "./list-paging.js";
 
 const CLASS_ID_DESC =
   "Optional Class id (the season tag, from qbo_list_classes) for this line. This company tracks one class per LINE, so it goes here rather than on the transaction.";
@@ -15,11 +24,6 @@ const CLASS_ID_DESC =
  */
 const REPLACE_WARNING =
   "Replacing lines discards every field the schema below cannot express — the line Id, TaxCodeRef, BillableStatus, CustomerRef and LineNum that QuickBooks put there. To change one field on an existing line, pass its lineId and only the fields you want changed; to add a class to an existing transaction, use qbo_set_transaction_class instead.";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
 
 // QBO's documented attachment ceiling is 100MB, but we buffer the whole file in
 // memory on Cloud Run, so cap URL fetches well below that.
@@ -186,29 +190,45 @@ export function registerQboTransactionTools(
 
   server.tool(
     "qbo_list_purchases",
-    "List expense/purchase transactions from QuickBooks. These include credit card charges, checks, and cash purchases. Filter by date range, account, or vendor.",
+    "List expense/purchase transactions from QuickBooks. These include credit card charges, checks, and cash purchases. Filter by date range, account, or vendor. " +
+      LIST_PAGING_DOC,
     {
       startDate: z.string().optional().describe("Start date YYYY-MM-DD"),
       endDate: z.string().optional().describe("End date YYYY-MM-DD"),
       accountId: z.string().optional().describe("Filter by bank/CC account ID"),
       vendorId: z.string().optional().describe("Filter by vendor (EntityRef) ID"),
-      startPosition: z.number().int().min(1).optional().describe("1-based start position (default 1)"),
-      maxResults: z.number().int().min(1).max(1000).optional().describe("Max results (default 100)"),
+      ...LIST_PAGING,
     },
-    async ({ startDate, endDate, accountId, vendorId, startPosition, maxResults }) => {
-      try {
-        const conditions: string[] = [];
-        if (startDate) conditions.push(`TxnDate >= '${startDate}'`);
-        if (endDate) conditions.push(`TxnDate <= '${endDate}'`);
-        if (accountId) conditions.push(`AccountRef = '${accountId}'`);
-        if (vendorId) conditions.push(`EntityRef = '${vendorId}'`);
-        const where = conditions.join(" AND ");
-        const result = await client.queryPurchases(where, startPosition ?? 1, maxResults ?? 100);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+    (args) =>
+      runTool(
+        "qbo_list_purchases",
+        args,
+        async ({ startDate, endDate, accountId, vendorId, startPosition, maxResults, format }) => {
+          const conditions: string[] = [];
+          if (startDate) conditions.push(`TxnDate >= '${startDate}'`);
+          if (endDate) conditions.push(`TxnDate <= '${endDate}'`);
+          if (accountId) conditions.push(`AccountRef = '${accountId}'`);
+          if (vendorId) conditions.push(`EntityRef = '${vendorId}'`);
+          const where = conditions.join(" AND ");
+          const start = startPosition ?? 1;
+          const max = maxResults ?? 100;
+
+          const raw = await client.queryPurchases(where, start, max);
+          if (format === "raw") return raw;
+
+          const rowCount = await client.countEntities("Purchase", where);
+          return buildEntityList({
+            entity: "Purchase",
+            key: "purchases",
+            rows: queryRows(raw, "Purchase").map(slimPurchase),
+            startPosition: start,
+            maxResults: max,
+            rowCount,
+            filters: { startDate, endDate, accountId, vendorId },
+          });
+        },
+        { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -217,14 +237,7 @@ export function registerQboTransactionTools(
     {
       id: z.string().describe("Purchase transaction ID"),
     },
-    async ({ id }) => {
-      try {
-        const result = await client.getPurchase(id);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+    (args) => runTool("qbo_get_purchase", args, ({ id }) => client.getPurchase(id)),
   );
 
   server.tool(
@@ -265,20 +278,18 @@ export function registerQboTransactionTools(
           `Required to replace the whole line array when no lineIds are given. ${REPLACE_WARNING}`,
         ),
     },
-    async ({ id, syncToken, vendorId, memo, lines, replaceAllLines }) => {
-      try {
+    (args) =>
+      runTool(
+        "qbo_update_purchase",
+        args,
+        async ({ id, syncToken, vendorId, memo, lines, replaceAllLines }) => {
         // QBO rejects a sparse Purchase update without PaymentType and AccountRef
         // (ValidationFault), so fetch the current transaction and carry them over.
         const current = (await client.getPurchase(id)) as {
           Purchase?: { PaymentType?: string; AccountRef?: unknown; SyncToken?: string; Line?: QboLine[] };
         };
         const existing = current.Purchase;
-        if (!existing) {
-          return {
-            content: [{ type: "text" as const, text: `Error: purchase ${id} not found` }],
-            isError: true,
-          };
-        }
+        if (!existing) throw new Error(`purchase ${id} not found`);
 
         const update: Record<string, unknown> = {
           Id: id,
@@ -290,20 +301,15 @@ export function registerQboTransactionTools(
 
         if (vendorId) update.EntityRef = { type: "Vendor", value: vendorId };
         if (memo) update.PrivateNote = memo;
-        if (lines) {
-          const built = buildPurchaseLineUpdate(existing.Line ?? [], lines, replaceAllLines ?? false);
-          if ("error" in built) {
-            return { content: [{ type: "text" as const, text: built.error }], isError: true };
+          if (lines) {
+            const built = buildPurchaseLineUpdate(existing.Line ?? [], lines, replaceAllLines ?? false);
+            if ("error" in built) throw new Error(built.error.replace(/^Error: /, ""));
+            update.Line = built.lines;
           }
-          update.Line = built.lines;
-        }
 
-        const result = await client.updatePurchase(update);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+          return client.updatePurchase(update);
+        },
+      ),
   );
 
   server.tool(
@@ -333,8 +339,8 @@ export function registerQboTransactionTools(
         .describe("Expense lines — at least one required"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ paymentType, accountId, txnDate, vendorId, docNumber, memo, lines, idempotencyKey }) => {
-      try {
+    (args) =>
+      runTool("qbo_create_purchase", args, async ({ paymentType, accountId, txnDate, vendorId, docNumber, memo, lines, idempotencyKey }) => {
         const purchase: Record<string, unknown> = {
           PaymentType: paymentType,
           AccountRef: { value: accountId },
@@ -354,37 +360,45 @@ export function registerQboTransactionTools(
         if (docNumber) purchase.DocNumber = docNumber;
         if (memo) purchase.PrivateNote = memo;
 
-        const result = await idempotentCreate("qbo_create_purchase", idempotencyKey, () =>
+        return idempotentCreate("qbo_create_purchase", idempotencyKey, () =>
           client.createPurchase(purchase),
         );
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+      }),
   );
 
   server.tool(
     "qbo_list_deposits",
-    "List deposit transactions. Filter by date range.",
+    "List deposit transactions. Filter by date range. " + LIST_PAGING_DOC,
     {
       startDate: z.string().optional().describe("Start date YYYY-MM-DD"),
       endDate: z.string().optional().describe("End date YYYY-MM-DD"),
-      startPosition: z.number().int().min(1).optional().describe("1-based start position"),
-      maxResults: z.number().int().min(1).max(1000).optional().describe("Max results (default 100)"),
+      ...LIST_PAGING,
     },
-    async ({ startDate, endDate, startPosition, maxResults }) => {
-      try {
+    (args) =>
+      runTool("qbo_list_deposits", args, async ({ startDate, endDate, startPosition, maxResults, format }) => {
         const conditions: string[] = [];
         if (startDate) conditions.push(`TxnDate >= '${startDate}'`);
         if (endDate) conditions.push(`TxnDate <= '${endDate}'`);
         const where = conditions.join(" AND ");
-        const result = await client.queryDeposits(where, startPosition ?? 1, maxResults ?? 100);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        const start = startPosition ?? 1;
+        const max = maxResults ?? 100;
+
+        const raw = await client.queryDeposits(where, start, max);
+        if (format === "raw") return raw;
+
+        const rowCount = await client.countEntities("Deposit", where);
+        return buildEntityList({
+          entity: "Deposit",
+          key: "deposits",
+          rows: queryRows(raw, "Deposit").map(slimDeposit),
+          startPosition: start,
+          maxResults: max,
+          rowCount,
+          filters: { startDate, endDate },
+        });
+      },
+      { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -393,14 +407,7 @@ export function registerQboTransactionTools(
     {
       id: z.string().describe("Deposit transaction ID"),
     },
-    async ({ id }) => {
-      try {
-        const result = await client.getDeposit(id);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+    (args) => runTool("qbo_get_deposit", args, ({ id }) => client.getDeposit(id)),
   );
 
   const depositLineSchema = z.object({
@@ -460,17 +467,12 @@ export function registerQboTransactionTools(
       lines: z.array(depositLineSchema).min(1).describe("Deposit lines — at least one required"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ depositToAccountId, txnDate, memo, lines, idempotencyKey }) => {
-      try {
-        const deposit = buildDeposit({ depositToAccountId, txnDate, memo, lines });
-        const result = await idempotentCreate("qbo_create_deposit", idempotencyKey, () =>
-          client.createDeposit(deposit),
-        );
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+    (args) =>
+      runTool("qbo_create_deposit", args, ({ depositToAccountId, txnDate, memo, lines, idempotencyKey }) =>
+        idempotentCreate("qbo_create_deposit", idempotencyKey, () =>
+          client.createDeposit(buildDeposit({ depositToAccountId, txnDate, memo, lines })),
+        ),
+      ),
   );
 
   server.tool(
@@ -493,34 +495,31 @@ export function registerQboTransactionTools(
         .max(50)
         .describe("Deposits to create, in order (max 50 per call)"),
     },
-    async ({ deposits }) => {
-      const results: Array<Record<string, unknown>> = [];
-      for (const [i, item] of deposits.entries()) {
-        try {
-          const result = await idempotentCreate("qbo_create_deposit", item.idempotencyKey, () =>
-            client.createDeposit(buildDeposit(item)),
-          );
-          results.push({ index: i, ok: true, result });
-        } catch (e) {
-          const msg = e instanceof QboError ? e.message : String(e);
-          results.push({ index: i, ok: false, error: msg });
+    (args) =>
+      runTool("qbo_create_deposits_batch", args, async ({ deposits }) => {
+        const results: Array<Record<string, unknown>> = [];
+        for (const [i, item] of deposits.entries()) {
+          try {
+            const result = await idempotentCreate("qbo_create_deposit", item.idempotencyKey, () =>
+              client.createDeposit(buildDeposit(item)),
+            );
+            results.push({ index: i, ok: true, result });
+          } catch (e) {
+            const msg = e instanceof QboError ? e.message : String(e);
+            results.push({ index: i, ok: false, error: msg });
+          }
         }
-      }
-      const failed = results.filter((r) => !r.ok).length;
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { total: deposits.length, succeeded: deposits.length - failed, failed, results },
-              null,
-              2,
-            ),
-          },
-        ],
-        ...(failed === deposits.length ? { isError: true } : {}),
-      };
-    },
+        const failed = results.filter((r) => !r.ok).length;
+        const summary = {
+          total: deposits.length,
+          succeeded: deposits.length - failed,
+          failed,
+          results,
+        };
+        // Every item failed — data AND a failure, so it reports as an error
+        // while still carrying each item's reason.
+        return failed === deposits.length ? new ToolFailure(summary) : summary;
+      }),
   );
 
   server.tool(
@@ -569,20 +568,18 @@ export function registerQboTransactionTools(
           `Required to replace the whole line array when no lineIds are given. ${REPLACE_WARNING}`,
         ),
     },
-    async ({ id, syncToken, depositToAccountId, memo, lines, replaceAllLines }) => {
-      try {
+    (args) =>
+      runTool(
+        "qbo_update_deposit",
+        args,
+        async ({ id, syncToken, depositToAccountId, memo, lines, replaceAllLines }) => {
         // QBO rejects a sparse Deposit update without DepositToAccountRef
         // (ValidationFault 2020) — fetch the current txn and carry it over.
         const current = (await client.getDeposit(id)) as {
           Deposit?: { DepositToAccountRef?: unknown; SyncToken?: string; Line?: QboLine[] };
         };
         const existing = current.Deposit;
-        if (!existing) {
-          return {
-            content: [{ type: "text" as const, text: `Error: deposit ${id} not found` }],
-            isError: true,
-          };
-        }
+        if (!existing) throw new Error(`deposit ${id} not found`);
 
         const update: Record<string, unknown> = {
           Id: id,
@@ -593,43 +590,50 @@ export function registerQboTransactionTools(
             : existing.DepositToAccountRef,
         };
         if (memo) update.PrivateNote = memo;
-        if (lines) {
-          const built = buildDepositLineUpdate(existing.Line ?? [], lines, replaceAllLines ?? false);
-          if ("error" in built) {
-            return { content: [{ type: "text" as const, text: built.error }], isError: true };
+          if (lines) {
+            const built = buildDepositLineUpdate(existing.Line ?? [], lines, replaceAllLines ?? false);
+            if ("error" in built) throw new Error(built.error.replace(/^Error: /, ""));
+            update.Line = built.lines;
           }
-          update.Line = built.lines;
-        }
 
-        const result = await client.updateDeposit(update);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+          return client.updateDeposit(update);
+        },
+      ),
   );
 
   server.tool(
     "qbo_list_transfers",
-    "List bank transfer transactions. Filter by date range.",
+    "List bank transfer transactions. Filter by date range. " + LIST_PAGING_DOC,
     {
       startDate: z.string().optional().describe("Start date YYYY-MM-DD"),
       endDate: z.string().optional().describe("End date YYYY-MM-DD"),
-      startPosition: z.number().int().min(1).optional().describe("1-based start position"),
-      maxResults: z.number().int().min(1).max(1000).optional().describe("Max results (default 100)"),
+      ...LIST_PAGING,
     },
-    async ({ startDate, endDate, startPosition, maxResults }) => {
-      try {
+    (args) =>
+      runTool("qbo_list_transfers", args, async ({ startDate, endDate, startPosition, maxResults, format }) => {
         const conditions: string[] = [];
         if (startDate) conditions.push(`TxnDate >= '${startDate}'`);
         if (endDate) conditions.push(`TxnDate <= '${endDate}'`);
         const where = conditions.join(" AND ");
-        const result = await client.queryTransfers(where, startPosition ?? 1, maxResults ?? 100);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        const start = startPosition ?? 1;
+        const max = maxResults ?? 100;
+
+        const raw = await client.queryTransfers(where, start, max);
+        if (format === "raw") return raw;
+
+        const rowCount = await client.countEntities("Transfer", where);
+        return buildEntityList({
+          entity: "Transfer",
+          key: "transfers",
+          rows: queryRows(raw, "Transfer").map(slimTransfer),
+          startPosition: start,
+          maxResults: max,
+          rowCount,
+          filters: { startDate, endDate },
+        });
+      },
+      { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -643,8 +647,8 @@ export function registerQboTransactionTools(
       memo: z.string().optional().describe("Private note/memo"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ fromAccountId, toAccountId, amount, txnDate, memo, idempotencyKey }) => {
-      try {
+    (args) =>
+      runTool("qbo_create_transfer", args, ({ fromAccountId, toAccountId, amount, txnDate, memo, idempotencyKey }) => {
         const transfer: Record<string, unknown> = {
           FromAccountRef: { value: fromAccountId },
           ToAccountRef: { value: toAccountId },
@@ -653,14 +657,10 @@ export function registerQboTransactionTools(
         if (txnDate) transfer.TxnDate = txnDate;
         if (memo) transfer.PrivateNote = memo;
 
-        const result = await idempotentCreate("qbo_create_transfer", idempotencyKey, () =>
+        return idempotentCreate("qbo_create_transfer", idempotencyKey, () =>
           client.createTransfer(transfer),
         );
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+      }),
   );
 
   server.tool(
@@ -688,8 +688,8 @@ export function registerQboTransactionTools(
         .describe("At least two lines; total Debits must equal total Credits"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
     },
-    async ({ txnDate, memo, lines, idempotencyKey }) => {
-      try {
+    (args) =>
+      runTool("qbo_create_journal_entry", args, async ({ txnDate, memo, lines, idempotencyKey }) => {
         const totalDebit = lines
           .filter((l) => l.postingType === "Debit")
           .reduce((s, l) => s + l.amount, 0);
@@ -698,15 +698,9 @@ export function registerQboTransactionTools(
           .reduce((s, l) => s + l.amount, 0);
         // Guard client-side so we return a clear message instead of QBO's generic fault.
         if (Math.abs(totalDebit - totalCredit) > 0.005) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: journal entry is unbalanced — debits ${totalDebit.toFixed(2)} vs credits ${totalCredit.toFixed(2)}. They must be equal.`,
-              },
-            ],
-            isError: true,
-          };
+          throw new Error(
+            `journal entry is unbalanced — debits ${totalDebit.toFixed(2)} vs credits ${totalCredit.toFixed(2)}. They must be equal.`,
+          );
         }
 
         const journalEntry: Record<string, unknown> = {
@@ -731,14 +725,10 @@ export function registerQboTransactionTools(
         if (txnDate) journalEntry.TxnDate = txnDate;
         if (memo) journalEntry.PrivateNote = memo;
 
-        const result = await idempotentCreate("qbo_create_journal_entry", idempotencyKey, () =>
+        return idempotentCreate("qbo_create_journal_entry", idempotencyKey, () =>
           client.createJournalEntry(journalEntry),
         );
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+      }),
   );
 
   server.tool(
@@ -783,30 +773,24 @@ export function registerQboTransactionTools(
         .optional()
         .describe("Optional MIME override. Only set this if the auto-detected type is wrong."),
     },
-    async ({
-      entityType,
-      entityId,
-      fileBase64,
-      fileUrl,
-      gmailMessageId,
-      gmailAttachmentId,
-      gmailAccount,
-      fileName,
-      contentType,
-    }) => {
-      try {
+    (args) =>
+      runTool("qbo_attach_file", args, async ({
+        entityType,
+        entityId,
+        fileBase64,
+        fileUrl,
+        gmailMessageId,
+        gmailAttachmentId,
+        gmailAccount,
+        fileName,
+        contentType,
+      }) => {
         const wantsGmail = !!(gmailMessageId || gmailAttachmentId || gmailAccount);
         const sources = [!!fileBase64, !!fileUrl, wantsGmail].filter(Boolean).length;
         if (sources !== 1) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: provide exactly one file source — fileBase64, fileUrl, or gmailMessageId + gmailAttachmentId",
-              },
-            ],
-            isError: true,
-          };
+          throw new Error(
+            "provide exactly one file source — fileBase64, fileUrl, or gmailMessageId + gmailAttachmentId",
+          );
         }
 
         let fileData: Buffer;
@@ -819,26 +803,12 @@ export function registerQboTransactionTools(
             await fetchFileFromUrl(fileUrl));
         } else if (wantsGmail) {
           if (!gmail) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: "Error: the Gmail source is not configured on this server. Set GMAIL_REFRESH_TOKENS (mint tokens with `npm run gmail:link`) — or use fileUrl/fileBase64.",
-                },
-              ],
-              isError: true,
-            };
+            throw new Error(
+              "the Gmail source is not configured on this server. Set GMAIL_REFRESH_TOKENS (mint tokens with `npm run gmail:link`) — or use fileUrl/fileBase64.",
+            );
           }
           if (!gmailMessageId || !gmailAttachmentId) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: "Error: the Gmail source needs both gmailMessageId and gmailAttachmentId",
-                },
-              ],
-              isError: true,
-            };
+            throw new Error("the Gmail source needs both gmailMessageId and gmailAttachmentId");
           }
           source = "gmail";
           const fetched = await gmail.getAttachment(gmailAccount, gmailMessageId, gmailAttachmentId);
@@ -856,15 +826,9 @@ export function registerQboTransactionTools(
         const sniffed = sniffContentType(fileData);
         if (!sniffed && !contentType) {
           const head = fileData.subarray(0, 8).toString("hex");
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: file bytes don't match any supported format (PDF, JPEG, PNG, GIF, WebP, HEIC) — first bytes: ${head || "(empty)"}, size: ${fileData.length}. If the format is genuinely something else, pass contentType explicitly.`,
-              },
-            ],
-            isError: true,
-          };
+          throw new Error(
+            `file bytes don't match any supported format (PDF, JPEG, PNG, GIF, WebP, HEIC) — first bytes: ${head || "(empty)"}, size: ${fileData.length}. If the format is genuinely something else, pass contentType explicitly.`,
+          );
         }
         const mime = contentType || sniffed || sourceContentType || "application/octet-stream";
         if (contentType && sniffed && contentType !== sniffed) {
@@ -885,7 +849,7 @@ export function registerQboTransactionTools(
         console.error(
           `[tool] qbo_attach_file step=done entityType=${entityType} entityId=${entityId} attachableId=${attachable?.Id ?? "unknown"}`,
         );
-        const summary = {
+        return {
           attachableId: attachable?.Id,
           fileName: attachable?.FileName ?? name,
           contentType: mime,
@@ -893,11 +857,7 @@ export function registerQboTransactionTools(
           source,
           attachedTo: { entityType, entityId },
         };
-        return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+      }),
   );
 
   server.tool(
@@ -909,8 +869,8 @@ export function registerQboTransactionTools(
         .describe("QBO entity type of the transaction"),
       entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
     },
-    async ({ entityType, entityId }) => {
-      try {
+    (args) =>
+      runTool("qbo_list_attachments", args, async ({ entityType, entityId }) => {
         const result = (await client.queryAttachables(entityType, entityId)) as {
           QueryResponse?: {
             Attachable?: Array<{
@@ -931,17 +891,7 @@ export function registerQboTransactionTools(
           note: a.Note,
           createdAt: a.MetaData?.CreateTime,
         }));
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ count: attachments.length, attachments }, null, 2),
-            },
-          ],
-        };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        return { count: attachments.length, attachments };
+      }),
   );
 }

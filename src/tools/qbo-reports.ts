@@ -1,12 +1,9 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { QboClient, QboError, parseTransactionList } from "../qbo-client.js";
-import { MAX_RESULT_CHARS, packRows, compact, tooBig } from "../result-size.js";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
+import { QboClient, parseTransactionList } from "../qbo-client.js";
+import { packRows } from "../result-size.js";
+import { runTool } from "../tool-logging.js";
+import { OFFSET_PAGING_NARROWING } from "./list-paging.js";
 
 /**
  * A TransactionList row, trimmed to what a treasurer actually reads.
@@ -94,32 +91,16 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
         .optional()
         .describe("`rows` (default) returns flattened transaction rows. `raw` returns QBO's nested report JSON — much larger, and rejected outright if it exceeds the size budget."),
     },
-    async ({ startDate, endDate, cleared, offset, limit, format }) => {
-      try {
+    (args) =>
+      runTool("qbo_transaction_report", args, async ({ startDate, endDate, cleared, offset, limit, format }) => {
         const report = await client.transactionList({ startDate, endDate, cleared });
-
-        if (format === "raw") {
-          const text = compact(report);
-          if (text.length > MAX_RESULT_CHARS) {
-            throw new QboError(tooBig("raw TransactionList", `${startDate}..${endDate}`, text.length), 200);
-          }
-          console.error(
-            `[tool] qbo_transaction_report start=${startDate} end=${endDate} format=raw chars=${text.length}`,
-          );
-          return { content: [{ type: "text", text }] };
-        }
-
-        const result = buildTransactionReport(report, { startDate, endDate, cleared, offset, limit });
-        const text = compact(result);
-        console.error(
-          `[tool] qbo_transaction_report start=${startDate} end=${endDate}${cleared ? ` cleared=${cleared}` : ""} rows=${result.rowCount} returned=${result.returned} offset=${result.offset} hasMore=${result.hasMore} chars=${text.length}`,
-        );
-        return { content: [{ type: "text", text }] };
-      } catch (e) {
-        console.error(`[tool] qbo_transaction_report FAILED start=${startDate} end=${endDate}: ${e instanceof Error ? e.message : String(e)}`);
-        return err(e);
-      }
-    },
+        // `raw` is the whole nested report — the size budget in runTool is what
+        // keeps it honest, so there is nothing to guard here.
+        if (format === "raw") return report;
+        return buildTransactionReport(report, { startDate, endDate, cleared, offset, limit });
+      },
+      { narrowing: OFFSET_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -129,18 +110,10 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
     },
-    async ({ startDate, endDate }) => {
-      try {
-        const result = await client.report("ProfitAndLoss", {
-          start_date: startDate,
-          end_date: endDate,
-        });
-        return { content: [{ type: "text", text: guardedText("ProfitAndLoss", `${startDate}..${endDate}`, result) }] };
-      } catch (e) {
-        console.error(`[tool] qbo_profit_loss FAILED ${startDate}..${endDate}: ${e instanceof Error ? e.message : String(e)}`);
-        return err(e);
-      }
-    },
+    (args) =>
+      runTool("qbo_profit_loss", args, ({ startDate, endDate }) =>
+        client.report("ProfitAndLoss", { start_date: startDate, end_date: endDate }),
+      ),
   );
 
   server.tool(
@@ -149,30 +122,9 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
     {
       asOfDate: z.string().describe("As-of date YYYY-MM-DD"),
     },
-    async ({ asOfDate }) => {
-      try {
-        const result = await client.report("BalanceSheet", {
-          start_date: asOfDate,
-          end_date: asOfDate,
-        });
-        return { content: [{ type: "text", text: guardedText("BalanceSheet", asOfDate, result) }] };
-      } catch (e) {
-        console.error(`[tool] qbo_balance_sheet FAILED ${asOfDate}: ${e instanceof Error ? e.message : String(e)}`);
-        return err(e);
-      }
-    },
+    (args) =>
+      runTool("qbo_balance_sheet", args, ({ asOfDate }) =>
+        client.report("BalanceSheet", { start_date: asOfDate, end_date: asOfDate }),
+      ),
   );
-}
-
-/**
- * Summary reports (P&L, Balance Sheet) are hierarchical, so there is nothing
- * sane to page — but they must still never hand the client a payload it will
- * reject. Over budget is a named error naming the size, not a mystery.
- */
-function guardedText(report: string, range: string, result: unknown): string {
-  const text = compact(result);
-  if (text.length > MAX_RESULT_CHARS) {
-    throw new QboError(tooBig(report, range, text.length), 200);
-  }
-  return text;
 }

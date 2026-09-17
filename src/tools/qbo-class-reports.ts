@@ -2,19 +2,15 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   QboClient,
-  QboError,
   CLASS_LEDGER_COLUMNS,
   parseClassLedger,
   parseProfitAndLossByClass,
   type AccountingMethod,
   type ClassLedgerTxn,
 } from "../qbo-client.js";
-import { MAX_RESULT_CHARS, packRows, compact, tooBig } from "../result-size.js";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
+import { packRows } from "../result-size.js";
+import { runTool } from "../tool-logging.js";
+import { OFFSET_PAGING_NARROWING } from "./list-paging.js";
 
 /**
  * Class-aware reporting.
@@ -149,52 +145,47 @@ export function registerQboClassReportTools(server: McpServer, client: QboClient
         .describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
       limit: z.number().int().min(1).optional().describe("Max rows to return in this page"),
     },
-    async ({
-      startDate,
-      endDate,
-      classIds,
-      untaggedOnly,
-      accountNameContains,
-      accountingMethod,
-      offset,
-      limit,
-    }) => {
-      try {
-        if (untaggedOnly && classIds?.length) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: untaggedOnly and classIds are contradictory — untagged rows belong to no class. Pass one or the other.",
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        const requestedBasis: AccountingMethod = accountingMethod ?? "Accrual";
-        const report = await client.classReport("GeneralLedger", {
+    (args) =>
+      runTool(
+        "qbo_class_transactions",
+        args,
+        async ({
           startDate,
           endDate,
           classIds,
-          accountingMethod: requestedBasis,
-          columns: CLASS_LEDGER_COLUMNS,
-        });
-
-        const body = buildClassTransactions(report, {
-          startDate,
-          endDate,
           untaggedOnly,
           accountNameContains,
+          accountingMethod,
           offset,
           limit,
-          requestedBasis,
-        });
-        return { content: [{ type: "text", text: compact(body) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        }) => {
+          if (untaggedOnly && classIds?.length) {
+            throw new Error(
+              "untaggedOnly and classIds are contradictory — untagged rows belong to no class. Pass one or the other.",
+            );
+          }
+
+          const requestedBasis: AccountingMethod = accountingMethod ?? "Accrual";
+          const report = await client.classReport("GeneralLedger", {
+            startDate,
+            endDate,
+            classIds,
+            accountingMethod: requestedBasis,
+            columns: CLASS_LEDGER_COLUMNS,
+          });
+
+          return buildClassTransactions(report, {
+            startDate,
+            endDate,
+            untaggedOnly,
+            accountNameContains,
+            offset,
+            limit,
+            requestedBasis,
+          });
+        },
+        { narrowing: OFFSET_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -210,8 +201,8 @@ export function registerQboClassReportTools(server: McpServer, client: QboClient
         .optional()
         .describe("'rows' (default) returns flattened account rows; 'raw' returns QBO's nested report JSON"),
     },
-    async ({ startDate, endDate, classIds, accountingMethod, format }) => {
-      try {
+    (args) =>
+      runTool("qbo_profit_loss_by_class", args, async ({ startDate, endDate, classIds, accountingMethod, format }) => {
         const requestedBasis: AccountingMethod = accountingMethod ?? "Accrual";
         const report = await client.classReport("ProfitAndLoss", {
           startDate,
@@ -221,25 +212,13 @@ export function registerQboClassReportTools(server: McpServer, client: QboClient
           summarizeColumnBy: "Classes",
         });
 
-        if (format === "raw") {
-          const text = compact(report);
-          if (text.length > MAX_RESULT_CHARS) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `Error: ${tooBig("The raw P&L-by-class report", `${startDate}..${endDate}`, text.length)}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          return { content: [{ type: "text", text }] };
-        }
+        // `raw` is deliberately unpaged — a hierarchical report has nothing
+        // sane to slice — so an over-budget one becomes runTool's named error.
+        if (format === "raw") return report;
 
         const parsed = parseProfitAndLossByClass(report);
         const untaggedColumn = parsed.columns.find((c) => c.isUntagged);
-        const body = {
+        return {
           report: "ProfitAndLoss by class",
           startDate,
           endDate,
@@ -255,10 +234,6 @@ export function registerQboClassReportTools(server: McpServer, client: QboClient
           untaggedColumn: untaggedColumn?.title ?? null,
           rows: parsed.rows,
         };
-        return { content: [{ type: "text", text: compact(body) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+      }),
   );
 }

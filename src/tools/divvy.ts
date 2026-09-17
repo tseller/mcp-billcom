@@ -3,38 +3,8 @@ import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
-
-/** One-line-per-transaction shape for compact listings. */
-function compactTransaction(tx: Record<string, unknown>): Record<string, unknown> {
-  const customFields = Array.isArray(tx.customFields)
-    ? (tx.customFields as Array<{ name?: string; selectedValues?: unknown[]; note?: string }>)
-    : [];
-  const fields: Record<string, string> = {};
-  for (const f of customFields) {
-    if (!f.name) continue;
-    const selected = (f.selectedValues ?? [])
-      .map((v) => {
-        if (typeof v === 'string') return v;
-        const o = v as { value?: unknown; label?: unknown; name?: unknown };
-        return String(o.value ?? o.label ?? o.name ?? '');
-      })
-      .filter(Boolean);
-    const value = selected.length > 0 ? selected.join(', ') : (f.note ?? '').trim();
-    if (value) fields[f.name] = value;
-  }
-  return {
-    id: tx.id,
-    uuid: tx.uuid,
-    date: String(tx.occurredTime ?? '').slice(0, 10),
-    status: tx.status,
-    user: tx.userName,
-    merchant: tx.merchantName,
-    amount: tx.amount,
-    receiptStatus: tx.receiptStatus,
-    syncStatus: tx.syncStatus,
-    ...(Object.keys(fields).length > 0 ? { fields } : {}),
-  };
-}
+import { buildCursorList, slimTransaction } from '../divvy-rows.js';
+import { CURSOR_PAGING, CURSOR_PAGING_NARROWING, cursorNarrowing } from './list-paging.js';
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.tool(
@@ -46,7 +16,11 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
 
   server.tool(
     'divvy_list_transactions',
-    'List Divvy (BILL Spend & Expense) transactions. Each transaction includes: userName (cardholder), merchantName, amount, receiptRequired, syncStatus (PENDING/SYNCED/NOT_SYNCED), and custom fields like NAP CODES and Notes. Prefer compact:true unless you need raw fields — it returns one small row per transaction instead of ~2KB of scaffolding each. Use status:"DECLINED" to surface card declines.',
+    'List Divvy (BILL Spend & Expense) transactions. ' +
+      'Returns one flattened row per transaction — date, cardholder, merchant, amount, status, receipt and sync status, both ids, and the filled custom-field values (NAP CODES, Notes) — plus `pageTotal` for the page. ' +
+      'Paged: when `hasMore` is true, call again with `page: nextPage`. ' +
+      'Use status:"DECLINED" to surface card declines. ' +
+      '`format: "raw"` returns BILL\'s full objects (~2KB of scaffolding each, and rejected outright if the page exceeds the size budget); for one transaction in full, use divvy_get_transaction.',
     {
       startDate: z.string().optional().describe('Start date filter (YYYY-MM-DD)'),
       endDate: z.string().optional().describe('End date filter (YYYY-MM-DD)'),
@@ -58,37 +32,44 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
         .describe(
           'Filter by transaction status, e.g. CLEARED or DECLINED. Applied per page after fetch, so a page can return fewer rows than pageSize while nextPage is still set.',
         ),
-      compact: z
-        .boolean()
-        .optional()
-        .describe(
-          'Return one small row per transaction: id, uuid, date, status, cardholder, merchant, amount, receiptStatus, syncStatus, and filled custom-field values (NAP CODES, Notes).',
-        ),
-      page: z.string().optional().describe('Page cursor for pagination (from nextPage in previous response)'),
-      pageSize: z.string().optional().describe('Number of results per page'),
+      ...CURSOR_PAGING,
     },
     (args) =>
-      runTool('divvy_list_transactions', args, async ({ status, compact, ...query }) => {
-        const raw = (await client.listTransactions(query)) as {
-          results?: Array<Record<string, unknown>>;
-          nextPage?: string;
-        };
-        let results = Array.isArray(raw.results) ? raw.results : [];
-        if (status) {
-          results = results.filter(
-            (tx) => String(tx.status ?? '').toUpperCase() === status.toUpperCase(),
-          );
-        }
-        if (!compact) {
-          return status ? { ...raw, results, statusFilter: status } : raw;
-        }
-        return {
-          count: results.length,
-          transactions: results.map(compactTransaction),
-          nextPage: raw.nextPage,
-          ...(status ? { statusFilter: status } : {}),
-        };
-      }),
+      runTool(
+        'divvy_list_transactions',
+        args,
+        async ({ status, format, ...query }) => {
+          const raw = (await client.listTransactions(query)) as {
+            results?: Array<Record<string, unknown>>;
+            nextPage?: string;
+          };
+          let results = Array.isArray(raw.results) ? raw.results : [];
+          if (status) {
+            results = results.filter(
+              (tx) => String(tx.status ?? '').toUpperCase() === status.toUpperCase(),
+            );
+          }
+          // `raw` is BILL's full objects — the size budget in runTool is what
+          // keeps it honest, so there is nothing to guard here.
+          if (format === 'raw') {
+            return status ? { ...raw, results, statusFilter: status } : raw;
+          }
+          return buildCursorList({
+            entity: 'Transaction',
+            key: 'transactions',
+            rows: results.map(slimTransaction),
+            nextPage: raw.nextPage,
+            filters: {
+              startDate: query.startDate,
+              endDate: query.endDate,
+              budgetId: query.budgetId,
+              syncStatus: query.syncStatus,
+              statusFilter: status,
+            },
+          });
+        },
+        { narrowing: CURSOR_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -168,8 +149,12 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       pageSize: z.string().optional().describe('Results per page (default per BILL API)'),
     },
     (args) =>
-      runTool('divvy_list_custom_field_values', args, ({ customFieldId, page, pageSize }) =>
-        client.listCustomFieldValues(customFieldId, { page, pageSize }),
+      runTool(
+        'divvy_list_custom_field_values',
+        args,
+        ({ customFieldId, page, pageSize }) =>
+          client.listCustomFieldValues(customFieldId, { page, pageSize }),
+        { narrowing: cursorNarrowing({ format: false }) },
       ),
   );
 

@@ -2,18 +2,13 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   QboClient,
-  QboError,
   parseTransactionList,
   matchesAccount,
   RECONCILE_COLUMNS,
   type ReconcileTxn,
 } from "../qbo-client.js";
-import { MAX_RESULT_CHARS, compact, packRows } from "../result-size.js";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
+import { MAX_RESULT_CHARS, packRows } from "../result-size.js";
+import { runTool } from "../tool-logging.js";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 const isCreditCard = (accountType: string) => /credit\s*card/i.test(accountType);
@@ -65,11 +60,11 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
       statementBeginningBalance: z.number().optional().describe("Beginning balance from the paper statement — cross-checked against QBO's register balance as-of the day before the period starts."),
       statementStartDate: z.string().optional().describe("Statement start date YYYY-MM-DD — enables the beginning-balance cross-check and bounds the review listing."),
     },
-    async ({ accountId, statementEndDate, statementEndingBalance, statementBeginningBalance, statementStartDate }) => {
-      try {
+    (args) =>
+      runTool("qbo_reconcile_worksheet", args, async ({ accountId, statementEndDate, statementEndingBalance, statementBeginningBalance, statementStartDate }) => {
         const account = await client.getAccount(accountId);
         if (!account) {
-          return err(new Error(`No account found with Id ${accountId} (use qbo_account_balances to list accounts).`));
+          throw new Error(`No account found with Id ${accountId} (use qbo_account_balances to list accounts).`);
         }
         const cc = isCreditCard(account.accountType);
         // QBO's reconcile "register balance as of <date>" matches the BalanceSheet
@@ -81,7 +76,7 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
 
         const registerEnd = toRegister(await client.accountBalanceAsOf(account.name, statementEndDate));
         if (registerEnd === undefined) {
-          return err(new Error(`Account "${account.name}" not found on the BalanceSheet as of ${statementEndDate}.`));
+          throw new Error(`Account "${account.name}" not found on the BalanceSheet as of ${statementEndDate}.`);
         }
 
         const difference = round2(statementEndingBalance - registerEnd);
@@ -156,13 +151,10 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
           text = keep.join("\n");
         }
         console.error(
-          `[tool] qbo_reconcile_worksheet account=${accountId} ${listStart}..${statementEndDate} uncleared=${uncleared.matched.length} cleared=${cleared.matched.length} chars=${text.length}`,
+          `[tool] qbo_reconcile_worksheet account=${accountId} ${listStart}..${statementEndDate} uncleared=${uncleared.matched.length} cleared=${cleared.matched.length}`,
         );
-        return { content: [{ type: "text", text }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        return text;
+      }),
   );
 
   server.tool(
@@ -176,17 +168,17 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
       offset: z.number().int().min(0).optional().describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
       limit: z.number().int().min(1).optional().describe("Max rows in this page. The response is also capped by a size budget, whichever is smaller."),
     },
-    async ({ accountId, startDate, endDate, status, offset, limit }) => {
-      try {
+    (args) =>
+      runTool("qbo_cleared_transactions", args, async ({ accountId, startDate, endDate, status, offset, limit }) => {
         const accountName = await client.getAccountName(accountId);
-        if (!accountName) return err(new Error(`No account found with Id ${accountId}.`));
+        if (!accountName) throw new Error(`No account found with Id ${accountId}.`);
         const { matched, total } = await txnsForAccount(client, accountName, startDate, endDate, status);
         // `raw` echoes every report column the typed fields already carry —
         // pure duplicate payload, and the reason this result used to be the
         // fattest in the server. Drop it and page what's left.
         const rows = matched.map(({ raw: _raw, ...t }) => t);
         const page = packRows(rows, offset ?? 0, limit);
-        const text = compact({
+        return {
           accountId,
           accountName,
           status,
@@ -204,14 +196,12 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
               }
             : {}),
           transactions: page.rows,
-        });
-        console.error(
-          `[tool] qbo_cleared_transactions account=${accountId} ${startDate}..${endDate} status=${status} rows=${rows.length} returned=${page.rows.length} hasMore=${page.hasMore} chars=${text.length}`,
-        );
-        return { content: [{ type: "text", text }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        };
+      },
+      {
+        narrowing:
+          "Narrow the request — a shorter date range, a smaller `limit`, or the next page (`offset: nextOffset`).",
+      },
+      ),
   );
 }

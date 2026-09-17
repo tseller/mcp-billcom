@@ -1,18 +1,10 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  QboClient,
-  QboError,
-  parseProfitAndLossByClass,
-  type AccountingMethod,
-} from "../qbo-client.js";
+import { QboClient, parseProfitAndLossByClass, type AccountingMethod } from "../qbo-client.js";
 import { buildBudgetVsActuals, type QboBudget } from "../budget-actuals.js";
-import { MAX_RESULT_CHARS, packRows, compact, tooBig } from "../result-size.js";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
+import { packRows } from "../result-size.js";
+import { runTool } from "../tool-logging.js";
+import { OFFSET_PAGING_NARROWING } from "./list-paging.js";
 
 const READ_ONLY_NOTE =
   "Budgets are READ-ONLY in the QuickBooks API — there is no create/update/delete, so a budget has to be built in the QuickBooks web UI first and can only be read back from here.";
@@ -51,9 +43,12 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
         .optional()
         .describe("Include every BudgetDetail row — account, class, period, amount (default false; can be long)"),
     },
-    async ({ nameContains, includeInactive, includeDetail }) => {
-      try {
-        const result = (await client.listBudgets(includeInactive ?? false)) as {
+    (args) =>
+      runTool(
+        "qbo_list_budgets",
+        args,
+        async ({ nameContains, includeInactive, includeDetail }) => {
+          const result = (await client.listBudgets(includeInactive ?? false)) as {
           QueryResponse?: { Budget?: QboBudget[] };
         };
         let budgets = result.QueryResponse?.Budget ?? [];
@@ -61,31 +56,20 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
           const needle = nameContains.toLowerCase();
           budgets = budgets.filter((b) => (b.Name ?? "").toLowerCase().includes(needle));
         }
-        const body = {
-          count: budgets.length,
-          note:
-            budgets.length === 0
-              ? `No budgets exist in this company yet. ${READ_ONLY_NOTE}`
-              : READ_ONLY_NOTE,
-          budgets: budgets.map((b) => summarize(b, includeDetail ?? false)),
-        };
-        const text = compact(body);
-        if (text.length > MAX_RESULT_CHARS) {
           return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: ${tooBig("The budget list with detail", "all budgets", text.length)} Call again without includeDetail, or narrow with nameContains.`,
-              },
-            ],
-            isError: true,
+            count: budgets.length,
+            note:
+              budgets.length === 0
+                ? `No budgets exist in this company yet. ${READ_ONLY_NOTE}`
+                : READ_ONLY_NOTE,
+            budgets: budgets.map((b) => summarize(b, includeDetail ?? false)),
           };
-        }
-        return { content: [{ type: "text", text }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        },
+        {
+          narrowing:
+            "Call again without `includeDetail`, or narrow with `nameContains`.",
+        },
+      ),
   );
 
   server.tool(
@@ -116,37 +100,28 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
         .describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
       limit: z.number().int().min(1).optional().describe("Max rows to return in this page"),
     },
-    async ({ budgetId, startDate, endDate, classIds, accountingMethod, offset, limit }) => {
-      try {
-        const found = (await client.getBudget(budgetId)) as {
+    (args) =>
+      runTool(
+        "qbo_budget_vs_actuals",
+        args,
+        async ({ budgetId, startDate, endDate, classIds, accountingMethod, offset, limit }) => {
+          const found = (await client.getBudget(budgetId)) as {
           QueryResponse?: { Budget?: QboBudget[] };
         };
-        const budget = found.QueryResponse?.Budget?.[0];
-        if (!budget) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: budget ${budgetId} not found. ${READ_ONLY_NOTE} List what exists with qbo_list_budgets.`,
-              },
-            ],
-            isError: true,
-          };
-        }
+          const budget = found.QueryResponse?.Budget?.[0];
+          if (!budget) {
+            throw new Error(
+              `budget ${budgetId} not found. ${READ_ONLY_NOTE} List what exists with qbo_list_budgets.`,
+            );
+          }
 
-        const from = startDate ?? budget.StartDate;
-        const to = endDate ?? budget.EndDate;
-        if (!from || !to) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: this budget carries no start/end date, so pass startDate and endDate explicitly.",
-              },
-            ],
-            isError: true,
-          };
-        }
+          const from = startDate ?? budget.StartDate;
+          const to = endDate ?? budget.EndDate;
+          if (!from || !to) {
+            throw new Error(
+              "this budget carries no start/end date, so pass startDate and endDate explicitly.",
+            );
+          }
 
         const basis: AccountingMethod = accountingMethod ?? "Accrual";
         const report = await client.classReport("ProfitAndLoss", {
@@ -160,8 +135,8 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
         const { rows, totals } = buildBudgetVsActuals(budget, actuals, { startDate: from, endDate: to });
         const page = packRows(rows, offset ?? 0, limit);
 
-        const body = {
-          budget: { id: budget.Id, name: budget.Name, entryType: budget.BudgetEntryType, type: budget.BudgetType },
+          return {
+            budget: { id: budget.Id, name: budget.Name, entryType: budget.BudgetEntryType, type: budget.BudgetType },
           startDate: from,
           endDate: to,
           accountingBasis: actuals.basis || basis,
@@ -179,12 +154,10 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
                 note: `Showing rows ${page.offset}-${page.offset + page.rows.length - 1} of ${rows.length}. Call again with offset: ${page.nextOffset} for the rest. \`totals\` already cover the whole budget.`,
               }
             : {}),
-          rows: page.rows,
-        };
-        return { content: [{ type: "text", text: compact(body) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+            rows: page.rows,
+          };
+        },
+        { narrowing: OFFSET_PAGING_NARROWING },
+      ),
   );
 }

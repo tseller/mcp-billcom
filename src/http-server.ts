@@ -22,9 +22,21 @@ import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { gmailClientFromEnv } from "./gmail-client.js";
+import {
+  LATEST_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  negotiateProtocolVersion,
+  reconcileProtocolVersion,
+  setRequestHeader,
+} from "./protocol-version.js";
 
 export function startHttpServer(qboConfig?: QboConfig): void {
   const transports = new Map<string, StreamableHTTPServerTransport>();
+
+  // The protocol version each live session negotiated at `initialize`. This is
+  // the authoritative answer to "what does this session speak" — see
+  // protocol-version.ts for why the client's per-request header isn't.
+  const negotiatedVersions = new Map<string, string>();
 
   const serverUrl = process.env.SERVER_URL || `http://localhost:${process.env.PORT || "8080"}`;
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
@@ -52,6 +64,55 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   // helper adds no DNS-rebinding middleware anyway, so this is otherwise
   // equivalent (and /mcp is still bearer-protected below).
   const app = express();
+
+  // Name every rejected /mcp request in the logs. Cloud Run's access log shows
+  // only "400" with a byte count, so a request the transport turns away (wrong
+  // protocol version, dead session, bad handshake) is invisible server-side and
+  // surfaces to the user as an unexplained tool failure. Log the method,
+  // session and protocol version so the next one is readable, not guessed at.
+  //
+  // Mounted first, ahead of body parsing and auth, so it covers *every* way a
+  // /mcp request can be refused — a 401 from the bearer check and a 400 from a
+  // body that failed to parse are rejections too, and were previously as
+  // anonymous as the ones this line was added for. It logs from `res.finish`,
+  // so `req.body` is read after the parser has run (or stays `-` if it never
+  // did).
+  app.use("/mcp", (req: Request, res: Response, next) => {
+    res.on("finish", () => {
+      if (res.statusCode < 400) return;
+      const body = req.body as { method?: string; id?: unknown } | undefined;
+      console.error(
+        `[http] ${req.method} /mcp rejected ${res.statusCode}` +
+          ` rpc=${body?.method ?? "-"}` +
+          ` session=${(req.headers["mcp-session-id"] as string) ?? "-"}` +
+          ` protocolVersion=${(req.headers["mcp-protocol-version"] as string) ?? "-"}` +
+          ` ua=${req.headers["user-agent"] ?? "-"}`,
+      );
+    });
+    next();
+  });
+
+  // Reconcile the client's MCP-Protocol-Version header against the version
+  // this session actually negotiated, so a client that announces a version we
+  // don't speak is answered rather than refused. See protocol-version.ts.
+  app.use("/mcp", (req: Request, _res: Response, next) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const header = req.headers["mcp-protocol-version"] as string | undefined;
+    const decision = reconcileProtocolVersion(
+      header,
+      sessionId ? negotiatedVersions.get(sessionId) : undefined,
+    );
+    if (decision.action === "replace") {
+      setRequestHeader(req, "MCP-Protocol-Version", decision.value);
+      console.error(
+        `[http] protocol-version reconciled session=${sessionId}` +
+          ` client=${header} negotiated=${decision.value}` +
+          ` ua=${req.headers["user-agent"] ?? "-"}`,
+      );
+    }
+    next();
+  });
+
   app.use(express.json({ limit: "25mb" }));
 
   // Mount OAuth routes if Google credentials are configured
@@ -80,28 +141,23 @@ export function startHttpServer(qboConfig?: QboConfig): void {
 
   // Unauthenticated liveness probe — lets "container up" be distinguished
   // from "instance failed to start" when diagnosing edge 5xx responses.
+  //
+  // It also answers "which MCP protocol versions does the deployed server
+  // speak?" without a deploy or a log dig. That list is compiled into the SDK,
+  // so before this it could only be learned from the 400 the server emitted
+  // when it refused a client — the exact failure #15 is about.
   app.get("/health", (_req: Request, res: Response) => {
-    res.json({ ok: true });
-  });
-
-  // Name every rejected /mcp request in the logs. Cloud Run's access log shows
-  // only "400" with a byte count, so a request the transport turns away (wrong
-  // protocol version, dead session, bad handshake) is invisible server-side and
-  // surfaces to the user as an unexplained tool failure. Log the method,
-  // session and protocol version so the next one is readable, not guessed at.
-  app.use("/mcp", (req: Request, res: Response, next) => {
-    res.on("finish", () => {
-      if (res.statusCode < 400) return;
-      const body = req.body as { method?: string; id?: unknown } | undefined;
-      console.error(
-        `[http] ${req.method} /mcp rejected ${res.statusCode}` +
-          ` rpc=${body?.method ?? "-"}` +
-          ` session=${(req.headers["mcp-session-id"] as string) ?? "-"}` +
-          ` protocolVersion=${(req.headers["mcp-protocol-version"] as string) ?? "-"}` +
-          ` ua=${req.headers["user-agent"] ?? "-"}`,
-      );
+    res.json({
+      ok: true,
+      revision: process.env.K_REVISION ?? null,
+      protocol: {
+        latest: LATEST_PROTOCOL_VERSION,
+        supported: SUPPORTED_PROTOCOL_VERSIONS,
+        // A version outside `supported` is no longer refused on an established
+        // session: it is reconciled to the version that session negotiated.
+        unsupportedHeaderPolicy: "reconcile-to-negotiated",
+      },
     });
-    next();
   });
 
   app.post("/mcp", async (req: Request, res: Response) => {
@@ -127,17 +183,28 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       return;
     }
 
+    // Record what this session settles on, applying the same rule the SDK's
+    // initialize handler does. The SDK keeps the negotiated version to itself,
+    // and it is the only authority on what the session speaks afterwards.
+    const negotiated = negotiateProtocolVersion(
+      (body as { params?: { protocolVersion?: unknown } }).params?.protocolVersion,
+    );
+
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sessionId) => {
         transports.set(sessionId, transport);
-        console.error(`[http] New session: ${sessionId}`);
+        negotiatedVersions.set(sessionId, negotiated);
+        console.error(`[http] New session: ${sessionId} protocolVersion=${negotiated}`);
       },
     });
 
     transport.onclose = () => {
       const sid = transport.sessionId;
-      if (sid) transports.delete(sid);
+      if (sid) {
+        transports.delete(sid);
+        negotiatedVersions.delete(sid);
+      }
       console.error(`[http] Session closed: ${sid}`);
     };
 

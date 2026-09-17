@@ -1,13 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { QboClient, QboError, type QboClass } from "../qbo-client.js";
+import { QboClient, type QboClass } from "../qbo-client.js";
 import { IdempotencyStore, withIdempotency } from "../idempotency.js";
-import { compact } from "../result-size.js";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
+import { runTool } from "../tool-logging.js";
 
 const shape = (c: QboClass) => ({
   id: c.Id,
@@ -41,8 +36,8 @@ export function registerQboClassTools(
         .optional()
         .describe("Include deactivated classes (default false)"),
     },
-    async ({ nameContains, includeInactive }) => {
-      try {
+    (args) =>
+      runTool("qbo_list_classes", args, async ({ nameContains, includeInactive }) => {
         const result = (await client.listClasses(includeInactive ?? false)) as {
           QueryResponse?: { Class?: QboClass[] };
         };
@@ -55,7 +50,7 @@ export function registerQboClassTools(
               (c.fullyQualifiedName ?? "").toLowerCase().includes(needle),
           );
         }
-        const body = {
+        return {
           count: classes.length,
           classTrackingNote:
             classes.length === 0
@@ -63,11 +58,7 @@ export function registerQboClassTools(
               : undefined,
           classes,
         };
-        return { content: [{ type: "text", text: compact(body) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+      }),
   );
 
   server.tool(
@@ -89,21 +80,14 @@ export function registerQboClassTools(
           "Optional idempotency key (any unique string). If a create with this key already succeeded, the original result is returned instead of creating a duplicate.",
         ),
     },
-    async ({ name, parentClassId, idempotencyKey }) => {
-      try {
+    (args) =>
+      runTool("qbo_create_class", args, async ({ name, parentClassId, idempotencyKey }) => {
         const existing = await client.findClassByName(name);
         if (existing) {
           return {
-            content: [
-              {
-                type: "text",
-                text: compact({
-                  created: false,
-                  reason: "a class with this name already exists",
-                  class: shape(existing),
-                }),
-              },
-            ],
+            created: false,
+            reason: "a class with this name already exists",
+            class: shape(existing),
           };
         }
 
@@ -112,17 +96,7 @@ export function registerQboClassTools(
           ? withIdempotency(deps.idempotency, "qbo_create_class", idempotencyKey, create)
           : create())) as { Class?: QboClass };
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: compact({ created: true, class: result.Class ? shape(result.Class) : result }),
-            },
-          ],
-        };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        return { created: true, class: result.Class ? shape(result.Class) : result };
+      }),
   );
 }

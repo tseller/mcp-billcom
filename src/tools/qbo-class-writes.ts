@@ -7,12 +7,7 @@ import {
   type ClassableEntity,
   type QboLine,
 } from "../class-lines.js";
-import { compact } from "../result-size.js";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
+import { runTool, ToolFailure } from "../tool-logging.js";
 
 /**
  * Writing a Class onto existing transactions — the bulk re-tagging path.
@@ -188,33 +183,19 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
         .optional()
         .describe("Report what would change and write nothing (default false)"),
     },
-    async (args) => {
-      try {
-        if (!args.classId && !args.clearClass) {
-          return {
-            content: [
-              { type: "text" as const, text: "Error: pass either classId (to set a class) or clearClass: true (to remove one)." },
-            ],
-            isError: true,
-          };
+    (args) =>
+      runTool("qbo_set_transaction_class", args, async (a) => {
+        if (!a.classId && !a.clearClass) {
+          throw new Error("pass either classId (to set a class) or clearClass: true (to remove one).");
         }
-        if (args.classId && args.clearClass) {
-          return {
-            content: [
-              { type: "text" as const, text: "Error: classId and clearClass are contradictory — pass exactly one." },
-            ],
-            isError: true,
-          };
+        if (a.classId && a.clearClass) {
+          throw new Error("classId and clearClass are contradictory — pass exactly one.");
         }
         const blocked = await guardTracking();
-        if (blocked) return { content: [{ type: "text" as const, text: blocked }], isError: true };
+        if (blocked) throw new Error(blocked);
 
-        const outcome = await setTransactionClass(client, args as Parameters<typeof setTransactionClass>[1]);
-        return { content: [{ type: "text", text: compact(outcome) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        return setTransactionClass(client, a as Parameters<typeof setTransactionClass>[1]);
+      }),
   );
 
   server.tool(
@@ -240,11 +221,12 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
         .optional()
         .describe("Report what would change for every item and write nothing (default false)"),
     },
-    async ({ items, dryRun }) => {
-      const blocked = await guardTracking();
-      if (blocked) return { content: [{ type: "text" as const, text: blocked }], isError: true };
+    (args) =>
+      runTool("qbo_set_transaction_class_batch", args, async ({ items, dryRun }) => {
+        const blocked = await guardTracking();
+        if (blocked) throw new Error(blocked);
 
-      const results: Array<Record<string, unknown>> = [];
+        const results: Array<Record<string, unknown>> = [];
       for (const [index, item] of items.entries()) {
         if (!item.classId && !item.clearClass) {
           results.push({ index, ok: false, id: item.id, error: "pass either classId or clearClass" });
@@ -267,24 +249,19 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
         }
       }
 
-      const failed = results.filter((r) => !r.ok).length;
-      const linesChanged = results.reduce((s, r) => s + (Number(r.linesChanged) || 0), 0);
-      return {
-        content: [
-          {
-            type: "text",
-            text: compact({
-              dryRun: dryRun ?? false,
-              total: items.length,
-              succeeded: items.length - failed,
-              failed,
-              linesChanged,
-              results,
-            }),
-          },
-        ],
-        ...(failed === items.length ? { isError: true } : {}),
-      };
-    },
+        const failed = results.filter((r) => !r.ok).length;
+        const linesChanged = results.reduce((s, r) => s + (Number(r.linesChanged) || 0), 0);
+        const body = {
+          dryRun: dryRun ?? false,
+          total: items.length,
+          succeeded: items.length - failed,
+          failed,
+          linesChanged,
+          results,
+        };
+        // Every item failing is data AND a failure — ToolFailure keeps the
+        // per-item errors instead of collapsing them into one message.
+        return failed === items.length ? new ToolFailure(body) : body;
+      }),
   );
 }

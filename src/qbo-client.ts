@@ -70,6 +70,21 @@ interface IntuitTokenResponse {
   expires_in: number;
 }
 
+/**
+ * The WHERE clause of a list query and of its COUNT(*) have to be the same
+ * filter, or `rowCount` describes a different set than the rows do. They are
+ * named once here and shared by the query method and the tool that counts.
+ */
+export const ACTIVE_ACCOUNTS = "Active = true";
+export const ACTIVE_VENDORS = "Active = true";
+
+/** QBO's query language escapes a literal apostrophe by doubling it — a vendor called "Bob's" is a valid search, not a syntax error. */
+export const qboLiteral = (value: string) => value.replace(/'/g, "''");
+
+/** The vendor-name filter shared by the search query and its COUNT(*). */
+export const vendorNameWhere = (pattern: string) =>
+  `DisplayName LIKE '${qboLiteral(pattern)}'`;
+
 const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 const PRODUCTION_BASE = "https://quickbooks.api.intuit.com/v3/company";
 
@@ -367,13 +382,22 @@ export class QboClient {
 
   // --- Convenience methods ---
 
-  async listAccounts() {
-    return this.query("SELECT * FROM Account WHERE Active = true MAXRESULTS 1000");
+  async listAccounts(startPosition = 1, maxResults = 1000) {
+    return this.query(
+      `SELECT * FROM Account WHERE ${ACTIVE_ACCOUNTS} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
+    );
   }
 
   async listVendors(startPosition = 1, maxResults = 100) {
     return this.query(
-      `SELECT * FROM Vendor WHERE Active = true STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
+      `SELECT * FROM Vendor WHERE ${ACTIVE_VENDORS} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
+    );
+  }
+
+  /** Vendors whose display name matches a LIKE pattern, paged like the other lists. */
+  async searchVendors(pattern: string, startPosition = 1, maxResults = 100) {
+    return this.query(
+      `SELECT * FROM Vendor WHERE ${vendorNameWhere(pattern)} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
     );
   }
 
@@ -389,6 +413,30 @@ export class QboClient {
     return this.query(
       `SELECT * FROM Customer WHERE Active = true STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
     );
+  }
+
+  /**
+   * COUNT(*) over the same filter a list query uses, so a paged list can state
+   * how many rows the whole range holds. QBO's `totalCount` on a normal query
+   * is only the size of the page it just returned, so it can't answer this.
+   *
+   * Best-effort: a count that fails must not fail the listing, so callers get
+   * `undefined` and a result without `rowCount` rather than an error.
+   */
+  async countEntities(entity: string, where: string): Promise<number | undefined> {
+    const clause = where ? ` WHERE ${where}` : "";
+    try {
+      const res = await this.query<{ QueryResponse?: { totalCount?: number } }>(
+        `SELECT COUNT(*) FROM ${entity}${clause}`,
+      );
+      const count = res?.QueryResponse?.totalCount;
+      return typeof count === "number" ? count : undefined;
+    } catch (e) {
+      console.error(
+        `[qbo] count ${entity} failed (listing continues without rowCount): ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return undefined;
+    }
   }
 
   async queryPurchases(where: string, startPosition = 1, maxResults = 100) {

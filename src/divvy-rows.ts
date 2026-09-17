@@ -19,6 +19,7 @@
  * large page without going near BILL.
  */
 
+import { rowSyncStatus } from "./divvy-filters.js";
 import { packRows } from "./result-size.js";
 
 type Tx = Record<string, unknown>;
@@ -57,7 +58,10 @@ export function slimTransaction(tx: Tx): Record<string, unknown> {
     merchant: tx.merchantName,
     amount: tx.amount,
     receiptStatus: tx.receiptStatus,
-    syncStatus: tx.syncStatus,
+    // BILL states the accounting sync on a nested integration record, not a
+    // top-level `syncStatus` — reading the top-level name meant the row this
+    // tool advertises as carrying a sync status never carried one.
+    syncStatus: rowSyncStatus(tx),
     ...(Object.keys(fields).length > 0 ? { fields } : {}),
   };
 }
@@ -75,6 +79,15 @@ export interface CursorListInput {
   sumField?: string | null;
   /** Echoed filters (date range, budget, status) for a self-describing result. */
   filters?: Record<string, unknown>;
+  /**
+   * Per filter, how it was actually enforced — server-side, dropped here, or
+   * sent and not honored (see `FilterCheck`, src/divvy-filters.ts). Echoing a
+   * filter says only what was asked; this says what happened, which is the
+   * difference between #29 being invisible and being stated in the result.
+   */
+  filtering?: Record<string, string>;
+  /** BILL pages consumed for this one result, when more than one. */
+  billPages?: number;
 }
 
 /**
@@ -100,6 +113,8 @@ export function buildCursorList({
   nextPage,
   sumField = "amount",
   filters = {},
+  filtering,
+  billPages,
 }: CursorListInput): Record<string, unknown> {
   const page = packRows(rows, 0, undefined);
   const returned = page.rows.length;
@@ -126,6 +141,8 @@ export function buildCursorList({
   return {
     entity,
     ...Object.fromEntries(Object.entries(filters).filter(([, v]) => v !== undefined && v !== "")),
+    ...(filtering && Object.keys(filtering).length > 0 ? { filtering } : {}),
+    ...(billPages !== undefined && billPages > 1 ? { billPages } : {}),
     returned,
     ...(pageTotal !== undefined ? { pageTotal } : {}),
     hasMore,

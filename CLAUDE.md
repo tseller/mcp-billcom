@@ -49,6 +49,7 @@ gcloud config configurations activate mcp-billcom
 - `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Enforced for **every** tool by `runTool`, not opted into per tool
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions (flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, cards, members, budgets, list_pending_action
+- `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
 - `src/divvy-rows.ts` — the flattened Divvy row (`slimTransaction`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
 - `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
@@ -135,9 +136,10 @@ What this means in practice:
   (`{"startDate":"2026-05-01","endDate":"2026-06-30","pageSize":"50"}`,
   measured on revision `billcom-mcp-00063-2qh`): 93,704 chars before →
   **15,216** (6x), and `format: "raw"` on the same page is still 93,704 and
-  refused by name. (That date range narrows nothing today: BILL ignores this
-  tool's `startDate`/`endDate` and returns the newest page whatever you ask
-  for — issue #29, found while verifying this.)
+  refused by name. (That date range narrowed nothing when this was measured —
+  BILL ignored the parameter names the tool was sending and returned the newest
+  page whatever you asked for, issue #29, found while verifying this. It does
+  narrow now; see "Filters" below.)
   BILL's cursor is an opaque `nextPage` string, not a row offset, so this list
   keeps `page`/`pageSize` rather than pretending to be `startPosition`; every
   other field means what it does on the QBO lists. When `truncatedBy` is
@@ -154,6 +156,69 @@ What this means in practice:
 - Rejected `/mcp` requests are logged with the rpc method, session and
   `MCP-Protocol-Version`, so a request the transport turns away is readable in
   Cloud Run logs rather than an anonymous 400.
+
+## Filters
+
+A filter is only a filter if the rows that come back obey it.
+
+`divvy_list_transactions` sent `start_date` / `end_date` / `budget_id` /
+`sync_status` as query parameters. BILL's v3 `/spend/transactions` does not
+read those names, and answers **HTTP 200 with an unfiltered page** rather than
+rejecting the unknown parameter — so a treasurer reconciling May-June got
+August-September, the call succeeded, and nothing in the response said the
+filter had done nothing. `budgetId` and `syncStatus` were dead the same way,
+as was `since` on `divvy_list_pending_action`.
+
+The wrong parameter name was the instance. The structure that allowed it is
+that the tool had no way to tell an applied filter from an ignored one: it sent
+a filter and assumed. So a filter is now declared as a **pair**, in
+`src/divvy-filters.ts`:
+
+- `terms(value)` — what BILL is asked, in its own `field:operator:value`
+  grammar, comma-joined into the `filters` query parameter;
+- `matches(row, value)` — the same question asked of a row that came back.
+
+`FilterCheck` runs `matches` over every row of every BILL page, drops the rows
+that fail, and returns a `filtering` block in the result saying per filter how
+it was really enforced — `server`, `client`, or *sent and not honored*. A
+filter BILL ignores therefore cannot silently return the wrong rows; it drops
+them and says so. A filter BILL has no field for (`status`) takes the same path
+with no terms and reads as client-side rather than posing as a server filter.
+The tool's schema and `FILTER_SPECS` are pinned to each other by a test, so a
+filter added later cannot be sent without declaring how a row is checked
+against it.
+
+What BILL actually supports on `/v3/spend/transactions`, probed against live
+books on 2026-09-17 (it validates both field and operator, so this is BILL's
+own answer):
+
+| field | operators | notes |
+| --- | --- | --- |
+| `occurredTime` | `gte`, `lte` only | `eq`/`gt`/`lt`/`ne`/`in`/`sw` are 400s |
+| `budgetId` | `eq` | either the base64 `budgetId` or the `bgt_…` uuid |
+| `syncStatus` | `eq` | `PENDING`/`SYNCED`/`ERROR`/`MANUAL_SYNCED`/`NOT_SYNCED` |
+| `status` | — | not a filter field at all (400) — client-side only |
+
+Traps worth knowing:
+
+- Terms must be **comma-joined** in one `filters` parameter. Repeating the
+  parameter, or joining with a semicolon, is accepted and silently ignored —
+  the same failure mode as the original bug.
+- The value cannot carry a time: `occurredTime:lte:2026-06-26T23:59:59` fails
+  the `field:operator:value` split on its colons. A date-only `lte` means that
+  day at 00:00, which **excludes the day itself** — `lte:2026-06-26` returns
+  nothing for a transaction at `2026-06-26T10:50`. `endDate` therefore asks
+  BILL for the day after and trims the overhang client-side; `sentBound` on the
+  spec is what keeps that deliberate widening from reading as BILL ignoring us.
+- BILL states a transaction's accounting sync on a nested
+  `accountingIntegrationTransactions[].syncStatus` (lower-case `"synced"`), and
+  omits the record entirely when nothing synced. There is no top-level
+  `syncStatus`, so the row this tool advertises as carrying a sync status
+  carried none until `slimTransaction` was pointed at the nested record.
+- When client-side filtering empties a page, the tool walks BILL's cursor to
+  refill it, bounded at 10 BILL pages per call and entered **only** when rows
+  were actually dropped — so the healthy path is still one BILL call. The
+  result states `billPages` when more than one was consumed.
 
 ## Protocol version
 

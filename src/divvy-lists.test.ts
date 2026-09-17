@@ -1,8 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCursorList, slimTransaction } from "./divvy-rows.js";
+import { FILTER_SPECS, FilterCheck, billFilterParam } from "./divvy-filters.js";
+import type { DivvyClient } from "./divvy-client.js";
+import { registerDivvyTools } from "./tools/divvy.js";
 import { MAX_RESULT_CHARS, compact, overBudget } from "./result-size.js";
-import { runTool } from "./tool-logging.js";
+import { runTool, type ToolResult } from "./tool-logging.js";
 import {
   CURSOR_PAGING,
   CURSOR_PAGING_NARROWING,
@@ -62,8 +65,24 @@ function liveTransaction(i: number) {
         respondedTime: null,
       },
     ],
-    syncStatus: i % 4 === 0 ? "SYNCED" : "PENDING",
-    syncTime: null,
+    // BILL states the accounting sync on a nested integration record, and
+    // omits the record entirely for a transaction that has not synced — there
+    // is no top-level `syncStatus`, which is why the row used to carry none.
+    accountingIntegrationTransactions:
+      i % 4 === 0
+        ? [
+            {
+              id: `QWNjb3VudGluZ0ludGVncmF0aW9uVHJhbnNhY3Rpb246${i}`,
+              billable: false,
+              integrationTxId: String(1000 + i),
+              syncStatus: "synced",
+              syncMessage: "Synced to QBO",
+              integrationType: "qbo",
+              integrationId: "be28f5ec-7839-41ba-b646-5000d62c6c71",
+              syncRequestId: `e80eb15d-5287-4052-b05e-e2a0cbf939${String(i).padStart(2, "0")}`,
+            },
+          ]
+        : null,
     glAccountId: null,
     glAccountName: null,
     customFields: [
@@ -221,4 +240,259 @@ test("every narrowing sentence names only parameters of its own paging shape", (
       );
     }
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * Filters (issue #29): what is asked of BILL, and what is checked of
+ * the rows that come back.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The instance of the bug. `start_date` / `end_date` are not parameters BILL
+ * reads, and it answers 200 with an unfiltered page rather than rejecting
+ * them — so the only way to know they were wrong was to look at the dates.
+ * BILL's own grammar is `filters=field:operator:value`, comma-joined, and it
+ * rejects an unknown field or operator with a 400.
+ */
+test("a date range is asked of BILL in the grammar BILL actually reads", () => {
+  assert.equal(
+    billFilterParam({ startDate: "2026-05-01", endDate: "2026-06-30" }),
+    "occurredTime:gte:2026-05-01,occurredTime:lte:2026-07-01",
+  );
+  assert.equal(
+    billFilterParam({ budgetId: "bgt_uv3ogfaead47j90sf9v9k97ab8", syncStatus: "SYNCED" }),
+    "budgetId:eq:bgt_uv3ogfaead47j90sf9v9k97ab8,syncStatus:eq:SYNCED",
+  );
+  // BILL has no `status` filter field (asking for one is a 400), so it
+  // contributes no term and is enforced here instead.
+  assert.equal(billFilterParam({ status: "DECLINED" }), undefined);
+  assert.equal(billFilterParam({}), undefined);
+});
+
+/**
+ * BILL's `lte` is midnight of the day named, so `lte:2026-06-26` excludes a
+ * transaction at 2026-06-26T10:50 — the end of an inclusive range cannot be
+ * said to BILL directly (a value with a time fails the `field:operator:value`
+ * split on its colons). The tool asks for the day after and trims here.
+ */
+test("the last day of the range is in the range", () => {
+  const onEndDate = { ...liveTransaction(1), occurredTime: "2026-06-26T10:50:44.000+00:00" };
+  const dayAfterEnd = { ...liveTransaction(2), occurredTime: "2026-06-27T09:00:00.000+00:00" };
+  const check = new FilterCheck({ startDate: "2026-06-01", endDate: "2026-06-26" });
+  assert.deepEqual(check.keep([onEndDate, dayAfterEnd]), [onEndDate]);
+  // The overhang is ours — we asked BILL for the wider bound — so it does not
+  // read as BILL ignoring the filter.
+  assert.match(check.report().endDate, /^server \+ client/);
+});
+
+/**
+ * The check that would have caught #29: ask the rows, not the request. These
+ * are the rows production actually returned for a May-June query before the
+ * fix — the newest page, every row outside the range.
+ */
+test("rows outside the range asked for never reach the caller, and the result says so", () => {
+  const unfiltered = [
+    { ...liveTransaction(1), occurredTime: "2026-09-16T19:50:58.000+00:00" },
+    { ...liveTransaction(2), occurredTime: "2026-08-02T13:52:22.000+00:00" },
+    { ...liveTransaction(3), occurredTime: "2026-05-19T10:00:03.000+00:00" },
+  ];
+  const check = new FilterCheck({ startDate: "2026-05-01", endDate: "2026-06-30" });
+  const kept = check.keep(unfiltered);
+
+  assert.equal(kept.length, 1);
+  assert.equal(String(kept[0].occurredTime).slice(0, 10), "2026-05-19");
+  assert.equal(check.dropped, 2);
+  // Not "filter: 2026-05-01" — that only echoes what was asked. This states
+  // what happened, which is the whole difference.
+  assert.match(check.report().endDate, /not being honored/);
+  assert.match(check.report().endDate, /2 of 3 row\(s\) outside it/);
+});
+
+test("a filter BILL honors reads as server-side, with the rows to show for it", () => {
+  const inRange = [1, 2, 3].map((i) => ({
+    ...liveTransaction(i),
+    occurredTime: `2026-05-0${i}T10:00:00.000+00:00`,
+  }));
+  const check = new FilterCheck({ startDate: "2026-05-01", endDate: "2026-06-30" });
+  assert.equal(check.keep(inRange).length, 3);
+  assert.equal(check.dropped, 0);
+  assert.match(check.report().startDate, /^server — BILL filtered/);
+  assert.match(check.report().endDate, /^server — BILL filtered/);
+});
+
+test("a filter BILL has no field for says it is applied here, not pretends to be a server filter", () => {
+  const check = new FilterCheck({ status: "DECLINED" });
+  const kept = check.keep(page(9));
+  assert.equal(kept.length, 1); // liveTransaction(0) is the DECLINED one
+  assert.match(check.report().status, /^client — BILL has no `status` filter/);
+  assert.match(check.report().status, /8 of 9 row\(s\) dropped/);
+});
+
+/**
+ * `budgetId` and `syncStatus` travel the same path, and were the same kind of
+ * dead parameter (`budget_id`, `sync_status`). BILL takes both as filter
+ * terms, and both have a witness on the row — BILL accepts either spelling of
+ * a budget id, and states the accounting sync on a nested integration record.
+ */
+test("budgetId and syncStatus are checked against the row too", () => {
+  const byId = new FilterCheck({ budgetId: "bdg_7f3a1c9e2d4b6a8c0e2f4a6b8c0d2e4f" });
+  assert.equal(byId.keep(page(3)).length, 3);
+  const byUuid = new FilterCheck({ budgetId: "bgt_other" });
+  assert.equal(byUuid.keep(page(3)).length, 0);
+  assert.match(byUuid.report().budgetId, /not being honored/);
+
+  // Every 4th fixture row carries a nested "synced" record; the rest carry none.
+  const synced = new FilterCheck({ syncStatus: "SYNCED" });
+  assert.equal(synced.keep(page(8)).length, 2);
+  const notSynced = new FilterCheck({ syncStatus: "NOT_SYNCED" });
+  assert.equal(notSynced.keep(page(8)).length, 6);
+});
+
+test("a row carries the sync status the tool says it carries", () => {
+  assert.equal(slimTransaction(liveTransaction(0)).syncStatus, "SYNCED");
+  assert.equal(slimTransaction(liveTransaction(1)).syncStatus, undefined);
+});
+
+/** Registers the Divvy tools against a stub and hands back what was declared. */
+function registeredTools(client: unknown) {
+  const tools = new Map<
+    string,
+    { schema: Record<string, unknown>; handler: (args: Record<string, unknown>) => Promise<ToolResult> }
+  >();
+  const server = {
+    tool: (
+      name: string,
+      _desc: string,
+      schema: Record<string, unknown>,
+      handler: (args: Record<string, unknown>) => Promise<ToolResult>,
+    ) => tools.set(name, { schema, handler }),
+  };
+  registerDivvyTools(
+    server as unknown as Parameters<typeof registerDivvyTools>[0],
+    client as DivvyClient,
+  );
+  return tools;
+}
+
+const listResult = async (
+  handler: (a: Record<string, unknown>) => Promise<ToolResult>,
+  args: Record<string, unknown>,
+) => JSON.parse((await handler(args)).content[0].text) as Record<string, unknown>;
+
+/**
+ * The structural pin. Every filter this tool advertises must be declared in
+ * FILTER_SPECS — that is what makes it impossible to add one that is sent and
+ * never checked, which is the shape #29 had.
+ */
+test("every filter the tool advertises is declared with how it is checked", () => {
+  const { schema } = registeredTools({})!.get("divvy_list_transactions")!;
+  const paging = new Set(Object.keys(CURSOR_PAGING));
+  const advertised = Object.keys(schema).filter((k) => !paging.has(k));
+  assert.ok(advertised.length > 0);
+  for (const name of advertised) {
+    assert.ok(
+      name in FILTER_SPECS,
+      `\`${name}\` is offered as a filter with no declaration of how a row is checked against it`,
+    );
+  }
+  // And nothing is declared that the tool does not offer.
+  for (const name of Object.keys(FILTER_SPECS)) {
+    assert.ok(advertised.includes(name), `FILTER_SPECS declares \`${name}\`, which no tool offers`);
+  }
+});
+
+test("the tool sends BILL one filter parameter and reports how each filter landed", async () => {
+  const calls: Array<Record<string, string | undefined>> = [];
+  const client = {
+    listTransactions: async (p: Record<string, string | undefined>) => {
+      calls.push(p);
+      return {
+        results: [1, 2, 3].map((i) => ({
+          ...liveTransaction(i),
+          occurredTime: `2026-05-0${i}T10:00:00.000+00:00`,
+        })),
+        nextPage: "cursor-2",
+      };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, { startDate: "2026-05-01", endDate: "2026-06-30" });
+
+  assert.equal(calls.length, 1, "the healthy path is one BILL call");
+  assert.equal(calls[0].filters, "occurredTime:gte:2026-05-01,occurredTime:lte:2026-07-01");
+  assert.equal(calls[0].start_date, undefined);
+  assert.equal(result.returned, 3);
+  assert.match(String((result.filtering as Record<string, string>).startDate), /^server/);
+});
+
+/**
+ * If BILL stops honoring a filter, the rows are dropped here — and a page made
+ * mostly of holes is refilled from the next BILL page rather than coming back
+ * near-empty. Bounded: the walk only happens because rows were dropped.
+ */
+test("when BILL ignores a filter the page is refilled from the cursor, and says it was", async () => {
+  let call = 0;
+  const client = {
+    listTransactions: async () => {
+      call += 1;
+      // BILL ignoring the range: page 1 is all outside it, page 2 all inside.
+      const day = call === 1 ? "2026-09" : "2026-05";
+      return {
+        results: [1, 2, 3].map((i) => ({
+          ...liveTransaction(i),
+          occurredTime: `${day}-0${i}T10:00:00.000+00:00`,
+        })),
+        nextPage: `cursor-${call + 1}`,
+      };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, {
+    startDate: "2026-05-01",
+    endDate: "2026-06-30",
+    pageSize: "3",
+  });
+
+  assert.equal(call, 2);
+  assert.equal(result.billPages, 2);
+  assert.equal(result.returned, 3);
+  for (const row of result.transactions as Array<{ date: string }>) {
+    assert.ok(row.date >= "2026-05-01" && row.date <= "2026-06-30", `row outside range: ${row.date}`);
+  }
+  assert.match(String((result.filtering as Record<string, string>).endDate), /not being honored/);
+  assert.equal(result.nextPage, "cursor-3");
+});
+
+test("the walk is bounded — an always-ignored filter stops rather than paging forever", async () => {
+  let call = 0;
+  const client = {
+    listTransactions: async () => {
+      call += 1;
+      return {
+        results: [{ ...liveTransaction(1), occurredTime: "2026-09-01T10:00:00.000+00:00" }],
+        nextPage: `cursor-${call + 1}`,
+      };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, { startDate: "2026-05-01", endDate: "2026-06-30" });
+  assert.ok(call <= 10, `walked ${call} BILL pages`);
+  assert.equal(result.returned, 0);
+  // Zero rows, and the reason stated — not an empty answer with no explanation.
+  assert.match(String((result.filtering as Record<string, string>).endDate), /not being honored/);
+});
+
+test("with no filters set, nothing is sent to BILL and nothing is claimed", async () => {
+  const calls: Array<Record<string, string | undefined>> = [];
+  const client = {
+    listTransactions: async (p: Record<string, string | undefined>) => {
+      calls.push(p);
+      return { results: page(3), nextPage: undefined };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, {});
+  assert.equal(calls[0].filters, undefined);
+  assert.equal(result.filtering, undefined);
+  assert.equal(result.returned, 3);
 });

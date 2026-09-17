@@ -39,29 +39,25 @@ gcloud config configurations activate mcp-billcom
 - `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
 - `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
-<<<<<<< HEAD
-- `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
-- `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
-- `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit)
-- `src/tools/qbo-classes.ts` — QBO: list_classes, create_class (the season tags). Class names are never hardcoded — seasons become year-specific ("Fall 2026")
-- `src/tools/qbo-class-reports.ts` — QBO: class_transactions, profit_loss_by_class. **TransactionList cannot return a class**: it silently drops the `klass_name` column (verified against a bogus-column control), so class-aware listing is built on **GeneralLedger**, the only report returning both the posting Account and the Class. The class filter param is `class` (not `classid`, which is ignored) and QBO echoes an applied filter back as `Header.Class` — `QboClient.classReport` asserts that echo so a silently-dropped filter can't pose as a real answer. These reports default to **Accrual** because the company default is Cash, which would break deferred revenue
-- `src/tools/qbo-class-writes.ts` — QBO: set_transaction_class (+ batch) — the only sanctioned way to class an existing transaction
-- `src/tools/qbo-budgets.ts` — QBO: list_budgets, budget_vs_actuals. The Budget entity is **read-only** via the API (build budgets in the web UI), and there is **no budget report at all**: `BudgetVsActuals`/`BudgetSummary` return `5020 Permission Denied`, exactly as an invented report name does. So budget-vs-actuals is computed — `src/budget-actuals.ts` joins BudgetDetail (account × class) to a P&L summarised by class
-- `src/class-lines.ts` — line-preserving edits. Class writes **never rebuild a line**: they deep-copy QBO's own lines and write only `ClassRef`, then `diffPaths` re-checks that nothing else moved and the write is refused if it did. This exists because the update tools' `lines` array can express 3 fields while a live line carries up to 7 (`Id`, `TaxCodeRef`, `BillableStatus`, `CustomerRef`, `LineNum`), so a rebuild silently dropped the rest — hence `mergeLinePatches` (edit by `lineId`) and the explicit `replaceAllLines` flag on the update tools
-- `src/scripts/verify-class-live.ts` — read-only live/sandbox verification of the class tooling (`npx tsx src/scripts/verify-class-live.ts`; set `QBO_BASE_URL` + env credentials for a sandbox company)
-=======
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts (flattened rows + paging), account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors (both flattened rows + paging), create_vendor
 - `src/tools/list-paging.ts` — the paging vocabularies, each paired with the sentence that names its knobs when a result is over budget (so advice and schema can't drift): `listPaging(defaultMaxResults)` (`startPosition`/`maxResults`/`format`, the QBO entity queries), `OFFSET_PAGING_NARROWING` (the `offset`/`limit` report tools) and `CURSOR_PAGING` (`page`/`pageSize`/`format`, BILL's opaque cursor)
 - `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit). The three list tools return **flattened rows** and **page by size as well as row count** — see "Tool result size" below
 - `src/qbo-rows.ts` — the flattened row shapes for every list tool (`slimPurchase`/`slimDeposit`/`slimTransfer`/`slimAccount`/`slimVendor`) plus `buildEntityList()`, which packs one page and states `rowCount` / `hasMore` / `nextStartPosition`. `sumField: null` omits `pageTotal` for a listing where a per-page sum states nothing true (a chart of accounts adds assets to liabilities)
 - `src/tool-logging.ts` — `runTool()`, the single response path every tool goes through: start/finish logging, `compact()` serialization, and the result-size budget. A handler returns plain data (or a string) and never builds an MCP response itself
->>>>>>> origin/main
+- `src/tools/qbo-classes.ts` — QBO: list_classes, create_class (the season tags). Class names are never hardcoded — seasons become year-specific ("Fall 2026")
+- `src/tools/qbo-class-reports.ts` — QBO: class_transactions, profit_loss_by_class. **TransactionList cannot return a class**: it silently drops the `klass_name` column (verified against a bogus-column control), so class-aware listing is built on **GeneralLedger**, the only report returning both the posting Account and the Class. The class filter param is `class` (not `classid`, which is ignored) and QBO echoes an applied filter back as `Header.Class` — `QboClient.classReport` asserts that echo so a silently-dropped filter can't pose as a real answer. These reports default to **Accrual** because the company default is Cash, which would break deferred revenue
+- `src/tools/qbo-class-writes.ts` — QBO: set_transaction_class (+ batch) — the only sanctioned way to class an existing transaction
+- `src/tools/qbo-budgets.ts` — QBO: list_budgets, budget_vs_actuals. The Budget entity is **read-only** via the API (build budgets in the web UI), and there is **no budget report at all**: `BudgetVsActuals`/`BudgetSummary` return `5020 Permission Denied`, exactly as an invented report name does. So budget-vs-actuals is computed — `src/budget-actuals.ts` joins BudgetDetail (account × class) to a P&L summarised by class
+- `src/class-lines.ts` — line-preserving edits. Class writes **never rebuild a line**: they deep-copy QBO's own lines and write only `ClassRef`, then `diffPaths` re-checks that nothing else moved and the write is refused if it did. This exists because the update tools' `lines` array can express 3 fields while a live line carries up to 7 (`Id`, `TaxCodeRef`, `BillableStatus`, `CustomerRef`, `LineNum`), so a rebuild silently dropped the rest — hence `mergeLinePatches` (edit by `lineId`) and the explicit `replaceAllLines` flag on the update tools
+- `src/scripts/verify-class-live.ts` — read-only live/sandbox verification of the class tooling (`npx tsx src/scripts/verify-class-live.ts`; set `QBO_BASE_URL` + env credentials for a sandbox company)
 - `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
 - `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Enforced for **every** tool by `runTool`, not opted into per tool
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions (flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, cards, members, budgets, list_pending_action
 - `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
+- `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
+- `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
 - `src/divvy-rows.ts` — the flattened Divvy row (`slimTransaction`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
 - `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
@@ -242,6 +238,70 @@ and none outside. Walked to the last page, the row count grows with the range �
 where before every one of those asks returned the same newest 50 rows. A
 single-day ask (`2026-06-26`..`2026-06-26`) returns the one transaction that
 day, which is the midnight-`lte` trap above.
+
+## Budgets
+
+`divvy_list_budgets` returned `{"results":[]}` on books where almost every
+transaction names a budget (issue #34). Nothing was wrong with the request:
+BILL's `GET /v3/spend/budgets` simply does not return these budgets. Probed
+against live books on 2026-09-17, with the endpoint's own documented
+parameters:
+
+| ask | rows |
+| --- | --- |
+| no filter | 0 |
+| `retired:eq:false` | 0 |
+| `retired:eq:true` | 3 (all retired, all pre-2026) |
+| `budgetIds:eq:<an active budget's uuid>` | 0 |
+| `parentBudgetId:eq:…`, `isBudgetGroup:eq:…`, `name:sw:…` | 0 |
+| `sort=name:asc`, `sort=spent:desc`, `max=100` | 0 |
+| `GET /v3/spend/budgets/<that same uuid>` | **the budget, in full, 200** |
+
+So the list endpoint is blind to budgets the same token reads one at a time,
+and its unfiltered answer is a strict *subset* of a filtered one — asking it
+more cleverly does not help. Two traps: `budgetId` (singular) is rejected as an
+unsupported filter field while `budgetIds` is accepted and matches nothing, and
+`/v3/spend/budgets/{id}/members` returns `{"results":[]}` for a budget the list
+cannot see, so membership is no witness either.
+
+`assembleBudgets` therefore builds the listing from every source that names a
+budget — the budget list (asked for `retired:eq:false` **and** `retired:eq:true`,
+which between them cover every budget), the cards, and the most recent
+transactions — and reads each discovered id back with `GET /v3/spend/budgets/{id}`,
+which is BILL confirming the budget exists rather than us asserting it. The
+result states per source what it contributed and each row carries `seenOn`, so
+a listing that is short because a source went blind says so. The sources run
+concurrently and the read-backs eight at a time: ~18 BILL calls, 8-12s.
+
+Live books, measured on revision `billcom-mcp-00065-t7s`: 0 budgets before →
+**14**, 2,983 chars, including all ten named on recent transactions
+("AYSO Region 2B145", "Capital LiveScan Codes", "Fleet US", the tournament
+budgets) with both the base64 `id` and the `bgt_…` `uuid` that
+`divvy_list_transactions {"budgetId": …}` accepts. BILL's own list contributes
+3 of those 14 and says so in words.
+
+## Empty listings
+
+A list that returns no rows must say which kind of nothing it found. This is
+#29's shape a third time (`src/divvy-filters.ts`): a call that succeeds and
+says nothing true. A silent `[]` reads as "there are none" when it may mean
+"this source cannot see them" — which is exactly how a blind budget endpoint
+went unnoticed while every transaction named a budget.
+
+`describeEmpty()` (`src/empty-listing.ts`) names three meanings, and the
+strongest is only claimable with a **witness** — an independent source that
+would have named a row of this kind if one existed:
+
+- `none-found` — a witness was consulted and names none either;
+- `source-blind` — a witness names rows this source did not return;
+- `unverified` — nothing independent was checked, so the result states what
+  the source returned, not that none exist.
+
+`buildEntityList` and `buildCursorList` attach the block whenever `returned` is
+0, so every list tool — QBO and Divvy, including ones written later — inherits
+it without opting in, the same way they inherit the result-size budget.
+`unverified` is the default because it is the honest thing to say when nothing
+was checked; a tool that can afford a witness passes one.
 
 ## Protocol version
 

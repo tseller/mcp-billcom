@@ -5,6 +5,7 @@ import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
 import { buildCursorList, slimTransaction } from '../divvy-rows.js';
 import { FilterCheck } from '../divvy-filters.js';
+import { assembleBudgets } from '../divvy-budgets.js';
 import { CURSOR_PAGING, CURSOR_PAGING_NARROWING, cursorNarrowing } from './list-paging.js';
 
 /** BILL's own maximum for `max` on /v3/spend/transactions. */
@@ -20,9 +21,12 @@ const MAX_BILL_PAGES_PER_CALL = 10;
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.tool(
     'divvy_list_budgets',
-    'List all Divvy (BILL Spend & Expense) budgets',
+    'List Divvy (BILL Spend & Expense) budgets — one row each with the name, both spellings of the id that `divvy_list_transactions {"budgetId": …}` accepts, whether it is retired, and the current period\'s limit and spend. ' +
+      "Use this to resolve a budget name to an id. " +
+      "BILL's own budget-list endpoint does not return every budget on these books (issue #34), so the listing is assembled: budgets it does return, plus every budget named by a card or a recent transaction, each read back by id to confirm it exists. " +
+      '`sources` states what each one contributed, and `seenOn` on a row says where that budget was named — so a short answer reads as short rather than as "there are none".',
     {},
-    (args) => runTool('divvy_list_budgets', args, () => client.listBudgets()),
+    (args) => runTool('divvy_list_budgets', args, () => assembleBudgets(client)),
   );
 
   server.tool(

@@ -20,6 +20,7 @@
  */
 
 import { rowSyncStatus } from "./divvy-filters.js";
+import { describeEmpty, type Witness } from "./empty-listing.js";
 import { packRows } from "./result-size.js";
 
 type Tx = Record<string, unknown>;
@@ -88,6 +89,13 @@ export interface CursorListInput {
   filtering?: Record<string, string>;
   /** BILL pages consumed for this one result, when more than one. */
   billPages?: number;
+  /**
+   * Independent sources consulted for this result, for the zero-row case.
+   * Omitted means none were — which is what the `empty` block then says, since
+   * "the source returned nothing" and "there is nothing" are different claims
+   * (see `src/empty-listing.ts`).
+   */
+  witnesses?: Witness[];
 }
 
 /**
@@ -115,6 +123,7 @@ export function buildCursorList({
   filters = {},
   filtering,
   billPages,
+  witnesses,
 }: CursorListInput): Record<string, unknown> {
   const page = packRows(rows, 0, undefined);
   const returned = page.rows.length;
@@ -146,6 +155,7 @@ export function buildCursorList({
     returned,
     ...(pageTotal !== undefined ? { pageTotal } : {}),
     hasMore,
+    ...(returned === 0 ? { empty: describeEmpty(witnesses) } : {}),
     ...(hasMore
       ? {
           ...(sizeTruncated ? {} : { nextPage }),

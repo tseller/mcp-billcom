@@ -135,7 +135,9 @@ What this means in practice:
   (`{"startDate":"2026-05-01","endDate":"2026-06-30","pageSize":"50"}`,
   measured on revision `billcom-mcp-00063-2qh`): 93,704 chars before →
   **15,216** (6x), and `format: "raw"` on the same page is still 93,704 and
-  refused by name.
+  refused by name. (That date range narrows nothing today: BILL ignores this
+  tool's `startDate`/`endDate` and returns the newest page whatever you ask
+  for — issue #29, found while verifying this.)
   BILL's cursor is an opaque `nextPage` string, not a row offset, so this list
   keeps `page`/`pageSize` rather than pretending to be `startPosition`; every
   other field means what it does on the QBO lists. When `truncatedBy` is

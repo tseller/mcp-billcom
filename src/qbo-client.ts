@@ -391,6 +391,30 @@ export class QboClient {
     );
   }
 
+  /**
+   * COUNT(*) over the same filter a list query uses, so a paged list can state
+   * how many rows the whole range holds. QBO's `totalCount` on a normal query
+   * is only the size of the page it just returned, so it can't answer this.
+   *
+   * Best-effort: a count that fails must not fail the listing, so callers get
+   * `undefined` and a result without `rowCount` rather than an error.
+   */
+  async countEntities(entity: string, where: string): Promise<number | undefined> {
+    const clause = where ? ` WHERE ${where}` : "";
+    try {
+      const res = await this.query<{ QueryResponse?: { totalCount?: number } }>(
+        `SELECT COUNT(*) FROM ${entity}${clause}`,
+      );
+      const count = res?.QueryResponse?.totalCount;
+      return typeof count === "number" ? count : undefined;
+    } catch (e) {
+      console.error(
+        `[qbo] count ${entity} failed (listing continues without rowCount): ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return undefined;
+    }
+  }
+
   async queryPurchases(where: string, startPosition = 1, maxResults = 100) {
     const clause = where ? `WHERE ${where}` : "";
     return this.query(

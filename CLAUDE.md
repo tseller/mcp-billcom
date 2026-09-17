@@ -41,9 +41,11 @@ gcloud config configurations activate mcp-billcom
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
-- `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit)
+- `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit). The three list tools return **flattened rows** and **page by size as well as row count** — see "Tool result size" below
+- `src/qbo-rows.ts` — the flattened row shapes for those list tools (`slimPurchase`/`slimDeposit`/`slimTransfer`) plus `buildEntityList()`, which packs one page and states `rowCount` / `hasMore` / `nextStartPosition`
+- `src/tool-logging.ts` — `runTool()`, the single response path every tool goes through: start/finish logging, `compact()` serialization, and the result-size budget. A handler returns plain data (or a string) and never builds an MCP response itself
 - `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
-- `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Any tool whose payload grows with a date range goes through it
+- `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Enforced for **every** tool by `runTool`, not opted into per tool
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
@@ -61,19 +63,41 @@ tokens) and a fiscal year ~470,000. The server never complained; the failure
 landed past our edge at the client's per-result cap and looked like a bare
 "the tool errored", with nothing in the Cloud Run logs.
 
-The discipline now lives in `src/result-size.ts` and is shared:
+The discipline lives in `src/result-size.ts`, and it is the **default** rather
+than something each tool opts into: every tool response goes through `runTool`
+(`src/tool-logging.ts`), which serializes with `compact()` and refuses anything
+over budget. A tool written tomorrow inherits it without knowing this exists;
+paging is what turns that refusal into a usable answer.
 
 - `MAX_RESULT_CHARS` (40,000 ≈ 10k tokens) is the budget for one tool result.
 - `compact()` — no pretty-printing (indentation alone was ~25% of a payload).
 - `packRows()` — takes the largest slice that fits both the caller's `limit`
   and the budget; the result carries `rowCount` (whole range), `offset`,
   `returned`, `hasMore`, `nextOffset` and a `note` saying how to get the rest.
+- Over budget is a named error stating the size and how to narrow the request —
+  never a silent oversized payload.
 
 What this means in practice:
 
 - `qbo_transaction_report` and `qbo_cleared_transactions` accept `offset`/`limit`
   and page. **No date range is too long** — a long one just takes more calls.
   Aggregates (`total`) always cover the whole range, not the page.
+- `qbo_list_purchases` / `qbo_list_deposits` / `qbo_list_transfers` return
+  flattened rows (`src/qbo-rows.ts`) and page on ONE coordinate: when `hasMore`
+  is true, call again with `startPosition: nextStartPosition`. `rowCount` is a
+  separate `SELECT COUNT(*)` covering the whole filter (QBO's own `totalCount`
+  on a query is only the page it just returned); `pageTotal` is this page only,
+  because QBO's query language has no SUM. Both `hasMore` reasons are reported
+  via `truncatedBy`: `size` (the budget cut the window short) or `window`
+  (QBO has rows past what we asked for). `format: "raw"` still returns the full
+  entities, and is refused if it exceeds the budget.
+- Live books, a fiscal year of purchases (2025-07-01..2026-06-30, 96 rows):
+  199,955 chars before → ~22,000 after (~9x), one page, `rowCount: 96`. The
+  QBO entity is ~2,083 chars, of which `PurchaseEx` (a JAXB blob), `domain`,
+  `sparse`, `SyncToken`, `MetaData`, `PrintStatus`, `CustomExtensions` and the
+  USD `CurrencyRef` are envelope; a row keeps date, amount, payee/account names
+  WITH their ids, doc number, memo and the categorization lines. Full fidelity
+  is one `qbo_get_purchase` away.
 - Live books, 2026-05-01..2026-06-30: 62 rows, 52,180 chars before → 19,789
   after (2.6x), one page. Roughly 120-180 rows per page at those memo lengths.
 - `qbo_reconcile_worksheet` truncates the *listing* (never the balances or the

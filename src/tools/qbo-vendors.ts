@@ -1,11 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { QboClient, QboError } from "../qbo-client.js";
-
-function err(e: unknown) {
-  const msg = e instanceof QboError ? e.message : String(e);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
+import { QboClient } from "../qbo-client.js";
+import { runTool } from "../tool-logging.js";
 
 export function registerQboVendorTools(server: McpServer, client: QboClient) {
   server.tool(
@@ -15,14 +11,10 @@ export function registerQboVendorTools(server: McpServer, client: QboClient) {
       startPosition: z.number().int().min(1).optional().describe("1-based start position (default 1)"),
       maxResults: z.number().int().min(1).max(1000).optional().describe("Max results (default 100)"),
     },
-    async ({ startPosition, maxResults }) => {
-      try {
-        const result = await client.listVendors(startPosition ?? 1, maxResults ?? 100);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+    (args) =>
+      runTool("qbo_list_vendors", args, ({ startPosition, maxResults }) =>
+        client.listVendors(startPosition ?? 1, maxResults ?? 100),
+      ),
   );
 
   server.tool(
@@ -31,17 +23,13 @@ export function registerQboVendorTools(server: McpServer, client: QboClient) {
     {
       name: z.string().describe("Vendor name to search for (supports % wildcards)"),
     },
-    async ({ name }) => {
-      try {
+    (args) =>
+      runTool("qbo_search_vendors", args, ({ name }) => {
         const searchName = name.includes("%") ? name : `%${name}%`;
-        const result = await client.query(
+        return client.query(
           `SELECT * FROM Vendor WHERE DisplayName LIKE '${searchName}' MAXRESULTS 50`,
         );
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+      }),
   );
 
   server.tool(
@@ -53,17 +41,13 @@ export function registerQboVendorTools(server: McpServer, client: QboClient) {
       email: z.string().optional().describe("Email address"),
       phone: z.string().optional().describe("Phone number"),
     },
-    async ({ displayName, companyName, email, phone }) => {
-      try {
+    (args) =>
+      runTool("qbo_create_vendor", args, ({ displayName, companyName, email, phone }) => {
         const extra: Record<string, unknown> = {};
         if (companyName) extra.CompanyName = companyName;
         if (email) extra.PrimaryEmailAddr = { Address: email };
         if (phone) extra.PrimaryPhone = { FreeFormNumber: phone };
-        const result = await client.createVendor(displayName, extra);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return err(e);
-      }
-    },
+        return client.createVendor(displayName, extra);
+      }),
   );
 }

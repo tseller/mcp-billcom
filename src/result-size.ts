@@ -12,6 +12,12 @@
  * so the fix lives here and is shared: every result is compact, every list
  * result is paged against a byte budget, and anything that still can't fit is
  * a named error rather than an oversized payload.
+ *
+ * It is also the DEFAULT, not an opt-in: every tool response goes through
+ * `runTool` (src/tool-logging.ts), which serializes with `compact()` and
+ * refuses anything over `MAX_RESULT_CHARS`. A new tool inherits the budget
+ * without knowing this file exists; paging with `packRows` is what turns that
+ * refusal into a usable answer.
  */
 
 /**
@@ -24,12 +30,19 @@ export const MAX_RESULT_CHARS = 40_000;
 /** Serialize without pretty-printing. Indentation alone is ~25% of a report payload. */
 export const compact = (v: unknown): string => JSON.stringify(v);
 
-/** The message every over-budget result fails with — states the size and the way out. */
-export function tooBig(what: string, range: string, chars: number): string {
+/**
+ * The message every over-budget result fails with — states the size and the
+ * way out. Raised from the single response path (`runTool`), so a tool that
+ * never thought about size still fails loudly here instead of handing the
+ * client a payload it will reject.
+ */
+export function overBudget(what: string, chars: number): string {
   return (
-    `${what} for ${range} is ${chars.toLocaleString()} characters, over the ` +
+    `${what} produced a ${chars.toLocaleString()}-character result, over the ` +
     `${MAX_RESULT_CHARS.toLocaleString()}-character tool-result budget. ` +
-    `Narrow the date range, or use the paged row format (omit \`format: "raw"\`).`
+    `Narrow the request — a shorter date range, a smaller maxResults, ` +
+    `the paged row format (omit \`format: "raw"\`), or the next page ` +
+    `(\`offset\` / \`startPosition\`).`
   );
 }
 

@@ -70,6 +70,21 @@ interface IntuitTokenResponse {
   expires_in: number;
 }
 
+/**
+ * The WHERE clause of a list query and of its COUNT(*) have to be the same
+ * filter, or `rowCount` describes a different set than the rows do. They are
+ * named once here and shared by the query method and the tool that counts.
+ */
+export const ACTIVE_ACCOUNTS = "Active = true";
+export const ACTIVE_VENDORS = "Active = true";
+
+/** QBO's query language escapes a literal apostrophe by doubling it — a vendor called "Bob's" is a valid search, not a syntax error. */
+export const qboLiteral = (value: string) => value.replace(/'/g, "''");
+
+/** The vendor-name filter shared by the search query and its COUNT(*). */
+export const vendorNameWhere = (pattern: string) =>
+  `DisplayName LIKE '${qboLiteral(pattern)}'`;
+
 const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 const PRODUCTION_BASE = "https://quickbooks.api.intuit.com/v3/company";
 
@@ -367,13 +382,22 @@ export class QboClient {
 
   // --- Convenience methods ---
 
-  async listAccounts() {
-    return this.query("SELECT * FROM Account WHERE Active = true MAXRESULTS 1000");
+  async listAccounts(startPosition = 1, maxResults = 1000) {
+    return this.query(
+      `SELECT * FROM Account WHERE ${ACTIVE_ACCOUNTS} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
+    );
   }
 
   async listVendors(startPosition = 1, maxResults = 100) {
     return this.query(
-      `SELECT * FROM Vendor WHERE Active = true STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
+      `SELECT * FROM Vendor WHERE ${ACTIVE_VENDORS} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
+    );
+  }
+
+  /** Vendors whose display name matches a LIKE pattern, paged like the other lists. */
+  async searchVendors(pattern: string, startPosition = 1, maxResults = 100) {
+    return this.query(
+      `SELECT * FROM Vendor WHERE ${vendorNameWhere(pattern)} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
     );
   }
 

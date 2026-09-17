@@ -6,11 +6,14 @@ import { dirname, join } from "node:path";
 import {
   buildEntityList,
   queryRows,
+  slimAccount,
   slimDeposit,
   slimPurchase,
   slimTransfer,
+  slimVendor,
 } from "./qbo-rows.js";
 import { MAX_RESULT_CHARS, compact } from "./result-size.js";
+import { vendorNameWhere } from "./qbo-client.js";
 import { runTool, ToolFailure } from "./tool-logging.js";
 
 /**
@@ -296,6 +299,199 @@ test("an empty QueryResponse lists nothing instead of throwing", () => {
   assert.equal(result.returned, 0);
   assert.equal(result.hasMore, false);
   assert.deepEqual(result.purchases, []);
+});
+
+// --- the chart of accounts and the vendor list --------------------------------
+
+/**
+ * An Account as live QBO returns it. The chart of accounts is the everyday
+ * treasurer call (it's how you find the account id every other tool wants) and
+ * the tool took NO arguments — so when 53,799 characters of these came back
+ * over the 40,000-character budget, the error's advice to "narrow the request"
+ * was impossible to follow.
+ */
+function liveAccount(i: number) {
+  return {
+    Name: `${4000 + i} Program Expenses ${i}`,
+    SubAccount: i % 3 === 0,
+    ParentRef: i % 3 === 0 ? { value: "88", name: "Program Expenses" } : undefined,
+    FullyQualifiedName: `Program Expenses:${4000 + i} Program Expenses ${i}`,
+    Active: true,
+    Classification: "Expense",
+    AccountType: "Expense",
+    AccountSubType: "OtherMiscellaneousServiceCost",
+    AcctNum: String(4000 + i),
+    CurrentBalance: 0,
+    CurrentBalanceWithSubAccounts: 0,
+    CurrencyRef: { value: "USD", name: "United States Dollar" },
+    domain: "QBO",
+    sparse: false,
+    Id: String(100 + i),
+    SyncToken: "0",
+    MetaData: {
+      CreateTime: "2026-05-08T15:11:43-07:00",
+      LastUpdatedTime: "2026-08-31T16:35:37-07:00",
+    },
+  };
+}
+
+/** A Vendor exactly as live QBO returns it (captured from production). */
+function liveVendor(i: number) {
+  return {
+    Balance: 0,
+    BillRate: 0,
+    Vendor1099: false,
+    CurrencyRef: { value: "USD", name: "United States Dollar" },
+    CostRate: 0,
+    domain: "QBO",
+    sparse: false,
+    Id: String(26 + i),
+    SyncToken: "0",
+    MetaData: {
+      CreateTime: "2026-05-08T15:11:43-07:00",
+      LastUpdatedTime: "2026-05-08T15:11:43-07:00",
+    },
+    GivenName: "Anthony",
+    MiddleName: "and",
+    FamilyName: `Marlene Yee ${i}`,
+    CompanyName: `Anthony and Marlene Yee ${i}`,
+    DisplayName: `Anthony and Marlene Yee ${i}`,
+    PrintOnCheckName: `Anthony and Marlene Yee ${i}`,
+    Active: true,
+    V4IDPseudonym: "0020663109cece5d124d4aa07e068b7dea1d7e",
+    PrimaryEmailAddr: { Address: `marlenegyee${i}@gmail.com` },
+  };
+}
+
+const accountRows = (n: number) => Array.from({ length: n }, (_, i) => slimAccount(liveAccount(i)));
+const vendorRows = (n: number) => Array.from({ length: n }, (_, i) => slimVendor(liveVendor(i)));
+
+test("an account row drops QBO's envelope and keeps what picks an account", () => {
+  const row = slimAccount({ ...liveAccount(0), CurrentBalance: 1234.5 });
+  const text = compact(row);
+
+  for (const envelope of [
+    "domain",
+    "sparse",
+    "SyncToken",
+    "MetaData",
+    "FullyQualifiedName",
+    "AccountSubType",
+    "CurrentBalanceWithSubAccounts",
+    "United States Dollar",
+  ]) {
+    assert.ok(!text.includes(envelope), `row still carries QBO envelope: ${envelope}`);
+  }
+
+  assert.deepEqual(row, {
+    id: "100",
+    name: "4000 Program Expenses 0",
+    num: "4000",
+    type: "Expense",
+    classification: "Expense",
+    balance: 1234.5,
+    parent: "Program Expenses",
+    parentId: "88",
+  });
+
+  // A top-level account carries no parent keys at all, and `active` shows up
+  // only when it is the interesting answer — the listing is active-only.
+  const top = slimAccount({ ...liveAccount(1), Active: false });
+  assert.ok(!("parent" in top) && !("parentId" in top));
+  assert.equal(top.active, false);
+  assert.ok(!("active" in slimAccount(liveAccount(1))));
+});
+
+test("the whole chart of accounts fits one result, where the raw entities did not", () => {
+  const raw = compact({ QueryResponse: { Account: Array.from({ length: 120 }, (_, i) => liveAccount(i)) } });
+  assert.ok(raw.length > MAX_RESULT_CHARS, `raw chart of accounts is only ${raw.length} chars`);
+
+  const result = buildEntityList({
+    entity: "Account",
+    key: "accounts",
+    rows: accountRows(120),
+    startPosition: 1,
+    maxResults: 1000,
+    rowCount: 120,
+    sumField: null,
+  });
+
+  assert.ok(compact(result).length < MAX_RESULT_CHARS, `paged result is ${compact(result).length} chars`);
+  assert.equal(result.returned, 120);
+  assert.equal(result.hasMore, false, "the whole chart comes back in one call");
+  // Assets + liabilities + income added together would be a number that means
+  // nothing, so a chart of accounts states no page total at all.
+  assert.ok(!("pageTotal" in result), "a chart of accounts must not claim a page total");
+});
+
+test("a vendor row keeps who they are, not how QBO spells their name four times", () => {
+  const row = slimVendor({
+    ...liveVendor(0),
+    Balance: 250,
+    PrimaryPhone: { FreeFormNumber: "(555) 123-4567" },
+  });
+  const text = compact(row);
+
+  for (const envelope of [
+    "BillRate",
+    "CostRate",
+    "Vendor1099",
+    "V4IDPseudonym",
+    "PrintOnCheckName",
+    "GivenName",
+    "FamilyName",
+    "SyncToken",
+    "MetaData",
+    "United States Dollar",
+  ]) {
+    assert.ok(!text.includes(envelope), `row still carries QBO envelope: ${envelope}`);
+  }
+
+  assert.deepEqual(row, {
+    id: "26",
+    name: "Anthony and Marlene Yee 0",
+    // CompanyName repeated the display name verbatim, so it is dropped.
+    email: "marlenegyee0@gmail.com",
+    phone: "(555) 123-4567",
+    balance: 250,
+  });
+
+  const withCompany = slimVendor({ ...liveVendor(0), CompanyName: "Yee Family Trust" });
+  assert.equal(withCompany.company, "Yee Family Trust");
+});
+
+test("maxResults: 1000 — the schema's own maximum — returns vendors instead of an error", () => {
+  const raw = compact({ QueryResponse: { Vendor: Array.from({ length: 1000 }, (_, i) => liveVendor(i)) } });
+  assert.ok(raw.length > MAX_RESULT_CHARS, `raw vendor page is only ${raw.length} chars`);
+
+  const all = vendorRows(1000);
+  const seen: string[] = [];
+  let startPosition = 1;
+
+  for (let guard = 0; guard < 50; guard++) {
+    const result = buildEntityList({
+      entity: "Vendor",
+      key: "vendors",
+      rows: all.slice(startPosition - 1),
+      startPosition,
+      maxResults: 1000,
+      rowCount: all.length,
+      sumField: null,
+    });
+    assert.ok(compact(result).length <= MAX_RESULT_CHARS, "every page fits the budget");
+    assert.ok((result.returned as number) > 0, "a page that fits must carry rows");
+    assert.ok(!("pageTotal" in result), "a slice of what we owe is not a total");
+    seen.push(...(result.vendors as Array<Record<string, unknown>>).map((r) => String(r.id)));
+    if (!result.hasMore) break;
+    assert.equal(result.truncatedBy, "size");
+    startPosition = result.nextStartPosition as number;
+  }
+
+  assert.deepEqual(seen, all.map((r) => String(r.id)), "paging walks all 1000 vendors exactly once");
+});
+
+test("a vendor whose name has an apostrophe is a search, not a query syntax error", () => {
+  assert.equal(vendorNameWhere("%Bob's Signs%"), "DisplayName LIKE '%Bob''s Signs%'");
 });
 
 // --- the shared response path -------------------------------------------------

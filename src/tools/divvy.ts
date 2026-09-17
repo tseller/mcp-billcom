@@ -4,7 +4,18 @@ import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
 import { buildCursorList, slimTransaction } from '../divvy-rows.js';
+import { FilterCheck } from '../divvy-filters.js';
 import { CURSOR_PAGING, CURSOR_PAGING_NARROWING, cursorNarrowing } from './list-paging.js';
+
+/** BILL's own maximum for `max` on /v3/spend/transactions. */
+const BILL_MAX_PAGE_SIZE = 50;
+
+/**
+ * How many BILL pages one tool call may consume while refilling a page that
+ * client-side filtering emptied. A bound, not a target: the loop only walks
+ * when rows were actually dropped, so the healthy path is one call.
+ */
+const MAX_BILL_PAGES_PER_CALL = 10;
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.tool(
@@ -17,20 +28,34 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
   server.tool(
     'divvy_list_transactions',
     'List Divvy (BILL Spend & Expense) transactions. ' +
-      'Returns one flattened row per transaction — date, cardholder, merchant, amount, status, receipt and sync status, both ids, and the filled custom-field values (NAP CODES, Notes) — plus `pageTotal` for the page. ' +
+      'Returns one flattened row per transaction — date, cardholder, merchant, amount, status, receipt and accounting-sync status, both ids, and the filled custom-field values (NAP CODES, Notes) — plus `pageTotal` for the page. ' +
       'Paged: when `hasMore` is true, call again with `page: nextPage`. ' +
+      'Every filter is checked against the rows that come back, and `filtering` states per filter how it was enforced — so a filter the backend does not honor drops the rows here and says so, rather than quietly returning the wrong ones. ' +
+      'A filter applied here (rather than by BILL) can make one result span several BILL pages, so `returned` may exceed `pageSize`; `billPages` says how many were consumed. ' +
       'Use status:"DECLINED" to surface card declines. ' +
       '`format: "raw"` returns BILL\'s full objects (~2KB of scaffolding each, and rejected outright if the page exceeds the size budget); for one transaction in full, use divvy_get_transaction.',
     {
-      startDate: z.string().optional().describe('Start date filter (YYYY-MM-DD)'),
-      endDate: z.string().optional().describe('End date filter (YYYY-MM-DD)'),
-      budgetId: z.string().optional().describe('Filter by budget ID'),
-      syncStatus: z.string().optional().describe('Filter by sync status: PENDING, SYNCED, ERROR, MANUAL_SYNCED, NOT_SYNCED'),
+      startDate: z
+        .string()
+        .optional()
+        .describe('Only transactions occurring on or after this date (YYYY-MM-DD).'),
+      endDate: z
+        .string()
+        .optional()
+        .describe('Only transactions occurring on or before this date (YYYY-MM-DD), inclusive.'),
+      budgetId: z
+        .string()
+        .optional()
+        .describe('Filter by budget — either the `budgetId` or the `bgt_…` uuid from a row.'),
+      syncStatus: z
+        .string()
+        .optional()
+        .describe('Filter by accounting sync status: PENDING, SYNCED, ERROR, MANUAL_SYNCED, NOT_SYNCED'),
       status: z
         .string()
         .optional()
         .describe(
-          'Filter by transaction status, e.g. CLEARED or DECLINED. Applied per page after fetch, so a page can return fewer rows than pageSize while nextPage is still set.',
+          'Filter by transaction status, e.g. CLEARED or DECLINED. BILL has no server-side filter for this one, so it is applied here after fetch.',
         ),
       ...CURSOR_PAGING,
     },
@@ -38,34 +63,50 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       runTool(
         'divvy_list_transactions',
         args,
-        async ({ status, format, ...query }) => {
-          const raw = (await client.listTransactions(query)) as {
-            results?: Array<Record<string, unknown>>;
-            nextPage?: string;
-          };
-          let results = Array.isArray(raw.results) ? raw.results : [];
-          if (status) {
-            results = results.filter(
-              (tx) => String(tx.status ?? '').toUpperCase() === status.toUpperCase(),
-            );
-          }
+        async ({ format, page, pageSize, ...filters }) => {
+          const check = new FilterCheck(filters);
+          const target = Number(pageSize) > 0 ? Number(pageSize) : BILL_MAX_PAGE_SIZE;
+
+          let cursor = page;
+          let billPages = 0;
+          let kept: Array<Record<string, unknown>> = [];
+          let raw: { results?: Array<Record<string, unknown>>; nextPage?: string } = {};
+
+          // One BILL call in the ordinary case. The walk exists for the case
+          // this tool could not previously see: if BILL stops honoring a
+          // filter, rows are dropped here, and a page that is mostly holes is
+          // refilled from the next BILL page instead of coming back near-empty.
+          do {
+            raw = (await client.listTransactions({
+              filters: check.billParam,
+              page: cursor,
+              pageSize,
+            })) as typeof raw;
+            billPages += 1;
+            kept = kept.concat(check.keep(Array.isArray(raw.results) ? raw.results : []));
+            cursor = raw.nextPage;
+          } while (
+            cursor &&
+            check.dropped > 0 &&
+            kept.length < target &&
+            billPages < MAX_BILL_PAGES_PER_CALL
+          );
+
           // `raw` is BILL's full objects — the size budget in runTool is what
           // keeps it honest, so there is nothing to guard here.
           if (format === 'raw') {
-            return status ? { ...raw, results, statusFilter: status } : raw;
+            return check.any
+              ? { ...raw, results: kept, nextPage: cursor, filtering: check.report() }
+              : raw;
           }
           return buildCursorList({
             entity: 'Transaction',
             key: 'transactions',
-            rows: results.map(slimTransaction),
-            nextPage: raw.nextPage,
-            filters: {
-              startDate: query.startDate,
-              endDate: query.endDate,
-              budgetId: query.budgetId,
-              syncStatus: query.syncStatus,
-              statusFilter: status,
-            },
+            rows: kept.map(slimTransaction),
+            nextPage: cursor,
+            filters,
+            filtering: check.any ? check.report() : undefined,
+            billPages,
           });
         },
         { narrowing: CURSOR_PAGING_NARROWING },

@@ -1,3 +1,5 @@
+import { FilterCheck } from './divvy-filters.js';
+
 const DIVVY_BASE_URL = 'https://gateway.prod.bill.com/connect';
 
 // BILL S&E web UI company segment. Stable per company; encoded base64 of
@@ -67,19 +69,27 @@ export class DivvyClient {
     return this.get('/v3/spend/budgets');
   }
 
+  /**
+   * One page of /v3/spend/transactions.
+   *
+   * `filters` is BILL's own filter grammar — comma-joined `field:operator:value`
+   * terms, built by `billFilterParam` (src/divvy-filters.ts). It is passed
+   * through rather than assembled here so that what is asked of BILL and what
+   * is checked of the answer are declared side by side.
+   *
+   * This used to send `start_date` / `end_date` / `budget_id` / `sync_status`,
+   * which BILL does not read: it answered 200 with an unfiltered page and the
+   * caller got the newest transactions whatever range they asked for
+   * (issue #29). BILL validates `filters` — an unknown field or operator is a
+   * 400 — so a wrong name there is loud instead of silent.
+   */
   async listTransactions(params?: {
-    startDate?: string;
-    endDate?: string;
-    budgetId?: string;
-    syncStatus?: string;
+    filters?: string;
     page?: string;
     pageSize?: string;
   }): Promise<unknown> {
     return this.get('/v3/spend/transactions', {
-      start_date: params?.startDate,
-      end_date: params?.endDate,
-      budget_id: params?.budgetId,
-      sync_status: params?.syncStatus,
+      filters: params?.filters,
       nextPage: params?.page,
       max: params?.pageSize,
     });
@@ -174,8 +184,9 @@ export class DivvyClient {
    * `reviewerUuid`: when set, restrict to transactions where that user is
    *   listed in `reviewers[]` with `status === "WAITING"`. Useful for "what
    *   am I supposed to approve" queries.
-   * `since`: optional YYYY-MM-DD lower bound on `occurredTime` (passed through
-   *   as `start_date`).
+   * `since`: optional YYYY-MM-DD lower bound on `occurredTime`. It travelled
+   *   the same dead `start_date` parameter as the transaction list (issue #29)
+   *   and so bounded nothing; it now goes through the same filter declaration.
    */
   async listPendingAction(params?: {
     reviewerUuid?: string;
@@ -188,13 +199,16 @@ export class DivvyClient {
     const pendingReview: PendingActionRow[] = [];
     let cursor: string | undefined;
     let safety = 50;
+    const check = new FilterCheck({ startDate: params?.since });
     do {
       const resp = (await this.get('/v3/spend/transactions', {
-        start_date: params?.since,
+        filters: check.billParam,
         nextPage: cursor,
         max: '50',
       })) as { results?: RawTransaction[]; nextPage?: string };
-      const results = Array.isArray(resp.results) ? resp.results : [];
+      const results = check.keep(
+        (Array.isArray(resp.results) ? resp.results : []) as unknown as Record<string, unknown>[],
+      ) as unknown as RawTransaction[];
       for (const tx of results) {
         if (TERMINAL_STATUSES.has(tx.status ?? '')) continue;
         const row = shapePendingRow(tx);

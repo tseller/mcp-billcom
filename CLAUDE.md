@@ -93,6 +93,11 @@ What this means in practice:
   the `GivenName`/`MiddleName`/`FamilyName` re-spellings). `active` is emitted
   only when a row is INACTIVE — these listings are active-only, so `true` on
   every row is a repeated constant. Neither states a `pageTotal`.
+  Live books, measured on revision `billcom-mcp-00062-k55`: the whole chart of
+  accounts (`qbo_list_accounts {}`, 108 rows) is 12,720 chars, down from a
+  53,799-char refusal on a tool that took no arguments to narrow; every vendor
+  at the schema's own maximum (`{"maxResults":1000}`, 76 rows) is 4,042 chars,
+  down from a 40,590-char refusal.
 - `qbo_list_purchases` / `qbo_list_deposits` / `qbo_list_transfers` return
   flattened rows (`src/qbo-rows.ts`) and page on ONE coordinate: when `hasMore`
   is true, call again with `startPosition: nextStartPosition`. `rowCount` is a

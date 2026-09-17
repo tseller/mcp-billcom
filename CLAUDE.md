@@ -271,9 +271,10 @@ transactions — and reads each discovered id back with `GET /v3/spend/budgets/{
 which is BILL confirming the budget exists rather than us asserting it. The
 result states per source what it contributed and each row carries `seenOn`, so
 a listing that is short because a source went blind says so. The sources run
-concurrently and the read-backs eight at a time: ~18 BILL calls, 8-12s.
+concurrently and the read-backs eight at a time: ~18 BILL calls, 5.9s from
+Cloud Run (8-12s from a laptop).
 
-Live books, measured on revision `billcom-mcp-00065-t7s`: 0 budgets before →
+Live books, measured on revision `billcom-mcp-00066-66r`: 0 budgets before →
 **14**, 2,983 chars, including all ten named on recent transactions
 ("AYSO Region 2B145", "Capital LiveScan Codes", "Fleet US", the tournament
 budgets) with both the base64 `id` and the `bgt_…` `uuid` that

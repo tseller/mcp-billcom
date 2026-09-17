@@ -11,6 +11,10 @@ import { registerQboVendorTools } from "./tools/qbo-vendors.js";
 import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
 import { registerQboReportTools } from "./tools/qbo-reports.js";
 import { registerQboReconcileTools } from "./tools/qbo-reconcile.js";
+import { registerQboClassTools } from "./tools/qbo-classes.js";
+import { registerQboClassReportTools } from "./tools/qbo-class-reports.js";
+import { registerQboClassWriteTools } from "./tools/qbo-class-writes.js";
+import { registerQboBudgetTools } from "./tools/qbo-budgets.js";
 import { createOAuthRouter, createRequireAuth } from "./oauth.js";
 import { FirestoreOAuthStore } from "./oauth-store.js";
 import { createQboAuthRouter } from "./qbo-auth-callback.js";
@@ -129,6 +133,10 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       registerQboTransactionTools(server, qboClient, { idempotency, gmail });
       registerQboReportTools(server, qboClient);
       registerQboReconcileTools(server, qboClient);
+      registerQboClassTools(server, qboClient, { idempotency });
+      registerQboClassReportTools(server, qboClient);
+      registerQboClassWriteTools(server, qboClient);
+      registerQboBudgetTools(server, qboClient);
     }
 
     const divvyToken = process.env.DIVVY_API_TOKEN;

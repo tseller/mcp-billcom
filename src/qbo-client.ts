@@ -411,6 +411,136 @@ export class QboClient {
     return this.request("POST", "/journalentry", journalEntry);
   }
 
+  async getJournalEntry(id: string) {
+    return this.request("GET", `/journalentry/${id}`);
+  }
+
+  async updateJournalEntry(journalEntry: Record<string, unknown>) {
+    return this.request("POST", "/journalentry", journalEntry);
+  }
+
+  // --- Classes ---
+
+  /**
+   * List Classes (the season tags: Fall / Spring / General).
+   *
+   * Class names are never hardcoded anywhere in this server — seasons become
+   * year-specific ("Fall 2026") and that must cost nothing.
+   */
+  async listClasses(includeInactive = false, maxResults = 1000) {
+    const where = includeInactive ? "" : "WHERE Active = true ";
+    return this.query(`SELECT * FROM Class ${where}MAXRESULTS ${maxResults}`);
+  }
+
+  /** Look up a class by exact name (case-insensitive) — used to avoid creating duplicates. */
+  async findClassByName(name: string): Promise<QboClass | undefined> {
+    const all = (await this.listClasses(true)) as {
+      QueryResponse?: { Class?: QboClass[] };
+    };
+    const target = name.trim().toLowerCase();
+    return (all.QueryResponse?.Class ?? []).find(
+      (c) =>
+        (c.Name ?? "").trim().toLowerCase() === target ||
+        (c.FullyQualifiedName ?? "").trim().toLowerCase() === target,
+    );
+  }
+
+  async createClass(name: string, parentClassId?: string) {
+    const body: Record<string, unknown> = { Name: name };
+    if (parentClassId) {
+      body.SubClass = true;
+      body.ParentRef = { value: parentClassId };
+    }
+    return this.request("POST", "/class", body);
+  }
+
+  // --- Budgets ---
+
+  /**
+   * List Budgets. The Budget entity is READ-ONLY in the QBO Accounting API —
+   * there is no create/update/delete, so budgets must be built in the QBO web
+   * UI and can only be read back from here.
+   */
+  async listBudgets(includeInactive = false, maxResults = 100) {
+    const where = includeInactive ? "" : "WHERE Active = true ";
+    return this.query(`SELECT * FROM Budget ${where}MAXRESULTS ${maxResults}`);
+  }
+
+  async getBudget(id: string) {
+    return this.query(`SELECT * FROM Budget WHERE Id = '${id}'`);
+  }
+
+  // --- Company preferences ---
+
+  /** Read company Preferences (we care about AccountingInfoPrefs → class tracking mode). */
+  async getPreferences(): Promise<QboPreferences> {
+    return this.request<QboPreferences>("GET", "/preferences");
+  }
+
+  /**
+   * How this company tracks classes. Verified live on the AYSO books:
+   * ClassTrackingPerTxnLine = true, ClassTrackingPerTxn = false — i.e. ClassRef
+   * belongs on each LINE DETAIL, never on the transaction header.
+   *
+   * The class write tools check this before writing rather than assuming, so a
+   * preference flip fails loudly instead of silently writing to the wrong place.
+   */
+  async getClassTrackingMode(): Promise<"perLine" | "perTxn" | "off"> {
+    const prefs = await this.getPreferences();
+    const a = prefs.Preferences?.AccountingInfoPrefs;
+    if (a?.ClassTrackingPerTxnLine) return "perLine";
+    if (a?.ClassTrackingPerTxn) return "perTxn";
+    return "off";
+  }
+
+  // --- Class-aware reports ---
+
+  /**
+   * Fetch a report from the ProfitAndLoss / GeneralLedger family with an
+   * optional class filter, and VERIFY the filter was applied.
+   *
+   * Why the verification: QBO silently ignores report params it doesn't
+   * support — the `account` param on TransactionList is the known example, and
+   * `classid` is another (verified live: it changes nothing). The param that
+   * actually works is `class`, and QBO proves it did by echoing the value back
+   * as `Header.Class`. We assert that echo rather than trusting the filter, so
+   * a silently-dropped filter can never masquerade as a real answer.
+   */
+  async classReport(
+    reportName: string,
+    params: {
+      startDate: string;
+      endDate: string;
+      classIds?: string[];
+      accountingMethod?: AccountingMethod;
+      columns?: string[];
+      summarizeColumnBy?: string;
+    },
+  ): Promise<unknown> {
+    const q: Record<string, string> = {
+      start_date: params.startDate,
+      end_date: params.endDate,
+    };
+    if (params.accountingMethod) q.accounting_method = params.accountingMethod;
+    if (params.columns?.length) q.columns = params.columns.join(",");
+    if (params.summarizeColumnBy) q.summarize_column_by = params.summarizeColumnBy;
+    if (params.classIds?.length) q.class = params.classIds.join(",");
+
+    const report = await this.report(reportName, q);
+
+    if (params.classIds?.length) {
+      const echoed = (report as QboReport).Header?.Class;
+      if (!echoed) {
+        throw new QboError(
+          `QBO ignored the class filter on the ${reportName} report (no Header.Class echo) — ` +
+            `refusing to return an unfiltered report as if it were filtered.`,
+          200,
+          report,
+        );
+      }
+    }
+    return report;
+  }
   async queryAttachables(entityType: string, entityId: string) {
     return this.query(
       `SELECT * FROM attachable WHERE AttachableRef.EntityRef.Type = '${entityType}' AND AttachableRef.EntityRef.value = '${entityId}'`,
@@ -482,6 +612,52 @@ export class QboClient {
   }
 }
 
+/** QBO report accounting basis. The AYSO company's own default is Cash. */
+export type AccountingMethod = "Cash" | "Accrual";
+
+export interface QboClass {
+  Id?: string;
+  Name?: string;
+  FullyQualifiedName?: string;
+  Active?: boolean;
+  SubClass?: boolean;
+  ParentRef?: { value?: string; name?: string };
+}
+
+export interface QboPreferences {
+  Preferences?: {
+    AccountingInfoPrefs?: {
+      ClassTrackingPerTxn?: boolean;
+      ClassTrackingPerTxnLine?: boolean;
+      TrackDepartments?: boolean;
+      UseAccountNumbers?: boolean;
+      FirstMonthOfFiscalYear?: string;
+    };
+    ReportPrefs?: { ReportBasis?: string };
+  };
+}
+
+/**
+ * The report columns that carry a class.
+ *
+ * `klass_name` is the ONLY token QBO accepts for a class column, and it works
+ * on ProfitAndLossDetail and GeneralLedger only. TransactionList SILENTLY
+ * DROPS it (verified live against a deliberately-bogus column name as a
+ * control: identical behaviour), which is why the class-aware transaction
+ * listing is built on GeneralLedger — the one report that returns both the
+ * posting Account and the Class.
+ */
+export const CLASS_LEDGER_COLUMNS = [
+  "tx_date",
+  "txn_type",
+  "doc_num",
+  "name",
+  "memo",
+  "account_name",
+  "klass_name",
+  "subt_nat_amount",
+];
+
 /** Strip a leading chart-of-accounts number ("1100 Chase Checking" → "Chase Checking"). */
 export const stripAcctNum = (s: string) => s.replace(/^\s*\d[\d.\-]*\s+/, "").trim();
 const normName = (s: string) => s.trim().toLowerCase();
@@ -549,8 +725,23 @@ interface QboReportRow {
   type?: string;
   group?: string;
 }
+interface QboReportColumn {
+  ColTitle?: string;
+  ColType?: string;
+  MetaData?: Array<{ Name?: string; Value?: string }>;
+}
 interface QboReport {
-  Columns?: { Column?: Array<{ ColTitle?: string; ColType?: string }> };
+  Header?: {
+    ReportName?: string;
+    ReportBasis?: string;
+    StartPeriod?: string;
+    EndPeriod?: string;
+    SummarizeColumnsBy?: string;
+    /** QBO echoes an APPLIED `class` filter back here — absence means it was ignored. */
+    Class?: string;
+    Option?: Array<{ Name?: string; Value?: string }>;
+  };
+  Columns?: { Column?: QboReportColumn[] };
   Rows?: { Row?: QboReportRow[] };
 }
 
@@ -619,4 +810,179 @@ export function parseTransactionList(report: unknown): {
 
   const total = txns.reduce((s, t) => s + t.amount, 0);
   return { transactions: txns, total: Math.round(total * 100) / 100 };
+}
+
+// --- Class-aware report parsing ---
+
+/** Build a title→index lookup over a report's Columns, tolerant of QBO's retitling. */
+function columnTitles(report: QboReport): string[] {
+  return (report.Columns?.Column ?? []).map((c) => c.ColTitle ?? "");
+}
+
+export interface ClassLedgerTxn {
+  date: string;
+  type: string;
+  docNumber: string;
+  name: string;
+  memo: string;
+  /** Posting account, from the report's Account column. */
+  account: string;
+  /** Class name, or "" when the line is untagged. */
+  className: string;
+  amount: number;
+  raw: Record<string, string>;
+}
+
+/**
+ * Flatten a GeneralLedger report (requested with CLASS_LEDGER_COLUMNS) into
+ * typed transaction rows carrying their class.
+ *
+ * GeneralLedger nests rows inside per-account sections and interleaves
+ * "Beginning Balance" / account-total / grand-total rows that DO carry an
+ * Amount cell — so, unlike TransactionList, an Amount alone is not enough to
+ * identify a transaction row. A real transaction row has both a Date and a
+ * Transaction Type; the running-balance and summary rows have neither.
+ */
+export function parseClassLedger(report: unknown): {
+  transactions: ClassLedgerTxn[];
+  total: number;
+  basis: string;
+  classFilterEcho?: string;
+} {
+  const r = report as QboReport;
+  const cols = columnTitles(r);
+  const idx = (title: string) => cols.findIndex((c) => c.toLowerCase() === title.toLowerCase());
+
+  const dateIdx = idx("Date");
+  const typeIdx = idx("Transaction Type");
+  const numIdx = idx("Num");
+  const nameIdx = idx("Name");
+  const memoIdx = idx("Memo/Description");
+  const classIdx = idx("Class");
+  let accountIdx = idx("Account");
+  if (accountIdx < 0) accountIdx = cols.findIndex((c) => /account/i.test(c) && !/split/i.test(c));
+  let amountIdx = idx("Amount");
+  if (amountIdx < 0) {
+    const defs = r.Columns?.Column ?? [];
+    amountIdx = defs.findIndex((c) => /amount|money/i.test(c.ColType ?? ""));
+  }
+
+  const txns: ClassLedgerTxn[] = [];
+  const cell = (cd: QboReportColData[], i: number) => (i >= 0 ? cd[i]?.value ?? "" : "");
+
+  const walk = (rows: QboReportRow[] | undefined) => {
+    for (const row of rows ?? []) {
+      if (row.Rows?.Row) walk(row.Rows.Row);
+      const cd = row.ColData;
+      if (!cd || amountIdx < 0) continue;
+      const date = cell(cd, dateIdx);
+      const type = cell(cd, typeIdx);
+      // Summary / beginning-balance rows carry an amount but no date+type pair.
+      if (!date || !type) continue;
+      const amount = Number((cd[amountIdx]?.value ?? "").replace(/,/g, ""));
+      if (Number.isNaN(amount)) continue;
+      const raw: Record<string, string> = {};
+      cols.forEach((c, i) => {
+        if (c) raw[c] = cd[i]?.value ?? "";
+      });
+      txns.push({
+        date,
+        type,
+        docNumber: cell(cd, numIdx),
+        name: cell(cd, nameIdx),
+        memo: cell(cd, memoIdx),
+        account: cell(cd, accountIdx),
+        className: cell(cd, classIdx),
+        amount,
+        raw,
+      });
+    }
+  };
+  walk(r.Rows?.Row);
+
+  const total = txns.reduce((s, t) => s + t.amount, 0);
+  return {
+    transactions: txns,
+    total: Math.round(total * 100) / 100,
+    basis: r.Header?.ReportBasis ?? "",
+    classFilterEcho: r.Header?.Class,
+  };
+}
+
+export interface ClassColumn {
+  index: number;
+  title: string;
+  /** QBO's own column key: an id for a real class, "not_specified", or "total". */
+  colKey: string;
+  classId?: string;
+  isUntagged: boolean;
+  isTotal: boolean;
+}
+
+export interface ClassPlRow {
+  account: string;
+  accountId?: string;
+  /** Amount per class column, keyed by that column's title. */
+  byClass: Record<string, number>;
+}
+
+/**
+ * Parse a ProfitAndLoss report requested with summarize_column_by=Classes.
+ *
+ * Column identity comes from QBO's own `MetaData.ColKey`: a numeric key is the
+ * Class id, "not_specified" is the untagged bucket (the number that answers
+ * "how much is still untagged?"), and "total" is the row total. Titles are only
+ * a fallback — class names change ("Fall 2026") and must never be matched on
+ * by hardcoded string.
+ */
+export function parseProfitAndLossByClass(report: unknown): {
+  basis: string;
+  summarizedBy: string;
+  columns: ClassColumn[];
+  rows: ClassPlRow[];
+} {
+  const r = report as QboReport;
+  const defs = r.Columns?.Column ?? [];
+
+  const columns: ClassColumn[] = [];
+  defs.forEach((c, i) => {
+    if ((c.ColType ?? "") === "Account") return; // the row-label column
+    const colKey = c.MetaData?.find((m) => m.Name === "ColKey")?.Value ?? "";
+    columns.push({
+      index: i,
+      title: c.ColTitle ?? "",
+      colKey,
+      classId: /^\d+$/.test(colKey) ? colKey : undefined,
+      isUntagged: colKey === "not_specified",
+      isTotal: colKey === "total",
+    });
+  });
+
+  const rows: ClassPlRow[] = [];
+  const walk = (rs: QboReportRow[] | undefined) => {
+    for (const row of rs ?? []) {
+      const cd = row.ColData;
+      if (cd && cd.length > 1) {
+        const label = cd[0]?.value ?? "";
+        if (label) {
+          const byClass: Record<string, number> = {};
+          for (const col of columns) {
+            const raw = (cd[col.index]?.value ?? "").replace(/,/g, "");
+            const n = Number(raw);
+            byClass[col.title] = raw === "" || Number.isNaN(n) ? 0 : n;
+          }
+          rows.push({ account: label, accountId: cd[0]?.id, byClass });
+        }
+      }
+      if (row.Rows?.Row) walk(row.Rows.Row);
+    }
+  };
+  walk(r.Rows?.Row);
+
+  return {
+    basis: r.Header?.ReportBasis ?? "",
+    summarizedBy: r.Header?.SummarizeColumnsBy ?? "",
+    columns,
+    rows,
+  };
 }

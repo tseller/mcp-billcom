@@ -77,6 +77,10 @@ export const OFFSET_PAGING_NARROWING =
  * its own name instead of masquerading as `startPosition`.
  *
  * `pageSize` stays a string because BILL's `max` query parameter is one.
+ *
+ * Which query parameters these two become, and how the response is checked for
+ * evidence that BILL read them, is declared in `src/divvy-paging.ts` — the
+ * schema here says what a caller may turn, that file says what it turns.
  */
 export const CURSOR_PAGING = {
   page: z
@@ -92,14 +96,8 @@ export const CURSOR_PAGING = {
     ),
 } as const;
 
-/**
- * Over-budget advice for the cursor tools — the knobs BILL actually has.
- * `format` is a parameter of the transaction list and not of every cursor
- * tool, so it is named only where it exists.
- */
-export const cursorNarrowing = ({ format = true }: { format?: boolean } = {}) =>
+/** Over-budget advice for the cursor tools — the knobs BILL actually has. */
+export const CURSOR_PAGING_NARROWING =
   "Narrow the request — a shorter date range, a smaller `pageSize`, " +
-  (format ? 'the paged row format (omit `format: "raw"`), ' : "") +
+  'the paged row format (omit `format: "raw"`), ' +
   "or the next page (`page: nextPage`).";
-
-export const CURSOR_PAGING_NARROWING = cursorNarrowing();

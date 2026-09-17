@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCursorList, slimTransaction } from "./divvy-rows.js";
 import { FILTER_SPECS, FilterCheck, billFilterParam } from "./divvy-filters.js";
+import { openCursor } from "./divvy-paging.js";
 import type { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
 import { MAX_RESULT_CHARS, compact, overBudget } from "./result-size.js";
@@ -11,7 +12,6 @@ import {
   CURSOR_PAGING_NARROWING,
   LIST_PAGING,
   LIST_PAGING_NARROWING,
-  cursorNarrowing,
 } from "./tools/list-paging.js";
 
 /**
@@ -228,7 +228,6 @@ test("every narrowing sentence names only parameters of its own paging shape", (
     // sentence, schema shape, response fields it may also name
     [LIST_PAGING_NARROWING, LIST_PAGING, ["nextStartPosition"]],
     [CURSOR_PAGING_NARROWING, CURSOR_PAGING, ["nextPage"]],
-    [cursorNarrowing({ format: false }), { page: 1, pageSize: 1 }, ["nextPage"]],
   ];
   for (const [sentence, shape, responseFields] of cases) {
     const named = [...sentence.matchAll(/`([A-Za-z]+)(?::[^`]*)?`/g)].map((m) => m[1]);
@@ -460,7 +459,9 @@ test("when BILL ignores a filter the page is refilled from the cursor, and says 
     assert.ok(row.date >= "2026-05-01" && row.date <= "2026-06-30", `row outside range: ${row.date}`);
   }
   assert.match(String((result.filtering as Record<string, string>).endDate), /not being honored/);
-  assert.equal(result.nextPage, "cursor-3");
+  // BILL's own cursor, with the identity of the page it came after sealed onto
+  // it so the next call can tell whether it advanced (src/divvy-paging.ts).
+  assert.equal(openCursor(String(result.nextPage)).cursor, "cursor-3");
 });
 
 test("the walk is bounded — an always-ignored filter stops rather than paging forever", async () => {

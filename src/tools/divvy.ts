@@ -3,12 +3,20 @@ import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
-import { buildCursorList, slimTransaction } from '../divvy-rows.js';
+import { buildCursorList, slimCustomFieldValue, slimTransaction } from '../divvy-rows.js';
 import { FilterCheck } from '../divvy-filters.js';
-import { CURSOR_PAGING, CURSOR_PAGING_NARROWING, cursorNarrowing } from './list-paging.js';
+import { PagingCheck } from '../divvy-paging.js';
+import { CURSOR_PAGING, CURSOR_PAGING_NARROWING } from './list-paging.js';
 
 /** BILL's own maximum for `max` on /v3/spend/transactions. */
 const BILL_MAX_PAGE_SIZE = 50;
+
+/**
+ * BILL's own maximum for `max` on /v3/spend/custom-fields/{id}/values — it
+ * answers `400 max: must be less than or equal to 100` above this. Asked for by
+ * default so the everyday call (the 72 NAP codes) is one page rather than four.
+ */
+const BILL_MAX_VALUES_PAGE_SIZE = '100';
 
 /**
  * How many BILL pages one tool call may consume while refilling a page that
@@ -65,9 +73,9 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
         args,
         async ({ format, page, pageSize, ...filters }) => {
           const check = new FilterCheck(filters);
+          const paging = new PagingCheck({ page, pageSize });
           const target = Number(pageSize) > 0 ? Number(pageSize) : BILL_MAX_PAGE_SIZE;
 
-          let cursor = page;
           let billPages = 0;
           let kept: Array<Record<string, unknown>> = [];
           let raw: { results?: Array<Record<string, unknown>>; nextPage?: string } = {};
@@ -79,14 +87,12 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           do {
             raw = (await client.listTransactions({
               filters: check.billParam,
-              page: cursor,
-              pageSize,
+              ...paging.args,
             })) as typeof raw;
             billPages += 1;
-            kept = kept.concat(check.keep(Array.isArray(raw.results) ? raw.results : []));
-            cursor = raw.nextPage;
+            kept = kept.concat(check.keep(paging.observe(raw.results, raw.nextPage)));
           } while (
-            cursor &&
+            paging.hasMore &&
             check.dropped > 0 &&
             kept.length < target &&
             billPages < MAX_BILL_PAGES_PER_CALL
@@ -95,17 +101,25 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           // `raw` is BILL's full objects — the size budget in runTool is what
           // keeps it honest, so there is nothing to guard here.
           if (format === 'raw') {
-            return check.any
-              ? { ...raw, results: kept, nextPage: cursor, filtering: check.report() }
+            return check.any || paging.report()
+              ? {
+                  ...raw,
+                  results: kept,
+                  nextPage: paging.nextPage,
+                  ...(check.any ? { filtering: check.report() } : {}),
+                  ...(paging.report() ? { paging: paging.report() } : {}),
+                }
               : raw;
           }
           return buildCursorList({
             entity: 'Transaction',
             key: 'transactions',
             rows: kept.map(slimTransaction),
-            nextPage: cursor,
+            nextPage: paging.nextPage,
             filters,
             filtering: check.any ? check.report() : undefined,
+            paging: paging.report(),
+            cursorStalled: paging.looped,
             billPages,
           });
         },
@@ -183,19 +197,46 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
 
   server.tool(
     'divvy_list_custom_field_values',
-    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label. Paginated — use page (from nextPage in the previous response) and pageSize to walk the full list.',
+    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). ' +
+      'Returns one flattened row per value — its `id`, `uuid` and label — and asks BILL for its own maximum page size, so the whole list is usually one call. ' +
+      'Paged: when `hasMore` is true, call again with `page: nextPage`; `hasMore: false` means the end of the list. ' +
+      '`paging` states whether BILL actually honored each paging parameter — a cursor that re-serves a page already returned stops the walk and says so, rather than looping. ' +
+      '`format: "raw"` returns BILL\'s own objects.',
     {
       customFieldId: z.string().describe('Custom field ID from divvy_list_custom_fields'),
-      page: z.string().optional().describe('Page cursor from the previous response\'s nextPage'),
-      pageSize: z.string().optional().describe('Results per page (default per BILL API)'),
+      ...CURSOR_PAGING,
     },
     (args) =>
       runTool(
         'divvy_list_custom_field_values',
         args,
-        ({ customFieldId, page, pageSize }) =>
-          client.listCustomFieldValues(customFieldId, { page, pageSize }),
-        { narrowing: cursorNarrowing({ format: false }) },
+        async ({ customFieldId, page, pageSize, format }) => {
+          const paging = new PagingCheck({
+            page,
+            pageSize: pageSize ?? BILL_MAX_VALUES_PAGE_SIZE,
+          });
+          const raw = (await client.listCustomFieldValues(customFieldId, paging.args)) as {
+            results?: Array<Record<string, unknown>>;
+            nextPage?: string;
+          };
+          const values = paging.observe(raw.results, raw.nextPage);
+
+          if (format === 'raw') {
+            return { ...raw, results: values, nextPage: paging.nextPage, paging: paging.report() };
+          }
+          return buildCursorList({
+            entity: 'CustomFieldValue',
+            key: 'values',
+            rows: values.map(slimCustomFieldValue),
+            nextPage: paging.nextPage,
+            // A page of option labels has no quantity to add up.
+            sumField: null,
+            filters: { customFieldId },
+            paging: paging.report(),
+            cursorStalled: paging.looped,
+          });
+        },
+        { narrowing: CURSOR_PAGING_NARROWING },
       ),
   );
 

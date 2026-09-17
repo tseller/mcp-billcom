@@ -66,6 +66,21 @@ export function slimTransaction(tx: Tx): Record<string, unknown> {
   };
 }
 
+/**
+ * One option value of a custom field (a NAP code). BILL sends `deleted` on
+ * every row and it is `false` on every live one, so it is carried only when it
+ * is true — a repeated constant is payload for nothing (the same reason
+ * `slimAccount` emits `active` only when a row is inactive).
+ */
+export function slimCustomFieldValue(v: Tx): Record<string, unknown> {
+  return {
+    id: v.id,
+    uuid: v.uuid,
+    value: v.value,
+    ...(v.deleted === true ? { deleted: true } : {}),
+  };
+}
+
 export interface CursorListInput {
   /** Record type, e.g. "Transaction". */
   entity: string;
@@ -86,6 +101,18 @@ export interface CursorListInput {
    * difference between #29 being invisible and being stated in the result.
    */
   filtering?: Record<string, string>;
+  /**
+   * Per paging knob, whether BILL was shown to read it (see `PagingCheck`,
+   * src/divvy-paging.ts). Same idea as `filtering`, for the parameters that
+   * decide which rows come back rather than which ones stay.
+   */
+  paging?: Record<string, string>;
+  /**
+   * BILL's cursor did not advance — it re-served a page already returned, so
+   * the walk stopped here rather than looping (issue #33). There is no cursor
+   * to hand back, and `hasMore` says so rather than claiming the list ended.
+   */
+  cursorStalled?: boolean;
   /** BILL pages consumed for this one result, when more than one. */
   billPages?: number;
 }
@@ -96,12 +123,13 @@ export interface CursorListInput {
  * `pageTotal`, `note` — with the one difference BILL forces: the position is
  * its opaque `nextPage` cursor, not a row offset.
  *
- * That difference is why the two `hasMore` reasons need different advice.
+ * That difference is why the `hasMore` reasons need different advice.
  * `window` — BILL has more pages — resumes with `page: nextPage`. `size` — the
  * budget cut this page short — cannot: the cursor points past the whole BILL
  * page, so following it would silently skip the rows we dropped. The way
  * forward there is the SAME `page` again with a smaller `pageSize`, and the
- * note says so.
+ * note says so. `cursor` — BILL re-served a page already returned — has no way
+ * forward at all, and says that rather than handing back a cursor that loops.
  *
  * There is no `rowCount`: BILL's list returns neither a total nor a page
  * count, and an omitted count beats an invented one.
@@ -114,12 +142,14 @@ export function buildCursorList({
   sumField = "amount",
   filters = {},
   filtering,
+  paging,
+  cursorStalled = false,
   billPages,
 }: CursorListInput): Record<string, unknown> {
   const page = packRows(rows, 0, undefined);
   const returned = page.rows.length;
   const sizeTruncated = returned < rows.length;
-  const hasMore = sizeTruncated || Boolean(nextPage);
+  const hasMore = sizeTruncated || cursorStalled || Boolean(nextPage);
 
   const pageTotal =
     sumField === null
@@ -135,21 +165,25 @@ export function buildCursorList({
     ? `Showing ${returned} of the ${rows.length} rows on this page — the size budget cut it short. ` +
       "Call again with the SAME `page` and a smaller `pageSize`; `nextPage` starts after all " +
       `${rows.length} rows, so following it here would skip the rest of this page.`
-    : `Showing ${returned} row${returned === 1 ? "" : "s"}. Call again with \`page: nextPage\` for the next page` +
-      `${pageTotal !== undefined ? "; `pageTotal` is this page only" : ""}.`;
+    : cursorStalled
+      ? "BILL's cursor did not advance — it re-served a page already returned, so the rest of this list " +
+        "cannot be reached by paging. `paging.page` says so; there is no cursor to follow."
+      : `Showing ${returned} row${returned === 1 ? "" : "s"}. Call again with \`page: nextPage\` for the next page` +
+        `${pageTotal !== undefined ? "; `pageTotal` is this page only" : ""}.`;
 
   return {
     entity,
     ...Object.fromEntries(Object.entries(filters).filter(([, v]) => v !== undefined && v !== "")),
     ...(filtering && Object.keys(filtering).length > 0 ? { filtering } : {}),
+    ...(paging && Object.keys(paging).length > 0 ? { paging } : {}),
     ...(billPages !== undefined && billPages > 1 ? { billPages } : {}),
     returned,
     ...(pageTotal !== undefined ? { pageTotal } : {}),
     hasMore,
     ...(hasMore
       ? {
-          ...(sizeTruncated ? {} : { nextPage }),
-          truncatedBy: sizeTruncated ? "size" : "window",
+          ...(sizeTruncated || cursorStalled ? {} : { nextPage }),
+          truncatedBy: sizeTruncated ? "size" : cursorStalled ? "cursor" : "window",
           note,
         }
       : {}),

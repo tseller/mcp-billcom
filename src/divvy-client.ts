@@ -1,4 +1,5 @@
 import { FilterCheck } from './divvy-filters.js';
+import { PagingCheck, billPagingParams } from './divvy-paging.js';
 
 const DIVVY_BASE_URL = 'https://gateway.prod.bill.com/connect';
 
@@ -82,6 +83,11 @@ export class DivvyClient {
    * caller got the newest transactions whatever range they asked for
    * (issue #29). BILL validates `filters` — an unknown field or operator is a
    * 400 — so a wrong name there is loud instead of silent.
+   *
+   * Paging goes through `billPagingParams` rather than a mapping written out
+   * here: this endpoint's `max`/`nextPage` were right and the custom-field
+   * values endpoint's were not (issue #33), which is what two hand-written
+   * copies of the same fact buys you.
    */
   async listTransactions(params?: {
     filters?: string;
@@ -90,8 +96,7 @@ export class DivvyClient {
   }): Promise<unknown> {
     return this.get('/v3/spend/transactions', {
       filters: params?.filters,
-      nextPage: params?.page,
-      max: params?.pageSize,
+      ...billPagingParams({ page: params?.page, pageSize: params?.pageSize }),
     });
   }
 
@@ -148,14 +153,24 @@ export class DivvyClient {
     return this.get('/v3/spend/custom-fields');
   }
 
+  /**
+   * One page of a custom field's option values (the NAP codes).
+   *
+   * This sent `page` / `page_size`, which BILL reads as neither a cursor nor a
+   * page size — it answers 200 with page 1 and a `nextPage` equal to the cursor
+   * it was handed, so walking the list returned the same first 20 values
+   * forever (issue #33). The names are `max` and `nextPage`, the same two the
+   * transactions endpoint uses, and they now come from the one declaration in
+   * `src/divvy-paging.ts` rather than being spelled out again here.
+   */
   async listCustomFieldValues(
     customFieldId: string,
     params?: { page?: string; pageSize?: string },
   ): Promise<unknown> {
-    return this.get(`/v3/spend/custom-fields/${customFieldId}/values`, {
-      page: params?.page,
-      page_size: params?.pageSize,
-    });
+    return this.get(
+      `/v3/spend/custom-fields/${customFieldId}/values`,
+      billPagingParams({ page: params?.page, pageSize: params?.pageSize }),
+    );
   }
 
   /**
@@ -197,17 +212,20 @@ export class DivvyClient {
   }> {
     const pendingFields: PendingActionRow[] = [];
     const pendingReview: PendingActionRow[] = [];
-    let cursor: string | undefined;
     let safety = 50;
     const check = new FilterCheck({ startDate: params?.since });
+    // The walk stops when BILL's cursor stops advancing, which `PagingCheck`
+    // decides by fingerprinting each page rather than by comparing cursor
+    // strings — a backend that re-serves a page under a *new* cursor string
+    // (issue #33) walks past a string comparison and not past this one.
+    const paging = new PagingCheck({ pageSize: '50' });
     do {
       const resp = (await this.get('/v3/spend/transactions', {
         filters: check.billParam,
-        nextPage: cursor,
-        max: '50',
+        ...billPagingParams(paging.args),
       })) as { results?: RawTransaction[]; nextPage?: string };
       const results = check.keep(
-        (Array.isArray(resp.results) ? resp.results : []) as unknown as Record<string, unknown>[],
+        paging.observe(resp.results, resp.nextPage) as Record<string, unknown>[],
       ) as unknown as RawTransaction[];
       for (const tx of results) {
         if (TERMINAL_STATUSES.has(tx.status ?? '')) continue;
@@ -226,9 +244,7 @@ export class DivvyClient {
           pendingReview.push(row);
         }
       }
-      const next = resp.nextPage;
-      if (!next || next === cursor) break;
-      cursor = next;
+      if (!paging.hasMore) break;
       safety -= 1;
     } while (safety > 0);
     return { pendingFields, pendingReview };

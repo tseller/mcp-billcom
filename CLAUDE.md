@@ -39,30 +39,25 @@ gcloud config configurations activate mcp-billcom
 - `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
 - `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
-<<<<<<< HEAD
-- `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
-- `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
-- `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit)
-- `src/tools/qbo-classes.ts` — QBO: list_classes, create_class (the season tags). Class names are never hardcoded — seasons become year-specific ("Fall 2026")
-- `src/tools/qbo-class-reports.ts` — QBO: class_transactions, profit_loss_by_class. **TransactionList cannot return a class**: it silently drops the `klass_name` column (verified against a bogus-column control), so class-aware listing is built on **GeneralLedger**, the only report returning both the posting Account and the Class. The class filter param is `class` (not `classid`, which is ignored) and QBO echoes an applied filter back as `Header.Class` — `QboClient.classReport` asserts that echo so a silently-dropped filter can't pose as a real answer. These reports default to **Accrual** because the company default is Cash, which would break deferred revenue
-- `src/tools/qbo-class-writes.ts` — QBO: set_transaction_class (+ batch) — the only sanctioned way to class an existing transaction
-- `src/tools/qbo-budgets.ts` — QBO: list_budgets, budget_vs_actuals. The Budget entity is **read-only** via the API (build budgets in the web UI), and there is **no budget report at all**: `BudgetVsActuals`/`BudgetSummary` return `5020 Permission Denied`, exactly as an invented report name does. So budget-vs-actuals is computed — `src/budget-actuals.ts` joins BudgetDetail (account × class) to a P&L summarised by class
-- `src/class-lines.ts` — line-preserving edits. Class writes **never rebuild a line**: they deep-copy QBO's own lines and write only `ClassRef`, then `diffPaths` re-checks that nothing else moved and the write is refused if it did. This exists because the update tools' `lines` array can express 3 fields while a live line carries up to 7 (`Id`, `TaxCodeRef`, `BillableStatus`, `CustomerRef`, `LineNum`), so a rebuild silently dropped the rest — hence `mergeLinePatches` (edit by `lineId`) and the explicit `replaceAllLines` flag on the update tools
-- `src/scripts/verify-class-live.ts` — read-only live/sandbox verification of the class tooling (`npx tsx src/scripts/verify-class-live.ts`; set `QBO_BASE_URL` + env credentials for a sandbox company)
-=======
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts (flattened rows + paging), account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors (both flattened rows + paging), create_vendor
 - `src/tools/list-paging.ts` — the paging vocabularies, each paired with the sentence that names its knobs when a result is over budget (so advice and schema can't drift): `listPaging(defaultMaxResults)` (`startPosition`/`maxResults`/`format`, the QBO entity queries), `OFFSET_PAGING_NARROWING` (the `offset`/`limit` report tools) and `CURSOR_PAGING` (`page`/`pageSize`/`format`, BILL's opaque cursor)
 - `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit). The three list tools return **flattened rows** and **page by size as well as row count** — see "Tool result size" below
 - `src/qbo-rows.ts` — the flattened row shapes for every list tool (`slimPurchase`/`slimDeposit`/`slimTransfer`/`slimAccount`/`slimVendor`) plus `buildEntityList()`, which packs one page and states `rowCount` / `hasMore` / `nextStartPosition`. `sumField: null` omits `pageTotal` for a listing where a per-page sum states nothing true (a chart of accounts adds assets to liabilities)
 - `src/tool-logging.ts` — `runTool()`, the single response path every tool goes through: start/finish logging, `compact()` serialization, and the result-size budget. A handler returns plain data (or a string) and never builds an MCP response itself
->>>>>>> origin/main
+- `src/tools/qbo-classes.ts` — QBO: list_classes, create_class (the season tags). Class names are never hardcoded — seasons become year-specific ("Fall 2026")
+- `src/tools/qbo-class-reports.ts` — QBO: class_transactions, profit_loss_by_class. **TransactionList cannot return a class**: it silently drops the `klass_name` column (verified against a bogus-column control), so class-aware listing is built on **GeneralLedger**, the only report returning both the posting Account and the Class. The class filter param is `class` (not `classid`, which is ignored) and QBO echoes an applied filter back as `Header.Class` — `QboClient.classReport` asserts that echo so a silently-dropped filter can't pose as a real answer. These reports default to **Accrual** because the company default is Cash, which would break deferred revenue
+- `src/tools/qbo-class-writes.ts` — QBO: set_transaction_class (+ batch) — the only sanctioned way to class an existing transaction
+- `src/tools/qbo-budgets.ts` — QBO: list_budgets, budget_vs_actuals. The Budget entity is **read-only** via the API (build budgets in the web UI), and there is **no budget report at all**: `BudgetVsActuals`/`BudgetSummary` return `5020 Permission Denied`, exactly as an invented report name does. So budget-vs-actuals is computed — `src/budget-actuals.ts` joins BudgetDetail (account × class) to a P&L summarised by class
+- `src/class-lines.ts` — line-preserving edits. Class writes **never rebuild a line**: they deep-copy QBO's own lines and write only `ClassRef`, then `diffPaths` re-checks that nothing else moved and the write is refused if it did. This exists because the update tools' `lines` array can express 3 fields while a live line carries up to 7 (`Id`, `TaxCodeRef`, `BillableStatus`, `CustomerRef`, `LineNum`), so a rebuild silently dropped the rest — hence `mergeLinePatches` (edit by `lineId`) and the explicit `replaceAllLines` flag on the update tools
+- `src/scripts/verify-class-live.ts` — read-only live/sandbox verification of the class tooling (`npx tsx src/scripts/verify-class-live.ts`; set `QBO_BASE_URL` + env credentials for a sandbox company)
 - `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
 - `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Enforced for **every** tool by `runTool`, not opted into per tool
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions (flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, cards, members, budgets, list_pending_action
 - `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
-- `src/divvy-rows.ts` — the flattened Divvy row (`slimTransaction`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
+- `src/divvy-paging.ts` — the same treatment for the paging parameters: each knob declared once as the BILL query parameter it becomes (`pageSize`→`max`, `page`→`nextPage`) and the question asked of the page that comes back. `PagingCheck` is the cursor state machine for a call; the cursor it hands out carries a fingerprint of the page it came after, so a cursor that re-serves its own page is caught on the next call — see "Paging" below
+- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCustomFieldValue`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
 - `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
 - `src/gmail-client.ts` — Gmail attachment fetch for qbo_attach_file (per-account refresh tokens)
@@ -242,6 +237,81 @@ and none outside. Walked to the last page, the row count grows with the range �
 where before every one of those asks returned the same newest 50 rows. A
 single-day ask (`2026-06-26`..`2026-06-26`) returns the one transaction that
 day, which is the midnight-`lte` trap above.
+
+## Paging
+
+A cursor is only a cursor if the page it returns is a different page.
+
+`divvy_list_custom_field_values` advertised `page` and `pageSize` and sent them
+as `page` / `page_size`. BILL's v3 `/spend/custom-fields/{id}/values` reads
+**neither** — it wants `max` and `nextPage`, the same two names the transactions
+endpoint uses — and, exactly as with the filters above, it answers **HTTP 200
+with page 1** rather than rejecting a parameter it doesn't know. So the tool's
+own instruction ("use page … and pageSize to walk the full list") could not be
+followed: a caller walking the NAP-code list got the same first 20 values back
+forever, behind a `nextPage` that never advanced. An infinite loop wearing the
+shape of a working paged API (issue #33).
+
+Probed against live books on 2026-09-17, on that endpoint:
+
+| request | rows | note |
+| --- | --- | --- |
+| *(no parameters)* | 20 | BILL's default page |
+| `?page_size=3` | 20 | what the tool sent — ignored |
+| `?pageSize=3` | 20 | ignored |
+| `?bogusParam=7` | 20 | the control: an unknown parameter is never refused |
+| `?max=3` | 3 | honored |
+| `?max=3&page=<cursor>` | 3 | **page 1 again**, and `nextPage` = the cursor sent |
+| `?max=3&nextPage=<cursor>` | 3 | advanced |
+| `?max=101` | — | `400 max: must be less than or equal to 100` |
+
+Renaming two parameters would have fixed that instance and left the structure
+untouched. So paging is declared the way filters are, in `src/divvy-paging.ts`:
+
+- `PAGING_SPECS[knob].param` / `.send()` — the query parameter BILL is asked on
+  (`pageSize`→`max`, `page`→`nextPage`) and the value sent;
+- `.honored(page, value)` — the same question asked of the page that came back:
+  `true` shown to be read, `false` shown not to be, `undefined` unwitnessable —
+  which is *stated*, never rounded up to "honored".
+
+The witness for a cursor is the cheap honest one: a cursor is derived from a
+page, so a cursor that re-serves the rows it was derived from has not advanced.
+To have that comparison on hand, the cursor handed to a caller is BILL's cursor
+with a fingerprint of that page sealed onto it (`<billCursor>~<fingerprint>`);
+the seal is stripped before the request, so BILL only ever sees its own cursor.
+A bare BILL cursor pasted by hand still works — it carries no witness, and the
+result says so rather than claiming the cursor advanced.
+
+What this means in practice:
+
+- `divvy_list_custom_field_values` and `divvy_list_transactions` both return a
+  `paging` block saying per knob how it was really enforced — the twin of
+  `filtering`. A `pageSize` BILL ignores reads as *not honored*, naming the
+  rows asked for and the rows returned.
+- A cursor that does not advance **stops the walk**: the repeated rows are
+  dropped rather than handed back as new ones (they are rows the caller already
+  has — returning them *is* the loop), no cursor is handed back, and
+  `truncatedBy` is `cursor` alongside the `paging.page` sentence. The three
+  `truncatedBy` reasons are now `window` (follow `page: nextPage`), `size`
+  (re-request the SAME `page` with a smaller `pageSize`) and `cursor` (there is
+  no way forward; the list cannot be read past here).
+- The check is an accumulator, so it also covers the walks *inside* one call —
+  `divvy_list_transactions` refilling a filtered page, and
+  `listPendingAction` walking to the end. It replaced that walk's
+  `next === cursor` string comparison, which a backend re-serving a page under
+  a *new* cursor string walks straight past.
+- `divvy_list_custom_field_values` asks for `max=100` (BILL's maximum on that
+  endpoint) by default, so the whole NAP-code list is one call, and returns
+  flattened rows: `id`, `uuid`, `value`, and `deleted` only when true.
+- A test pins the tools' schemas to `PAGING_SPECS`, and another asserts the
+  **wire** — that both BILL list requests go out carrying `max` and `nextPage`
+  and neither `page` nor `page_size`. Asserting the wrapper is what let #33
+  live; the query string is where the bug was.
+
+Live books, measured on revision `billcom-mcp-00065-xxx` (see "Proof" in issue
+#33): the NAP CODES field has **72** values. Before, every call returned the
+same first 20 with a `nextPage` that never moved; now one call returns all 72
+with `hasMore: false`.
 
 ## Protocol version
 

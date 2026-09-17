@@ -129,9 +129,13 @@ What this means in practice:
 - `divvy_list_transactions` returns flattened rows (`src/divvy-rows.ts`) **by
   default**. The row shape existed from the start but behind `compact: true`,
   so the everyday call — the default, at BILL's own maximum page size of 50 —
-  was 93,704 chars and failed; the same call with the flag was 14,973. A
-  default nobody has to know about is the fix, so `format: "raw"` is now the
-  opt-in (for one transaction in full, `divvy_get_transaction`).
+  was 93,704 chars and failed. A default nobody has to know about is the fix,
+  so `format: "raw"` is now the opt-in (for one transaction in full,
+  `divvy_get_transaction`). Live books, one 50-row page
+  (`{"startDate":"2026-05-01","endDate":"2026-06-30","pageSize":"50"}`,
+  measured on revision `billcom-mcp-00063-2qh`): 93,704 chars before →
+  **15,216** (6x), and `format: "raw"` on the same page is still 93,704 and
+  refused by name.
   BILL's cursor is an opaque `nextPage` string, not a row offset, so this list
   keeps `page`/`pageSize` rather than pretending to be `startPosition`; every
   other field means what it does on the QBO lists. When `truncatedBy` is

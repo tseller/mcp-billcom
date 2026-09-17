@@ -7,6 +7,7 @@ import {
   type ClassableEntity,
   type QboLine,
 } from "../class-lines.js";
+import { compact } from "../result-size.js";
 
 function err(e: unknown) {
   const msg = e instanceof QboError ? e.message : String(e);
@@ -209,7 +210,7 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
         if (blocked) return { content: [{ type: "text" as const, text: blocked }], isError: true };
 
         const outcome = await setTransactionClass(client, args as Parameters<typeof setTransactionClass>[1]);
-        return { content: [{ type: "text", text: JSON.stringify(outcome, null, 2) }] };
+        return { content: [{ type: "text", text: compact(outcome) }] };
       } catch (e) {
         return err(e);
       }
@@ -272,18 +273,14 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                dryRun: dryRun ?? false,
-                total: items.length,
-                succeeded: items.length - failed,
-                failed,
-                linesChanged,
-                results,
-              },
-              null,
-              2,
-            ),
+            text: compact({
+              dryRun: dryRun ?? false,
+              total: items.length,
+              succeeded: items.length - failed,
+              failed,
+              linesChanged,
+              results,
+            }),
           },
         ],
         ...(failed === items.length ? { isError: true } : {}),

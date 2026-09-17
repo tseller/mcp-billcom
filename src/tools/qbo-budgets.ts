@@ -7,6 +7,7 @@ import {
   type AccountingMethod,
 } from "../qbo-client.js";
 import { buildBudgetVsActuals, type QboBudget } from "../budget-actuals.js";
+import { MAX_RESULT_CHARS, packRows, compact, tooBig } from "../result-size.js";
 
 function err(e: unknown) {
   const msg = e instanceof QboError ? e.message : String(e);
@@ -68,7 +69,19 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
               : READ_ONLY_NOTE,
           budgets: budgets.map((b) => summarize(b, includeDetail ?? false)),
         };
-        return { content: [{ type: "text", text: JSON.stringify(body, null, 2) }] };
+        const text = compact(body);
+        if (text.length > MAX_RESULT_CHARS) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: ${tooBig("The budget list with detail", "all budgets", text.length)} Call again without includeDetail, or narrow with nameContains.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        return { content: [{ type: "text", text }] };
       } catch (e) {
         return err(e);
       }
@@ -95,8 +108,15 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
         .describe(
           "Cash or Accrual. Defaults to Accrual so deferred revenue lands in the season it belongs to; this company's QBO web UI default is Cash, so numbers can differ from the UI on purpose.",
         ),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
+      limit: z.number().int().min(1).optional().describe("Max rows to return in this page"),
     },
-    async ({ budgetId, startDate, endDate, classIds, accountingMethod }) => {
+    async ({ budgetId, startDate, endDate, classIds, accountingMethod, offset, limit }) => {
       try {
         const found = (await client.getBudget(budgetId)) as {
           QueryResponse?: { Budget?: QboBudget[] };
@@ -138,17 +158,30 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
         });
         const actuals = parseProfitAndLossByClass(report);
         const { rows, totals } = buildBudgetVsActuals(budget, actuals, { startDate: from, endDate: to });
+        const page = packRows(rows, offset ?? 0, limit);
 
         const body = {
           budget: { id: budget.Id, name: budget.Name, entryType: budget.BudgetEntryType, type: budget.BudgetType },
-          period: { startDate: from, endDate: to },
+          startDate: from,
+          endDate: to,
           accountingBasis: actuals.basis || basis,
           computed:
             "No budget-vs-actuals report exists in the QuickBooks API — these numbers are budget detail joined to a P&L summarised by class.",
           totals,
-          rows,
+          rowCount: rows.length,
+          offset: page.offset,
+          returned: page.rows.length,
+          hasMore: page.hasMore,
+          ...(page.hasMore
+            ? {
+                nextOffset: page.nextOffset,
+                truncatedBy: page.truncatedBy,
+                note: `Showing rows ${page.offset}-${page.offset + page.rows.length - 1} of ${rows.length}. Call again with offset: ${page.nextOffset} for the rest. \`totals\` already cover the whole budget.`,
+              }
+            : {}),
+          rows: page.rows,
         };
-        return { content: [{ type: "text", text: JSON.stringify(body, null, 2) }] };
+        return { content: [{ type: "text", text: compact(body) }] };
       } catch (e) {
         return err(e);
       }

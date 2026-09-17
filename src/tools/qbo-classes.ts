@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { QboClient, QboError, type QboClass } from "../qbo-client.js";
 import { IdempotencyStore, withIdempotency } from "../idempotency.js";
+import { compact } from "../result-size.js";
 
 function err(e: unknown) {
   const msg = e instanceof QboError ? e.message : String(e);
@@ -62,7 +63,7 @@ export function registerQboClassTools(
               : undefined,
           classes,
         };
-        return { content: [{ type: "text", text: JSON.stringify(body, null, 2) }] };
+        return { content: [{ type: "text", text: compact(body) }] };
       } catch (e) {
         return err(e);
       }
@@ -96,11 +97,11 @@ export function registerQboClassTools(
             content: [
               {
                 type: "text",
-                text: JSON.stringify(
-                  { created: false, reason: "a class with this name already exists", class: shape(existing) },
-                  null,
-                  2,
-                ),
+                text: compact({
+                  created: false,
+                  reason: "a class with this name already exists",
+                  class: shape(existing),
+                }),
               },
             ],
           };
@@ -115,11 +116,7 @@ export function registerQboClassTools(
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                { created: true, class: result.Class ? shape(result.Class) : result },
-                null,
-                2,
-              ),
+              text: compact({ created: true, class: result.Class ? shape(result.Class) : result }),
             },
           ],
         };

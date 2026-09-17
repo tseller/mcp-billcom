@@ -10,6 +10,8 @@ import {
 import { parseClassLedger, parseProfitAndLossByClass } from "./qbo-client.js";
 import { buildBudgetVsActuals, aggregateBudgetDetail, type QboBudget } from "./budget-actuals.js";
 import { buildPurchaseLineUpdate, buildDepositLineUpdate } from "./tools/qbo-transactions.js";
+import { buildClassTransactions } from "./tools/qbo-class-reports.js";
+import { compact, MAX_RESULT_CHARS } from "./result-size.js";
 
 /**
  * Fixtures below mirror the SHAPE of the live AYSO data — every field that a
@@ -364,6 +366,36 @@ const ledgerReport = {
   },
 };
 
+/** Same shape, but with the `id` attributes QBO hangs on the type and account cells. */
+const ledgerReportWithIds = {
+  ...ledgerReport,
+  Rows: {
+    Row: [
+      {
+        type: "Section",
+        Header: { ColData: [{ value: "1100 Chase Checking" }] },
+        Rows: {
+          Row: [
+            {
+              type: "Data",
+              ColData: [
+                { value: "2026-06-04" },
+                { value: "Expense", id: "1169" },
+                { value: "" },
+                { value: "Field Supplies Co" },
+                { value: "" },
+                { value: "Field paint" },
+                { value: "1100 Chase Checking", id: "14" },
+                { value: "-214.50" },
+              ],
+            },
+          ],
+        },
+      },
+    ],
+  },
+};
+
 test("parseClassLedger returns transaction rows with their class, skipping section and balance rows", () => {
   const { transactions, total, basis } = parseClassLedger(ledgerReport);
 
@@ -536,4 +568,75 @@ test("buildBudgetVsActuals never counts the TOTAL column as a class", () => {
   const actuals = parseProfitAndLossByClass(plByClass);
   const { rows } = buildBudgetVsActuals(budget, actuals);
   assert.ok(!rows.some((r) => r.class === "TOTAL"));
+});
+
+// --- Result size: a class ledger grows with its date range like any other report ---
+
+test("buildClassTransactions pages a long range instead of returning an oversized payload", () => {
+  // ~1,200 rows is a plausible fiscal year: one live month alone returned 56.
+  const rows = Array.from({ length: 1200 }, (_, i) => ({
+    type: "Data",
+    ColData: [
+      { value: `2026-06-${String((i % 28) + 1).padStart(2, "0")}` },
+      { value: "Expense", id: String(1000 + i) },
+      { value: "" },
+      { value: "A vendor with a reasonably long display name" },
+      { value: "" },
+      { value: "A memo of the length these actually run to in the real books" },
+      { value: "1100 Chase Checking", id: "14" },
+      { value: "-42.75" },
+    ],
+  }));
+  const bigReport = {
+    ...ledgerReport,
+    Rows: { Row: [{ type: "Section", Header: { ColData: [{ value: "1100 Chase Checking" }] }, Rows: { Row: rows } }] },
+  };
+
+  const page = buildClassTransactions(bigReport, {
+    startDate: "2025-07-01",
+    endDate: "2026-06-30",
+    requestedBasis: "Accrual",
+  });
+
+  assert.equal(page.rowCount, 1200);
+  assert.ok((page.returned as number) < 1200, "a full fiscal year must not come back in one page");
+  assert.equal(page.hasMore, true);
+  assert.equal(page.nextOffset, page.returned);
+  assert.ok(compact(page).length <= MAX_RESULT_CHARS, "a page must fit the tool-result budget");
+  // The whole-range total is reported even though only a page of rows is sent.
+  assert.equal(page.total, Math.round(1200 * -42.75 * 100) / 100);
+
+  const second = buildClassTransactions(bigReport, {
+    startDate: "2025-07-01",
+    endDate: "2026-06-30",
+    requestedBasis: "Accrual",
+    offset: page.nextOffset as number,
+  });
+  assert.equal(second.offset, page.nextOffset);
+  assert.ok((second.returned as number) > 0);
+});
+
+test("buildClassTransactions carries the QBO transaction id, so a row can be re-tagged directly", () => {
+  const page = buildClassTransactions(ledgerReportWithIds, {
+    startDate: "2026-06-01",
+    endDate: "2026-06-30",
+    requestedBasis: "Accrual",
+    untaggedOnly: true,
+  });
+  assert.equal(page.returned, 1);
+  assert.deepEqual((page.rows as Array<Record<string, unknown>>)[0].id, "1169");
+  assert.deepEqual((page.rows as Array<Record<string, unknown>>)[0].accountId, "14");
+  assert.equal((page.rows as Array<Record<string, unknown>>)[0].class, null);
+});
+
+test("buildClassTransactions counts untagged across the whole period, not just the page", () => {
+  const page = buildClassTransactions(ledgerReport, {
+    startDate: "2026-06-01",
+    endDate: "2026-06-30",
+    requestedBasis: "Accrual",
+    untaggedOnly: true,
+  });
+  assert.equal(page.rowsInPeriod, 3);
+  assert.equal(page.untaggedInPeriod, 1);
+  assert.equal(page.rowCount, 1);
 });

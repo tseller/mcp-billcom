@@ -45,6 +45,7 @@ gcloud config configurations activate mcp-billcom
 - `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
 - `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Any tool whose payload grows with a date range goes through it
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
+- `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
 - `src/gmail-client.ts` — Gmail attachment fetch for qbo_attach_file (per-account refresh tokens)
 - `src/scripts/gmail-link.ts` — one-time bootstrap to mint a Gmail refresh token (`npm run gmail:link`)
@@ -85,6 +86,41 @@ What this means in practice:
 - Rejected `/mcp` requests are logged with the rpc method, session and
   `MCP-Protocol-Version`, so a request the transport turns away is readable in
   Cloud Run logs rather than an anonymous 400.
+
+## Protocol version
+
+A Streamable HTTP client echoes an `MCP-Protocol-Version` header on every
+request after `initialize`, and the SDK transport refuses a version it doesn't
+know with `400 Bad Request: Unsupported protocol version` **before any tool
+runs**. Tim's Claude connector announces `2026-07-28`, which no released SDK
+speaks (1.30.0, latest as of 2026-09-17, is still on `2025-11-25`) — so
+upgrading the SDK does not fix it. That produced 16 silent tool failures in 30
+days: nothing ran, nothing was logged about the tool, and the Claude UI showed
+a bare "the tool errored".
+
+The cause was that the same fact — what version this session speaks — lived in
+two places that could drift: the version negotiated at `initialize` and the
+client's per-request header. `src/protocol-version.ts` makes the negotiated
+version authoritative: on an established session, a header naming a version we
+don't speak is **reconciled to the negotiated version** rather than refused —
+the same thing the transport already does when the header is absent. Nothing is
+loosened; the server only ever speaks what it advertised in its own
+`initialize` response. Newer and older unknown versions are treated alike, so
+next year's version needs no code change.
+
+Two traps worth knowing:
+
+- `StreamableHTTPServerTransport` rebuilds the request via `@hono/node-server`,
+  which reads `IncomingMessage.rawHeaders` — **not** the `req.headers` object
+  Express middleware mutates. `setRequestHeader()` writes both; changing only
+  `req.headers` looks like a working fix and changes nothing.
+- The `[http] … rejected …` logger is mounted **before** body parsing and auth,
+  so it names every refusal — including 401s and unparseable bodies, which
+  skipped it when it sat after `express.json()`.
+
+`GET /health` reports the deployed `latest`/`supported` version list, the Cloud
+Run revision and the policy — so "which versions does prod speak?" is a curl,
+not a deploy or a log dig.
 
 ## Environment Variables
 

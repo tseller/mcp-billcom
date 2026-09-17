@@ -17,6 +17,7 @@
  * book without going near QBO.
  */
 
+import { describeEmpty, type Witness } from "./empty-listing.js";
 import { packRows } from "./result-size.js";
 
 type Ref = { value?: string; name?: string; type?: string };
@@ -212,6 +213,12 @@ export interface EntityListInput {
   sumField?: string | null;
   /** Echoed filters (date range, account, vendor) for a self-describing result. */
   filters?: Record<string, unknown>;
+  /**
+   * Independent sources consulted for this result, for the zero-row case.
+   * Omitted means none were, and the `empty` block says so rather than letting
+   * a bare `[]` read as "there are none" (see `src/empty-listing.ts`).
+   */
+  witnesses?: Witness[];
 }
 
 /**
@@ -231,6 +238,7 @@ export function buildEntityList({
   rowCount,
   sumField = "amount",
   filters = {},
+  witnesses,
 }: EntityListInput): Record<string, unknown> {
   const page = packRows(rows, 0, maxResults);
   const returned = page.rows.length;
@@ -262,6 +270,7 @@ export function buildEntityList({
     returned,
     ...(pageTotal !== undefined ? { pageTotal } : {}),
     hasMore,
+    ...(returned === 0 ? { empty: describeEmpty(witnesses) } : {}),
     ...(hasMore
       ? {
           nextStartPosition,

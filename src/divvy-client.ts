@@ -65,8 +65,30 @@ export class DivvyClient {
     return this.request('POST', path, undefined, body);
   }
 
-  async listBudgets(): Promise<unknown> {
-    return this.get('/v3/spend/budgets');
+  /**
+   * One page of /v3/spend/budgets.
+   *
+   * Never call this endpoint with no `filters` and treat the answer as "every
+   * budget": on live books the unfiltered call returns nothing while
+   * `retired:eq:true` returns three, and budgets a caller can read one at a
+   * time by id are not returned by any filter at all (issue #34). What the
+   * budget listing does with that lives in `src/divvy-budgets.ts`.
+   */
+  async listBudgetsPage(params?: {
+    filters?: string;
+    page?: string;
+    pageSize?: string;
+  }): Promise<{ results?: Record<string, unknown>[]; nextPage?: string }> {
+    return this.get('/v3/spend/budgets', {
+      filters: params?.filters,
+      nextPage: params?.page,
+      max: params?.pageSize,
+    });
+  }
+
+  /** One budget in full, by either spelling of its id. */
+  async getBudget(budgetId: string): Promise<Record<string, unknown>> {
+    return this.get(`/v3/spend/budgets/${budgetId}`);
   }
 
   /**
@@ -87,7 +109,7 @@ export class DivvyClient {
     filters?: string;
     page?: string;
     pageSize?: string;
-  }): Promise<unknown> {
+  }): Promise<{ results?: Record<string, unknown>[]; nextPage?: string }> {
     return this.get('/v3/spend/transactions', {
       filters: params?.filters,
       nextPage: params?.page,
@@ -99,8 +121,14 @@ export class DivvyClient {
     return this.get(`/v3/spend/transactions/${transactionId}`);
   }
 
-  async listCards(): Promise<unknown> {
-    return this.get('/v3/spend/cards');
+  async listCards(params?: {
+    page?: string;
+    pageSize?: string;
+  }): Promise<{ results?: Record<string, unknown>[]; nextPage?: string }> {
+    return this.get('/v3/spend/cards', {
+      nextPage: params?.page,
+      max: params?.pageSize,
+    });
   }
 
   async listMembers(): Promise<unknown> {

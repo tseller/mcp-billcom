@@ -22,7 +22,15 @@ gcloud config configurations activate mcp-billcom
 - `npm run build` — compile TypeScript to `dist/`
 - `npm run dev` — run with tsx (loads `.env` automatically)
 - `npm start` — run compiled output (loads `.env` automatically)
+- `npm test` — node:test unit tests (`src/**/*.test.ts`)
 - Inspector: `npx @modelcontextprotocol/inspector node --env-file=.env --import=tsx src/index.ts`
+- Drive the **deployed** service end-to-end (handshake + one tool call, against live QBO):
+  ```
+  export MCP_TOKEN=$(gcloud secrets versions access latest --secret=MCP_API_TOKEN \
+    --project=mcp-servers-487419 --account=tseller@gmail.com)
+  scripts/mcp-call.sh --list
+  scripts/mcp-call.sh qbo_transaction_report '{"startDate":"2026-05-01","endDate":"2026-06-30"}'
+  ```
 
 ## Architecture
 
@@ -34,13 +42,49 @@ gcloud config configurations activate mcp-billcom
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts, account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors, create_vendor
 - `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit)
-- `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet
+- `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
+- `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Any tool whose payload grows with a date range goes through it
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
 - `src/gmail-client.ts` — Gmail attachment fetch for qbo_attach_file (per-account refresh tokens)
 - `src/scripts/gmail-link.ts` — one-time bootstrap to mint a Gmail refresh token (`npm run gmail:link`)
 - SDK: `@modelcontextprotocol/sdk` ^1.26.0
 - All logging goes to stderr (stdout is MCP protocol)
+
+## Tool result size
+
+A tool result is only useful if the MCP client accepts it. Report tools used to
+emit `JSON.stringify(report, null, 2)` of QBO's nested report JSON — ~840 chars
+per transaction row, so a two-month TransactionList is ~52,000 chars (~13,000
+tokens) and a fiscal year ~470,000. The server never complained; the failure
+landed past our edge at the client's per-result cap and looked like a bare
+"the tool errored", with nothing in the Cloud Run logs.
+
+The discipline now lives in `src/result-size.ts` and is shared:
+
+- `MAX_RESULT_CHARS` (40,000 ≈ 10k tokens) is the budget for one tool result.
+- `compact()` — no pretty-printing (indentation alone was ~25% of a payload).
+- `packRows()` — takes the largest slice that fits both the caller's `limit`
+  and the budget; the result carries `rowCount` (whole range), `offset`,
+  `returned`, `hasMore`, `nextOffset` and a `note` saying how to get the rest.
+
+What this means in practice:
+
+- `qbo_transaction_report` and `qbo_cleared_transactions` accept `offset`/`limit`
+  and page. **No date range is too long** — a long one just takes more calls.
+  Aggregates (`total`) always cover the whole range, not the page.
+- Live books, 2026-05-01..2026-06-30: 62 rows, 52,180 chars before → 19,789
+  after (2.6x), one page. Roughly 120-180 rows per page at those memo lengths.
+- `qbo_reconcile_worksheet` truncates the *listing* (never the balances or the
+  verdict) with an explicit note pointing at the paged tool.
+- `qbo_profit_loss` / `qbo_balance_sheet` are hierarchical with nothing sane to
+  page, so over budget is a named error stating the size — not a silent failure.
+- QBO answers some failures with **HTTP 200 and a `Fault` body** (a malformed
+  date, for one). `qboFaultMessage` is checked in `report()`, `query()` and
+  `request()` so a Fault raises a tool error instead of flowing on as data.
+- Rejected `/mcp` requests are logged with the rpc method, session and
+  `MCP-Protocol-Version`, so a request the transport turns away is readable in
+  Cloud Run logs rather than an anonymous 400.
 
 ## Environment Variables
 

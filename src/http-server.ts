@@ -80,6 +80,26 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     res.json({ ok: true });
   });
 
+  // Name every rejected /mcp request in the logs. Cloud Run's access log shows
+  // only "400" with a byte count, so a request the transport turns away (wrong
+  // protocol version, dead session, bad handshake) is invisible server-side and
+  // surfaces to the user as an unexplained tool failure. Log the method,
+  // session and protocol version so the next one is readable, not guessed at.
+  app.use("/mcp", (req: Request, res: Response, next) => {
+    res.on("finish", () => {
+      if (res.statusCode < 400) return;
+      const body = req.body as { method?: string; id?: unknown } | undefined;
+      console.error(
+        `[http] ${req.method} /mcp rejected ${res.statusCode}` +
+          ` rpc=${body?.method ?? "-"}` +
+          ` session=${(req.headers["mcp-session-id"] as string) ?? "-"}` +
+          ` protocolVersion=${(req.headers["mcp-protocol-version"] as string) ?? "-"}` +
+          ` ua=${req.headers["user-agent"] ?? "-"}`,
+      );
+    });
+    next();
+  });
+
   app.post("/mcp", async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 

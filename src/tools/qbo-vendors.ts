@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ACTIVE_VENDORS, QboClient, vendorNameWhere } from "../qbo-client.js";
 import { runTool } from "../tool-logging.js";
-import { listPaging } from "./list-paging.js";
+import { LIST_PAGING_NARROWING, listPaging } from "./list-paging.js";
 import { buildEntityList, queryRows, slimVendor } from "../qbo-rows.js";
 
 const VENDOR_ROWS_DOC =
@@ -34,7 +34,9 @@ export function registerQboVendorTools(server: McpServer, client: QboClient) {
           // A page of vendor balances is a slice of what we owe, not a total.
           sumField: null,
         });
-      }),
+      },
+      { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(
@@ -64,7 +66,9 @@ export function registerQboVendorTools(server: McpServer, client: QboClient) {
           sumField: null,
           filters: { name },
         });
-      }),
+      },
+      { narrowing: LIST_PAGING_NARROWING },
+      ),
   );
 
   server.tool(

@@ -31,18 +31,33 @@ export const MAX_RESULT_CHARS = 40_000;
 export const compact = (v: unknown): string => JSON.stringify(v);
 
 /**
+ * What to say when a result is over budget and the tool has not named its own
+ * paging knobs. Deliberately knob-free: advice that names parameters is only
+ * useful if they are *this* tool's parameters, and a wrong name is worse than
+ * no name — `divvy_list_transactions` used to be told to pass `maxResults`,
+ * `format`, `offset` or `startPosition`, none of which it accepts. A tool with
+ * paging arguments passes the sentence that names them (see
+ * `src/tools/list-paging.ts`, where each sentence sits beside the schema that
+ * declares those knobs, so the two cannot drift).
+ */
+export const DEFAULT_NARROWING =
+  "Narrow the request — a shorter date range, or a smaller page using this tool's own paging arguments.";
+
+/**
  * The message every over-budget result fails with — states the size and the
  * way out. Raised from the single response path (`runTool`), so a tool that
  * never thought about size still fails loudly here instead of handing the
  * client a payload it will reject.
  */
-export function overBudget(what: string, chars: number): string {
+export function overBudget(
+  what: string,
+  chars: number,
+  narrowing: string = DEFAULT_NARROWING,
+): string {
   return (
     `${what} produced a ${chars.toLocaleString()}-character result, over the ` +
     `${MAX_RESULT_CHARS.toLocaleString()}-character tool-result budget. ` +
-    `Narrow the request — a shorter date range, a smaller maxResults, ` +
-    `the paged row format (omit \`format: "raw"\`), or the next page ` +
-    `(\`offset\` / \`startPosition\`).`
+    narrowing
   );
 }
 

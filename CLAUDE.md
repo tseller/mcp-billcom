@@ -91,13 +91,15 @@ What this means in practice:
   via `truncatedBy`: `size` (the budget cut the window short) or `window`
   (QBO has rows past what we asked for). `format: "raw"` still returns the full
   entities, and is refused if it exceeds the budget.
-- Live books, a fiscal year of purchases (2025-07-01..2026-06-30, 96 rows):
-  199,955 chars before → ~22,000 after (~9x), one page, `rowCount: 96`. The
-  QBO entity is ~2,083 chars, of which `PurchaseEx` (a JAXB blob), `domain`,
-  `sparse`, `SyncToken`, `MetaData`, `PrintStatus`, `CustomExtensions` and the
-  USD `CurrencyRef` are envelope; a row keeps date, amount, payee/account names
-  WITH their ids, doc number, memo and the categorization lines. Full fidelity
-  is one `qbo_get_purchase` away.
+- Live books, a fiscal year of purchases (2025-07-01..2026-06-30, 96 rows,
+  measured on revision `billcom-mcp-00061-qnj`): 199,955 chars before →
+  38,189 for 92 rows, then a 4-row second page at `startPosition: 93`
+  (2,083 → 415 chars per row, 5x). The QBO entity's `PurchaseEx` (a JAXB blob),
+  `domain`, `sparse`, `SyncToken`, `MetaData`, `PrintStatus`,
+  `CustomExtensions` and the USD `CurrencyRef` are envelope; a row keeps date,
+  amount, payee/account names WITH their ids, doc number, memo and the
+  categorization lines. Full fidelity is one `qbo_get_purchase` away.
+  The same range with `format: "raw"` is 123,152 chars and is refused by name.
 - Live books, 2026-05-01..2026-06-30: 62 rows, 52,180 chars before → 19,789
   after (2.6x), one page. Roughly 120-180 rows per page at those memo lengths.
 - `qbo_reconcile_worksheet` truncates the *listing* (never the balances or the

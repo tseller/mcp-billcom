@@ -2,17 +2,24 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCursorList, slimTransaction } from "./divvy-rows.js";
 import { FILTER_SPECS, FilterCheck, billFilterParam } from "./divvy-filters.js";
-import type { DivvyClient } from "./divvy-client.js";
+import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
 import { MAX_RESULT_CHARS, compact, overBudget } from "./result-size.js";
 import { runTool, type ToolResult } from "./tool-logging.js";
 import {
-  CURSOR_PAGING,
   CURSOR_PAGING_NARROWING,
   LIST_PAGING,
   LIST_PAGING_NARROWING,
   cursorNarrowing,
+  cursorPaging,
 } from "./tools/list-paging.js";
+import {
+  BILL_CURSOR_PARAM,
+  BILL_MAX_PAGE_SIZE,
+  BILL_PAGE_SIZE_PARAM,
+  MAX_BILL_PAGES_PER_CALL,
+  billPagingLimits,
+} from "./divvy-paging.js";
 
 /**
  * A BILL Spend & Expense transaction in the shape the list endpoint returns —
@@ -227,8 +234,12 @@ test("every narrowing sentence names only parameters of its own paging shape", (
   const cases: Array<[string, Record<string, unknown>, string[]]> = [
     // sentence, schema shape, response fields it may also name
     [LIST_PAGING_NARROWING, LIST_PAGING, ["nextStartPosition"]],
-    [CURSOR_PAGING_NARROWING, CURSOR_PAGING, ["nextPage"]],
-    [cursorNarrowing({ format: false }), { page: 1, pageSize: 1 }, ["nextPage"]],
+    [CURSOR_PAGING_NARROWING, cursorPaging(billPagingLimits("transactions")), ["nextPage"]],
+    [
+      cursorNarrowing({ format: false }),
+      cursorPaging(billPagingLimits("customFieldValues"), { format: false }),
+      ["nextPage"],
+    ],
   ];
   for (const [sentence, shape, responseFields] of cases) {
     const named = [...sentence.matchAll(/`([A-Za-z]+)(?::[^`]*)?`/g)].map((m) => m[1]);
@@ -386,7 +397,7 @@ const listResult = async (
  */
 test("every filter the tool advertises is declared with how it is checked", () => {
   const { schema } = registeredTools({})!.get("divvy_list_transactions")!;
-  const paging = new Set(Object.keys(CURSOR_PAGING));
+  const paging = new Set(Object.keys(cursorPaging(billPagingLimits("transactions"))));
   const advertised = Object.keys(schema).filter((k) => !paging.has(k));
   assert.ok(advertised.length > 0);
   for (const name of advertised) {
@@ -416,7 +427,11 @@ test("the tool sends BILL one filter parameter and reports how each filter lande
     },
   };
   const { handler } = registeredTools(client).get("divvy_list_transactions")!;
-  const result = await listResult(handler, { startDate: "2026-05-01", endDate: "2026-06-30" });
+  const result = await listResult(handler, {
+    startDate: "2026-05-01",
+    endDate: "2026-06-30",
+    pageSize: 3,
+  });
 
   assert.equal(calls.length, 1, "the healthy path is one BILL call");
   assert.equal(calls[0].filters, "occurredTime:gte:2026-05-01,occurredTime:lte:2026-07-01");
@@ -480,6 +495,183 @@ test("the walk is bounded — an always-ignored filter stops rather than paging 
   assert.equal(result.returned, 0);
   // Zero rows, and the reason stated — not an empty answer with no explanation.
   assert.match(String((result.filtering as Record<string, string>).endDate), /not being honored/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Page size (issue #24): a knob the tool advertises must be one BILL
+ * will honor — and `pageSize` is rows, not BILL pages.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The bug. `pageSize` was an unbounded string handed straight to BILL, whose
+ * `max` on /v3/spend/transactions stops at 50, so a caller asking for a
+ * fiscal year at `pageSize: "100"` got BILL's raw
+ * `400 max: must be less than or equal to 50` — a limit the code knew (it had
+ * its own `BILL_MAX_PAGE_SIZE = 50` a few lines away) and the schema did not.
+ */
+test("an ask bigger than one BILL page returns rows, by walking BILL's cursor", async () => {
+  const asked: string[] = [];
+  const client = {
+    listTransactions: async (p: { pageSize?: string; page?: string }) => {
+      asked.push(String(p.pageSize));
+      const n = Number(p.pageSize);
+      return { results: page(n), nextPage: `cursor-${asked.length + 1}` };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, { pageSize: 100 });
+
+  // Two BILL calls, neither of them asking for more than BILL allows.
+  assert.deepEqual(asked, ["50", "50"]);
+  assert.equal(result.returned, 100);
+  assert.equal(result.billPages, 2);
+  assert.equal(result.nextPage, "cursor-3");
+});
+
+/**
+ * Asking BILL for exactly the rows still wanted is what makes `pageSize` mean
+ * rows: the page ends on a BILL page boundary, so `returned` cannot exceed the
+ * ask and the cursor handed back cannot skip rows this call already held.
+ */
+test("a partial page is asked of BILL as a partial page, so returned never exceeds pageSize", async () => {
+  const asked: string[] = [];
+  const client = {
+    listTransactions: async (p: { pageSize?: string }) => {
+      asked.push(String(p.pageSize));
+      return { results: page(Number(p.pageSize)), nextPage: "more" };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, { pageSize: 70 });
+
+  assert.deepEqual(asked, ["50", "20"]);
+  assert.equal(result.returned, 70);
+  assert.equal(result.billPages, 2);
+  assert.equal(result.nextPage, "more");
+});
+
+/** The default is one BILL page's worth, so the everyday call stays one call. */
+test("no pageSize means one BILL page, asked for at BILL's own maximum", async () => {
+  const asked: string[] = [];
+  const client = {
+    listTransactions: async (p: { pageSize?: string }) => {
+      asked.push(String(p.pageSize));
+      return { results: page(50), nextPage: "more" };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, {});
+  assert.deepEqual(asked, [String(BILL_MAX_PAGE_SIZE.transactions)]);
+  assert.equal(result.returned, 50);
+});
+
+/**
+ * The walk is bounded by what a tool result can carry as well as by the page
+ * count: rows past the budget would be dropped by `packRows` anyway, so
+ * fetching them is BILL calls spent on nothing.
+ */
+test("the walk stops once the rows in hand already fill the result budget", async () => {
+  let calls = 0;
+  const client = {
+    listTransactions: async (p: { pageSize?: string }) => {
+      calls += 1;
+      return { results: page(Number(p.pageSize)), nextPage: `cursor-${calls + 1}` };
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_transactions")!;
+  const result = await listResult(handler, { pageSize: 500 });
+
+  assert.ok(calls < MAX_BILL_PAGES_PER_CALL, `spent ${calls} BILL calls on a budget-bound page`);
+  assert.equal(result.truncatedBy, "size");
+  assert.ok(compact(result).length <= MAX_RESULT_CHARS);
+});
+
+/**
+ * The schema and BILL's limit are one fact, so the schema is generated from
+ * the declaration rather than restating it. An ask past what the tool can
+ * serve is refused by the schema, in a sentence naming BILL's page size —
+ * before the call, not as a backend 400 after it.
+ */
+test("pageSize is bounded by what the tool can actually serve, and says where the bound comes from", () => {
+  const { schema } = registeredTools({}).get("divvy_list_transactions")!;
+  const limits = billPagingLimits("transactions");
+  const pageSize = schema.pageSize as {
+    safeParse(v: unknown): { success: boolean; error?: { issues: Array<{ message: string }> } };
+    description?: string;
+  };
+
+  assert.equal(pageSize.safeParse(limits.maxRows).success, true);
+  const tooBig = pageSize.safeParse(limits.maxRows + 1);
+  assert.equal(tooBig.success, false);
+  assert.match(tooBig.error!.issues[0].message, new RegExp(String(limits.billPageSize)));
+  // The 400 the issue reported is inside the bound now — it is served, not refused.
+  assert.equal(pageSize.safeParse(100).success, true);
+  // Callers (and BILL) spell it as a string; the schema coerces rather than refusing.
+  assert.equal(pageSize.safeParse("100").success, true);
+  assert.equal(pageSize.safeParse(0).success, false);
+  assert.match(String(pageSize.description), new RegExp(`max ${limits.maxRows}`));
+});
+
+/**
+ * The structural pin, and the regression test for the second bug this found:
+ * `divvy_list_custom_field_values` spelled BILL's cursor and page size `page`
+ * and `page_size`. BILL reads neither — it answers 200 and ignores them — so
+ * that list returned its first 20 values whatever cursor it was given. Probed
+ * live 2026-09-18: `?page_size=5` returns the same 20 rows as no parameter at
+ * all, and `?page=<cursor>` returns page one again.
+ *
+ * Every paged BILL call now goes through one method, so the query parameters
+ * are checked here once for all of them.
+ */
+test("every paged BILL call spells the cursor and page size the way BILL reads them", async () => {
+  const urls: URL[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string) => {
+    urls.push(new URL(String(url)));
+    return { ok: true, json: async () => ({ results: [], nextPage: undefined }) } as Response;
+  }) as typeof globalThis.fetch;
+  try {
+    const client = new DivvyClient("token");
+    await client.listTransactions({ page: "c1", pageSize: "50", filters: "x:eq:y" });
+    await client.listCards({ page: "c2", pageSize: "100" });
+    await client.listBudgetsPage({ page: "c3", pageSize: "100" });
+    await client.listCustomFieldValues("cf_1", { page: "c4", pageSize: "100" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assert.equal(urls.length, 4);
+  for (const [i, url] of urls.entries()) {
+    assert.equal(url.searchParams.get(BILL_CURSOR_PARAM), `c${i + 1}`);
+    assert.ok(url.searchParams.get(BILL_PAGE_SIZE_PARAM), `no ${BILL_PAGE_SIZE_PARAM} on ${url}`);
+    // The names BILL answers 200 to and ignores.
+    for (const dead of ["page", "page_size", "start_date", "budget_id"]) {
+      assert.equal(url.searchParams.get(dead), null, `${url.pathname} still sends \`${dead}\``);
+    }
+  }
+});
+
+test("the custom-field values list pages — and its pageSize is bounded too", async () => {
+  const asked: Array<{ page?: string; pageSize?: string }> = [];
+  const client = {
+    listCustomFieldValues: async (_id: string, p: { page?: string; pageSize?: string }) => {
+      asked.push(p);
+      return { results: [{ id: "v1", value: "NAP-100" }], nextPage: "next-cursor" };
+    },
+  };
+  const { schema, handler } = registeredTools(client).get("divvy_list_custom_field_values")!;
+  const result = await listResult(handler, { customFieldId: "cf_1", page: "cursor-2", pageSize: 1 });
+
+  assert.deepEqual(asked, [{ page: "cursor-2", pageSize: "1" }]);
+  assert.equal(result.nextPage, "next-cursor");
+  assert.equal((result.results as unknown[]).length, 1);
+
+  const limits = billPagingLimits("customFieldValues");
+  const pageSize = schema.pageSize as { safeParse(v: unknown): { success: boolean } };
+  assert.equal(pageSize.safeParse(limits.maxRows).success, true);
+  assert.equal(pageSize.safeParse(limits.maxRows + 1).success, false);
+  // This list has no `format`, and must not be given one it does not implement.
+  assert.equal(schema.format, undefined);
 });
 
 test("with no filters set, nothing is sent to BILL and nothing is claimed", async () => {

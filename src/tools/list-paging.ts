@@ -76,21 +76,64 @@ export const OFFSET_PAGING_NARROWING =
  * BILL's opaque `nextPage` cursor rather than a row offset, so `page` keeps
  * its own name instead of masquerading as `startPosition`.
  *
- * `pageSize` stays a string because BILL's `max` query parameter is one.
+ * `pageSize` is **bounded**, and the bound comes from the caller rather than
+ * being written here, because it is a fact about one BILL endpoint: its own
+ * page maximum differs per list (50 on transactions, 100 on cards, budgets and
+ * custom-field values) and is declared once in `src/divvy-paging.ts`. It was
+ * an unbounded string, passed straight through, so `pageSize: "100"` on the
+ * transaction list surfaced as BILL's raw `400 max: must be less than or equal
+ * to 50` — a knob the tool advertised and the backend refused (issue #24).
+ *
+ * The bound is not BILL's page size, though: `pageSize` is how many ROWS the
+ * caller wants back, and an ask spanning several BILL pages is served by
+ * walking its cursor (`walkBillPages`). So the number here is the largest ask
+ * this tool can actually attempt, and the sentence says where it comes from —
+ * the limit is visible before the call rather than after a 400.
+ *
+ * It stays permissive about type: BILL's `max` is a string and callers have
+ * been passing `"50"`, so the schema coerces rather than rejecting it.
  */
-export const CURSOR_PAGING = {
-  page: z
-    .string()
-    .optional()
-    .describe("Page cursor for the next page — the `nextPage` value from the previous response."),
-  pageSize: z.string().optional().describe("Number of results per page."),
-  format: z
-    .enum(["rows", "raw"])
-    .optional()
-    .describe(
-      "`rows` (default) returns one flattened row per record. `raw` returns BILL's full objects — several times larger, and rejected outright if it exceeds the size budget.",
-    ),
-} as const;
+export interface CursorPagingLimits {
+  /** BILL's own maximum for one page of this list. */
+  billPageSize: number;
+  /** The largest row count one call can attempt. */
+  maxRows: number;
+  /** BILL pages one call may walk. */
+  maxPages: number;
+}
+
+export const cursorPaging = (
+  { billPageSize, maxRows, maxPages }: CursorPagingLimits,
+  { format = true }: { format?: boolean } = {},
+) =>
+  ({
+    page: z
+      .string()
+      .optional()
+      .describe("Page cursor for the next page — the `nextPage` value from the previous response."),
+    pageSize: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(
+        maxRows,
+        `pageSize must be ${maxRows} or fewer rows: BILL's own page holds ${billPageSize}, and one call walks at most ${maxPages} of them.`,
+      )
+      .optional()
+      .describe(
+        `Rows to return (default ${billPageSize}, max ${maxRows}). BILL's own page holds ${billPageSize}; a larger ask is served by walking its cursor here, not refused. The response is also capped by a size budget, whichever is smaller — so a page can return fewer rows than this.`,
+      ),
+    ...(format
+      ? {
+          format: z
+            .enum(["rows", "raw"])
+            .optional()
+            .describe(
+              "`rows` (default) returns one flattened row per record. `raw` returns BILL's full objects — several times larger, and rejected outright if it exceeds the size budget.",
+            ),
+        }
+      : {}),
+  }) as const;
 
 /**
  * Over-budget advice for the cursor tools — the knobs BILL actually has.

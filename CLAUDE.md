@@ -339,6 +339,53 @@ Two traps worth knowing:
 Run revision and the policy — so "which versions does prod speak?" is a curl,
 not a deploy or a log dig.
 
+## Pre-session requests
+
+Every current Claude client generation opens a conversation by POSTing
+`server/discover` to `/mcp` with no session. `/mcp` required the first request
+on a new session to be `initialize`, so it answered `400` with
+`{"error":"First request must be an initialize request"}` — not a JSON-RPC
+message at all (no `jsonrpc`, no `id`, no numeric code), so nothing in it a
+client could act on. 31 of those in one production day (2026-09-17T08:11Z ..
+2026-09-18T08:11Z), across three client families; never user-visible only
+because the clients fall back to `initialize` on their own. The whole
+mitigation was the client happening to retry (#21).
+
+`server/discover` is not a quirk of Tim's connector. It is a **GA'd method of
+MCP revision `2026-07-28`** — the revision those clients announce in
+`MCP-Protocol-Version` — whose spec says servers **MUST** implement it. No
+released `@modelcontextprotocol/sdk` does: 1.30.0 (latest as of 2026-09-18)
+speaks `2025-11-25` at the newest and the string `server/discover` appears
+nowhere in the package. Upgrading the SDK does not fix this, and the client is
+not misbehaving.
+
+We **answer** it rather than implement it, deliberately. `server/discover`
+returns a `DiscoverResult`, which in the spec's own era model is the signal
+"this is a *modern* server" — one that serves requests statelessly with
+per-request `_meta` and no handshake. This build cannot serve a single modern
+request, so answering a `DiscoverResult` would advertise an era we can't honor
+and push a dual-era client *away* from the handshake that works. Instead
+`src/pre-session.ts` answers the body the spec's own HTTP backward-compat rule
+tells a client to read ("on `400`, inspect the response body before falling
+back… if it is not a recognized modern JSON-RPC error, fall back to
+`initialize`"): a JSON-RPC `-32601` naming the method, `era: "legacy"`,
+`handshake: "initialize"`, the versions we do speak, and a sentence saying what
+to send. The client's recovery is now something we told it, not something it
+guessed.
+
+The fix is not a case for `server/discover`. Every way `/mcp` turns a request
+away before it reaches a session goes through the one module and answers in
+JSON-RPC — an unimplemented method (`-32601`), a body that names no method or a
+notification with nowhere to go (`-32600`), an expired/unknown session
+(`404`/`-32001`, matching the shape the SDK's own transport sends) and a
+missing `Mcp-Session-Id`. So next year's pre-session method is answered without
+a code change. Each answer also carries a `reason`, which the rejection logger
+prints as `why=` — the log line and the response body are two views of one
+decision rather than two texts that can drift.
+
+`GET /health` states `protocol.era` and `protocol.preSessionMethodPolicy`, so a
+client (or a person) can learn which era prod is without provoking a refusal.
+
 ## Environment Variables
 
 ### QuickBooks Online (optional — tools enabled if all are set)

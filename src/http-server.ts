@@ -29,6 +29,22 @@ import {
   reconcileProtocolVersion,
   setRequestHeader,
 } from "./protocol-version.js";
+import {
+  answerMissingSession,
+  answerPreSession,
+  answerUnknownSession,
+  type PreSessionAnswer,
+} from "./pre-session.js";
+
+/**
+ * Send one of `src/pre-session.ts`'s answers, and record its reason where the
+ * rejection logger will pick it up — so the log line and the response body are
+ * two views of the same decision rather than two texts that can disagree.
+ */
+function sendAnswer(res: Response, answer: PreSessionAnswer): void {
+  res.locals.refusalReason = answer.reason;
+  res.status(answer.status).json(answer.body);
+}
 
 export function startHttpServer(qboConfig?: QboConfig): void {
   const transports = new Map<string, StreamableHTTPServerTransport>();
@@ -86,7 +102,8 @@ export function startHttpServer(qboConfig?: QboConfig): void {
           ` rpc=${body?.method ?? "-"}` +
           ` session=${(req.headers["mcp-session-id"] as string) ?? "-"}` +
           ` protocolVersion=${(req.headers["mcp-protocol-version"] as string) ?? "-"}` +
-          ` ua=${req.headers["user-agent"] ?? "-"}`,
+          ` ua=${req.headers["user-agent"] ?? "-"}` +
+          ` why=${(res.locals.refusalReason as string | undefined) ?? "-"}`,
       );
     });
     next();
@@ -156,6 +173,13 @@ export function startHttpServer(qboConfig?: QboConfig): void {
         // A version outside `supported` is no longer refused on an established
         // session: it is reconciled to the version that session negotiated.
         unsupportedHeaderPolicy: "reconcile-to-negotiated",
+        // This server opens sessions with the `initialize` handshake — the
+        // "legacy" era in MCP 2026-07-28's own terms. A modern client can read
+        // that here instead of inferring it from a refusal. See
+        // src/pre-session.ts for why `server/discover` is answered rather than
+        // implemented.
+        era: "legacy",
+        preSessionMethodPolicy: "jsonrpc-error-naming-initialize",
       },
     });
   });
@@ -168,18 +192,21 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       const transport = transports.get(sessionId);
       if (!transport) {
         // 404 per MCP Streamable HTTP spec — signals the client to
-      // start a new session via an initialize request.
-      res.status(404).json({ error: "Session not found" });
+        // start a new session via an initialize request, and the body now
+        // says so in JSON-RPC rather than in a shape nothing parses.
+        sendAnswer(res, answerUnknownSession(sessionId));
         return;
       }
       await transport.handleRequest(req, res, req.body);
       return;
     }
 
-    // New session — must be an initialize request
+    // New session — the handshake is the only thing this era of the protocol
+    // can open one with. Anything else is answered as a JSON-RPC error that
+    // names the way in, never an anonymous 400. See src/pre-session.ts.
     const body = req.body;
     if (!isInitializeRequest(body)) {
-      res.status(400).json({ error: "First request must be an initialize request" });
+      sendAnswer(res, answerPreSession(body));
       return;
     }
 
@@ -236,37 +263,27 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     await transport.handleRequest(req, res, req.body);
   });
 
-  app.get("/mcp", async (req: Request, res: Response) => {
+  // GET (SSE stream) and DELETE (session teardown) only ever act on a session
+  // that already exists, so both refusals are the pre-session answers above.
+  const sessionScoped = async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     if (!sessionId) {
-      res.status(400).json({ error: "Missing mcp-session-id header" });
+      sendAnswer(res, answerMissingSession());
       return;
     }
     const transport = transports.get(sessionId);
     if (!transport) {
       // 404 per MCP Streamable HTTP spec — signals the client to
       // start a new session via an initialize request.
-      res.status(404).json({ error: "Session not found" });
+      sendAnswer(res, answerUnknownSession(sessionId));
       return;
     }
     await transport.handleRequest(req, res);
-  });
+  };
 
-  app.delete("/mcp", async (req: Request, res: Response) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId) {
-      res.status(400).json({ error: "Missing mcp-session-id header" });
-      return;
-    }
-    const transport = transports.get(sessionId);
-    if (!transport) {
-      // 404 per MCP Streamable HTTP spec — signals the client to
-      // start a new session via an initialize request.
-      res.status(404).json({ error: "Session not found" });
-      return;
-    }
-    await transport.handleRequest(req, res);
-  });
+  app.get("/mcp", sessionScoped);
+
+  app.delete("/mcp", sessionScoped);
 
   const port = parseInt(process.env.PORT || "8080", 10);
 

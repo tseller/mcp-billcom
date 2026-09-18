@@ -1,4 +1,10 @@
 import { FilterCheck } from './divvy-filters.js';
+import {
+  BILL_CURSOR_PARAM,
+  BILL_MAX_PAGE_SIZE,
+  BILL_PAGE_SIZE_PARAM,
+  type BillPage,
+} from './divvy-paging.js';
 
 const DIVVY_BASE_URL = 'https://gateway.prod.bill.com/connect';
 
@@ -66,6 +72,27 @@ export class DivvyClient {
   }
 
   /**
+   * One page of any BILL list. Every paged endpoint goes through here so that
+   * the cursor and page-size parameters are spelled once (`nextPage` / `max`,
+   * src/divvy-paging.ts) rather than per method.
+   *
+   * `listCustomFieldValues` used to spell them `page` and `page_size`, which
+   * BILL answers 200 to and ignores — so that list returned its first page
+   * whatever cursor it was given. A name BILL does not read is invisible from
+   * the response, which is exactly why it is no longer a per-method decision.
+   */
+  private async getBillPage<T = Record<string, unknown>>(
+    path: string,
+    params?: { filters?: string; page?: string; pageSize?: string },
+  ): Promise<BillPage<T>> {
+    return this.get(path, {
+      filters: params?.filters,
+      [BILL_CURSOR_PARAM]: params?.page,
+      [BILL_PAGE_SIZE_PARAM]: params?.pageSize,
+    });
+  }
+
+  /**
    * One page of /v3/spend/budgets.
    *
    * Never call this endpoint with no `filters` and treat the answer as "every
@@ -78,12 +105,8 @@ export class DivvyClient {
     filters?: string;
     page?: string;
     pageSize?: string;
-  }): Promise<{ results?: Record<string, unknown>[]; nextPage?: string }> {
-    return this.get('/v3/spend/budgets', {
-      filters: params?.filters,
-      nextPage: params?.page,
-      max: params?.pageSize,
-    });
+  }): Promise<BillPage<Record<string, unknown>>> {
+    return this.getBillPage('/v3/spend/budgets', params);
   }
 
   /** One budget in full, by either spelling of its id. */
@@ -109,12 +132,8 @@ export class DivvyClient {
     filters?: string;
     page?: string;
     pageSize?: string;
-  }): Promise<{ results?: Record<string, unknown>[]; nextPage?: string }> {
-    return this.get('/v3/spend/transactions', {
-      filters: params?.filters,
-      nextPage: params?.page,
-      max: params?.pageSize,
-    });
+  }): Promise<BillPage<Record<string, unknown>>> {
+    return this.getBillPage('/v3/spend/transactions', params);
   }
 
   async getTransaction(transactionId: string): Promise<unknown> {
@@ -124,11 +143,8 @@ export class DivvyClient {
   async listCards(params?: {
     page?: string;
     pageSize?: string;
-  }): Promise<{ results?: Record<string, unknown>[]; nextPage?: string }> {
-    return this.get('/v3/spend/cards', {
-      nextPage: params?.page,
-      max: params?.pageSize,
-    });
+  }): Promise<BillPage<Record<string, unknown>>> {
+    return this.getBillPage('/v3/spend/cards', params);
   }
 
   async listMembers(): Promise<unknown> {
@@ -179,11 +195,8 @@ export class DivvyClient {
   async listCustomFieldValues(
     customFieldId: string,
     params?: { page?: string; pageSize?: string },
-  ): Promise<unknown> {
-    return this.get(`/v3/spend/custom-fields/${customFieldId}/values`, {
-      page: params?.page,
-      page_size: params?.pageSize,
-    });
+  ): Promise<BillPage<Record<string, unknown>>> {
+    return this.getBillPage(`/v3/spend/custom-fields/${customFieldId}/values`, params);
   }
 
   /**
@@ -229,10 +242,10 @@ export class DivvyClient {
     let safety = 50;
     const check = new FilterCheck({ startDate: params?.since });
     do {
-      const resp = (await this.get('/v3/spend/transactions', {
+      const resp = (await this.getBillPage('/v3/spend/transactions', {
         filters: check.billParam,
-        nextPage: cursor,
-        max: '50',
+        page: cursor,
+        pageSize: String(BILL_MAX_PAGE_SIZE.transactions),
       })) as { results?: RawTransaction[]; nextPage?: string };
       const results = check.keep(
         (Array.isArray(resp.results) ? resp.results : []) as unknown as Record<string, unknown>[],

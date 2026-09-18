@@ -61,6 +61,15 @@ export function overBudget(
   );
 }
 
+/**
+ * The share of the budget a page's rows may use, once room is left for the
+ * envelope (header fields and the note) around them. Exported because anything
+ * that gathers rows *before* packing them — walking a backend's cursor, say —
+ * needs the same number to know when gathering more is pointless.
+ */
+export const rowBudget = (budget: number = MAX_RESULT_CHARS): number =>
+  Math.max(1000, budget - 2000);
+
 export interface PagedRows<T> {
   rows: T[];
   offset: number;
@@ -86,7 +95,7 @@ export function packRows<T>(
 ): PagedRows<T> {
   const start = Math.max(0, Math.min(offset, rows.length));
   // Leave room for the envelope (header fields + note) around the rows.
-  const rowBudget = Math.max(1000, budget - 2000);
+  const forRows = rowBudget(budget);
 
   const page: T[] = [];
   let used = 0;
@@ -98,7 +107,7 @@ export function packRows<T>(
       break;
     }
     const size = compact(rows[i]).length + 1; // +1 for the separating comma
-    if (page.length > 0 && used + size > rowBudget) {
+    if (page.length > 0 && used + size > forRows) {
       truncatedBy = "size";
       break;
     }

@@ -6,17 +6,21 @@ import { sniffContentType } from '../mime.js';
 import { buildCursorList, slimTransaction } from '../divvy-rows.js';
 import { FilterCheck } from '../divvy-filters.js';
 import { assembleBudgets } from '../divvy-budgets.js';
-import { CURSOR_PAGING, CURSOR_PAGING_NARROWING, cursorNarrowing } from './list-paging.js';
-
-/** BILL's own maximum for `max` on /v3/spend/transactions. */
-const BILL_MAX_PAGE_SIZE = 50;
+import {
+  BILL_MAX_PAGE_SIZE,
+  billPagingLimits,
+  walkBillPages,
+  type BillListName,
+} from '../divvy-paging.js';
+import { compact, rowBudget } from '../result-size.js';
+import { CURSOR_PAGING_NARROWING, cursorNarrowing, cursorPaging } from './list-paging.js';
 
 /**
- * How many BILL pages one tool call may consume while refilling a page that
- * client-side filtering emptied. A bound, not a target: the loop only walks
- * when rows were actually dropped, so the healthy path is one call.
+ * How many rows the caller wants back, when they did not say. One BILL page's
+ * worth — so the ordinary call is still exactly one call to BILL.
  */
-const MAX_BILL_PAGES_PER_CALL = 10;
+const defaultPageSize = (list: BillListName, asked: unknown): number =>
+  Number(asked) > 0 ? Number(asked) : BILL_MAX_PAGE_SIZE[list];
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.tool(
@@ -33,9 +37,9 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
     'divvy_list_transactions',
     'List Divvy (BILL Spend & Expense) transactions. ' +
       'Returns one flattened row per transaction — date, cardholder, merchant, amount, status, receipt and accounting-sync status, both ids, and the filled custom-field values (NAP CODES, Notes) — plus `pageTotal` for the page. ' +
-      'Paged: when `hasMore` is true, call again with `page: nextPage`. ' +
+      `Paged: when \`hasMore\` is true, call again with \`page: nextPage\`. \`pageSize\` is rows, not BILL pages — BILL's own page holds ${BILL_MAX_PAGE_SIZE.transactions}, and a bigger ask is served by walking its cursor here rather than failing. ` +
       'Every filter is checked against the rows that come back, and `filtering` states per filter how it was enforced — so a filter the backend does not honor drops the rows here and says so, rather than quietly returning the wrong ones. ' +
-      'A filter applied here (rather than by BILL) can make one result span several BILL pages, so `returned` may exceed `pageSize`; `billPages` says how many were consumed. ' +
+      '`billPages` says how many BILL pages one result consumed — more than one when the ask was bigger than a BILL page, or when a filter applied here dropped rows and the page was refilled. ' +
       'Use status:"DECLINED" to surface card declines. ' +
       '`format: "raw"` returns BILL\'s full objects (~2KB of scaffolding each, and rejected outright if the page exceeds the size budget); for one transaction in full, use divvy_get_transaction.',
     {
@@ -61,7 +65,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
         .describe(
           'Filter by transaction status, e.g. CLEARED or DECLINED. BILL has no server-side filter for this one, so it is applied here after fetch.',
         ),
-      ...CURSOR_PAGING,
+      ...cursorPaging(billPagingLimits('transactions')),
     },
     (args) =>
       runTool(
@@ -69,48 +73,44 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
         args,
         async ({ format, page, pageSize, ...filters }) => {
           const check = new FilterCheck(filters);
-          const target = Number(pageSize) > 0 ? Number(pageSize) : BILL_MAX_PAGE_SIZE;
 
-          let cursor = page;
-          let billPages = 0;
-          let kept: Array<Record<string, unknown>> = [];
-          let raw: { results?: Array<Record<string, unknown>>; nextPage?: string } = {};
+          // One BILL call in the ordinary case — the walk stops as soon as it
+          // has the rows asked for. It runs longer for two reasons, and they
+          // are now the same loop: the caller asked for more rows than one
+          // BILL page holds (BILL caps `max` at 50, issue #24), or a filter
+          // BILL did not honor emptied a page and it is refilled from the next
+          // one rather than coming back full of holes.
+          const walked = await walkBillPages<Record<string, unknown>>({
+            list: 'transactions',
+            target: defaultPageSize('transactions', pageSize),
+            page,
+            fetch: (p) => client.listTransactions({ filters: check.billParam, ...p }),
+            keep: (rows) => check.keep(rows),
+            // Measured as the tool will emit it: a flattened row is a sixth of
+            // the raw object, so measuring the wrong one would stop the walk
+            // five pages early.
+            measure: (tx) => compact(format === 'raw' ? tx : slimTransaction(tx)).length,
+            budgetChars: rowBudget(),
+          });
 
-          // One BILL call in the ordinary case. The walk exists for the case
-          // this tool could not previously see: if BILL stops honoring a
-          // filter, rows are dropped here, and a page that is mostly holes is
-          // refilled from the next BILL page instead of coming back near-empty.
-          do {
-            raw = (await client.listTransactions({
-              filters: check.billParam,
-              page: cursor,
-              pageSize,
-            })) as typeof raw;
-            billPages += 1;
-            kept = kept.concat(check.keep(Array.isArray(raw.results) ? raw.results : []));
-            cursor = raw.nextPage;
-          } while (
-            cursor &&
-            check.dropped > 0 &&
-            kept.length < target &&
-            billPages < MAX_BILL_PAGES_PER_CALL
-          );
-
-          // `raw` is BILL's full objects — the size budget in runTool is what
-          // keeps it honest, so there is nothing to guard here.
+          // BILL's full objects — the size budget in runTool is what keeps
+          // this honest, so there is nothing to guard here.
           if (format === 'raw') {
-            return check.any
-              ? { ...raw, results: kept, nextPage: cursor, filtering: check.report() }
-              : raw;
+            return {
+              ...walked.last,
+              results: walked.rows,
+              nextPage: walked.nextPage,
+              ...(check.any ? { filtering: check.report() } : {}),
+            };
           }
           return buildCursorList({
             entity: 'Transaction',
             key: 'transactions',
-            rows: kept.map(slimTransaction),
-            nextPage: cursor,
+            rows: walked.rows.map(slimTransaction),
+            nextPage: walked.nextPage,
             filters,
             filtering: check.any ? check.report() : undefined,
-            billPages,
+            billPages: walked.billPages,
           });
         },
         { narrowing: CURSOR_PAGING_NARROWING },
@@ -187,18 +187,32 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
 
   server.tool(
     'divvy_list_custom_field_values',
-    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label. Paginated — use page (from nextPage in the previous response) and pageSize to walk the full list.',
+    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label. ' +
+      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFieldValues}, BILL's own page maximum), and when \`nextPage\` comes back, call again with \`page: nextPage\`.`,
     {
       customFieldId: z.string().describe('Custom field ID from divvy_list_custom_fields'),
-      page: z.string().optional().describe('Page cursor from the previous response\'s nextPage'),
-      pageSize: z.string().optional().describe('Results per page (default per BILL API)'),
+      ...cursorPaging(billPagingLimits('customFieldValues'), { format: false }),
     },
     (args) =>
       runTool(
         'divvy_list_custom_field_values',
         args,
-        ({ customFieldId, page, pageSize }) =>
-          client.listCustomFieldValues(customFieldId, { page, pageSize }),
+        // This list could not page before: it spelled BILL's parameters `page`
+        // and `page_size`, which BILL answers 200 to and ignores, so it
+        // returned its first 20 values whatever was asked (see
+        // src/divvy-paging.ts). The walk is the same one the transaction list
+        // uses, so `pageSize` means rows here too.
+        async ({ customFieldId, page, pageSize }) => {
+          const walked = await walkBillPages<Record<string, unknown>>({
+            list: 'customFieldValues',
+            target: defaultPageSize('customFieldValues', pageSize),
+            page,
+            fetch: (p) => client.listCustomFieldValues(customFieldId, p),
+            measure: (v) => compact(v).length,
+            budgetChars: rowBudget(),
+          });
+          return { ...walked.last, results: walked.rows, nextPage: walked.nextPage };
+        },
         { narrowing: cursorNarrowing({ format: false }) },
       ),
   );

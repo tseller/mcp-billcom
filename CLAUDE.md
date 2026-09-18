@@ -41,7 +41,7 @@ gcloud config configurations activate mcp-billcom
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts (flattened rows + paging), account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors (both flattened rows + paging), create_vendor
-- `src/tools/list-paging.ts` — the paging vocabularies, each paired with the sentence that names its knobs when a result is over budget (so advice and schema can't drift): `listPaging(defaultMaxResults)` (`startPosition`/`maxResults`/`format`, the QBO entity queries), `OFFSET_PAGING_NARROWING` (the `offset`/`limit` report tools) and `CURSOR_PAGING` (`page`/`pageSize`/`format`, BILL's opaque cursor)
+- `src/tools/list-paging.ts` — the paging vocabularies, each paired with the sentence that names its knobs when a result is over budget (so advice and schema can't drift): `listPaging(defaultMaxResults)` (`startPosition`/`maxResults`/`format`, the QBO entity queries), `OFFSET_PAGING_NARROWING` (the `offset`/`limit` report tools) and `cursorPaging(limits)` (`page`/`pageSize`/`format`, BILL's opaque cursor — the `pageSize` bound comes from `src/divvy-paging.ts` rather than being restated here)
 - `src/tools/qbo-transactions.ts` — QBO: list/get/update/create purchases; list/get/create/update deposits (single + batch); list/create transfers; create journal entries; attach/list files. Create tools accept an optional `idempotencyKey`; update tools fetch-then-merge fields QBO requires on full-entity validation (PaymentType/AccountRef on Purchase, DepositToAccountRef on Deposit). The three list tools return **flattened rows** and **page by size as well as row count** — see "Tool result size" below
 - `src/qbo-rows.ts` — the flattened row shapes for every list tool (`slimPurchase`/`slimDeposit`/`slimTransfer`/`slimAccount`/`slimVendor`) plus `buildEntityList()`, which packs one page and states `rowCount` / `hasMore` / `nextStartPosition`. `sumField: null` omits `pageTotal` for a listing where a per-page sum states nothing true (a chart of accounts adds assets to liabilities)
 - `src/tool-logging.ts` — `runTool()`, the single response path every tool goes through: start/finish logging, `compact()` serialization, and the result-size budget. A handler returns plain data (or a string) and never builds an MCP response itself
@@ -56,6 +56,7 @@ gcloud config configurations activate mcp-billcom
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions (flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, cards, members, budgets, list_pending_action
 - `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
+- `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets and custom-field values 100, each probed), and `walkBillPages()`, which serves a caller's row count by walking BILL's cursor. Every paged BILL call goes through `DivvyClient.getBillPage` — see "Page size" below
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
 - `src/divvy-rows.ts` — the flattened Divvy row (`slimTransaction`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
@@ -153,7 +154,8 @@ What this means in practice:
   other field means what it does on the QBO lists. When `truncatedBy` is
   `size` the cursor is **withheld**: it points past the whole BILL page, so
   following it would skip the rows the budget dropped — the note says to
-  re-request the same `page` with a smaller `pageSize`.
+  re-request the same `page` with a smaller `pageSize`. `pageSize` is rows and
+  is bounded by BILL's own page maximum times the walk cap — see "Page size".
 - `qbo_reconcile_worksheet` truncates the *listing* (never the balances or the
   verdict) with an explicit note pointing at the paged tool.
 - `qbo_profit_loss` / `qbo_balance_sheet` are hierarchical with nothing sane to
@@ -224,11 +226,10 @@ Traps worth knowing:
   `syncStatus`, so the row this tool advertises as carrying a sync status
   carried none until `slimTransaction` was pointed at the nested record.
 - When client-side filtering empties a page, the tool walks BILL's cursor to
-  refill it, bounded at 10 BILL pages per call and entered **only** when rows
-  were actually dropped — so the healthy path is still one BILL call. The
-  result states `billPages` when more than one was consumed. One consequence:
-  `returned` can **exceed** `pageSize`, because a result may span more than one
-  BILL page and a partial BILL page has no cursor to hand back.
+  refill it, so a page made mostly of holes does not come back near-empty. That
+  is the same walk a `pageSize` bigger than one BILL page uses (see "Page size"
+  below), bounded at 10 BILL pages per call; the result states `billPages` when
+  more than one was consumed.
 
 Live books, measured on revision `billcom-mcp-00064-rnq`. Asking for
 2026-05-01..2026-06-30 returned 50 rows dated 2026-08-02..2026-09-16 (all 50
@@ -238,6 +239,62 @@ and none outside. Walked to the last page, the row count grows with the range �
 where before every one of those asks returned the same newest 50 rows. A
 single-day ask (`2026-06-26`..`2026-06-26`) returns the one transaction that
 day, which is the midnight-`lte` trap above.
+
+## Page size
+
+A knob a tool advertises has to be one the backend will honor.
+
+`divvy_list_transactions` took `pageSize` as an unbounded string and handed it
+straight to BILL, whose `max` on `/v3/spend/transactions` stops at 50. So
+`{"startDate":"2025-07-01","endDate":"2026-06-30","pageSize":"100"}` came back
+as BILL's raw `400 max: must be less than or equal to 50` (issue #24) — a limit
+the code already knew, since the same file held its own `BILL_MAX_PAGE_SIZE = 50`
+a few lines away, used for something else. The fact was in the code and not in
+the schema, and `divvy-budgets.ts` held three more copies of it as string
+literals.
+
+Sweeping for the same shape turned up a second, quieter instance. That tool
+spelled BILL's two paging parameters `page` and `page_size`
+(`divvy_list_custom_field_values`), and **BILL reads neither name** — it answers
+200 and ignores them, which is issue #29's failure mode a fourth time. Probed on
+live books 2026-09-18:
+
+| ask | result |
+| --- | --- |
+| `?page_size=5` | 20 rows — identical to no parameter at all |
+| `?max=5` | 5 rows |
+| `?page=<cursor>` | the **first** page again, forever |
+| `?nextPage=<cursor>` | the actual next page |
+
+So that tool could not page: every call returned the same first 20 NAP codes.
+
+`src/divvy-paging.ts` is where those facts now live, once:
+
+- `BILL_CURSOR_PARAM` / `BILL_PAGE_SIZE_PARAM` — `nextPage` and `max`. Every
+  paged BILL call goes through `DivvyClient.getBillPage`, so a method cannot
+  invent a third spelling; a test asserts all four listings send those names
+  and none of the dead ones.
+- `BILL_MAX_PAGE_SIZE` — BILL's own maximum per endpoint, probed rather than
+  assumed (it validates `max`, so the 400 is the boundary): transactions **50**,
+  cards **100**, budgets **100**, custom-field values **100**. `divvy-budgets.ts`
+  reads its three page sizes from here instead of restating them.
+- `billPagingLimits(list)` — what the schema advertises, so the number in the
+  description and the number enforced are the same number.
+
+And `pageSize` is **rows, not BILL pages**. BILL's page is a transport detail,
+so an ask larger than one is served by `walkBillPages()` — which requests
+exactly the rows still wanted (never more than BILL's maximum) and follows
+`nextPage` — rather than by a 400 the caller has to learn to loop around. Two
+consequences worth knowing:
+
+- Because each request asks for exactly what is left, a page ends on a BILL
+  page boundary: `returned` can no longer exceed `pageSize`, and the cursor
+  handed back cannot skip rows the call already held. (It used to be able to
+  exceed it, for that reason.)
+- The walk stops as soon as it has the rows asked for, so the everyday call is
+  still exactly one BILL call. It is also bounded by the result-size budget, not
+  just by the 10-page cap: rows past the budget would be dropped by `packRows`
+  anyway, so a `pageSize: 500` ask spends 3 BILL calls rather than 10.
 
 ## Budgets
 

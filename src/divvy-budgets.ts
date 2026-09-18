@@ -28,6 +28,7 @@
  * same discipline for the zero-row case).
  */
 
+import { BILL_MAX_PAGE_SIZE } from "./divvy-paging.js";
 import { describeEmpty, type Witness } from "./empty-listing.js";
 
 export type Raw = Record<string, unknown>;
@@ -67,9 +68,13 @@ interface BudgetRef {
  */
 const MAX_CARD_PAGES = 5;
 const MAX_TRANSACTION_PAGES = 4;
-const TRANSACTION_PAGE_SIZE = "50";
-const CARD_PAGE_SIZE = "100";
-const BUDGET_PAGE_SIZE = "100";
+// BILL's own page maximum per endpoint, declared once in src/divvy-paging.ts —
+// these were three literals here, a fourth in the transaction tool and nothing
+// at all in the schemas, which is how `pageSize: "100"` on a list BILL caps at
+// 50 became a raw backend 400 (issue #24).
+const TRANSACTION_PAGE_SIZE = String(BILL_MAX_PAGE_SIZE.transactions);
+const CARD_PAGE_SIZE = String(BILL_MAX_PAGE_SIZE.cards);
+const BUDGET_PAGE_SIZE = String(BILL_MAX_PAGE_SIZE.budgets);
 const MAX_BUDGET_PAGES = 10;
 /** How many discovered budgets are read back by id in one call. */
 const MAX_READBACK = 100;

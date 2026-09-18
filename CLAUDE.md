@@ -296,6 +296,19 @@ consequences worth knowing:
   just by the 10-page cap: rows past the budget would be dropped by `packRows`
   anyway, so a `pageSize: 500` ask spends 3 BILL calls rather than 10.
 
+Live books, measured on revision `billcom-mcp-00068-qvc`. The issue's own call —
+a fiscal year at `pageSize: "100"` — was BILL's raw
+`400 max: must be less than or equal to 50`; it now returns **86 rows**
+(`billPages: 2`, `hasMore: false` — the whole range), 34,364 chars in 1.9s.
+`pageSize: "500"` returns 118 rows over **3** BILL pages (not 10), 38,261 chars,
+`truncatedBy: "size"`. `pageSize: "501"` is refused by the schema before any
+BILL call, with `pageSize must be 500 or fewer rows: BILL's own page holds 50,
+and one call walks at most 10 of them.` `divvy_list_custom_field_values`
+returns all **72** NAP codes in one call (9,204 chars) where it returned the
+same first 20 forever, and `page: nextPage` advances (`Ads/Social Media…` →
+`Bank and Credit Card Fees`) instead of repeating page one. The default
+transaction call is unchanged at 50 rows / one BILL page / 15,466 chars.
+
 ## Budgets
 
 `divvy_list_budgets` returned `{"results":[]}` on books where almost every

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
-import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
-import { McpServer, isInitializeRequest } from "@modelcontextprotocol/server";
+import { NodeStreamableHTTPServerTransport, toNodeHandler } from "@modelcontextprotocol/node";
+import type { InboundLegacyRouteReason } from "@modelcontextprotocol/server";
+import { McpServer, createMcpHandler, isInitializeRequest } from "@modelcontextprotocol/server";
 import express from "express";
 import type { QboConfig } from "./qbo-client.js";
 import { QboClient } from "./qbo-client.js";
@@ -34,6 +35,8 @@ import {
   answerUnknownSession,
   type PreSessionAnswer,
 } from "./pre-session.js";
+import { cachedDiscoverReading } from "./discover.js";
+import { routeEra } from "./era-routing.js";
 
 /**
  * Send one of `src/pre-session.ts`'s answers, and record its reason where the
@@ -70,6 +73,59 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   const firestore = new FirestoreOAuthStore(gcpProjectId);
   const idempotency = new IdempotencyStore(firestore);
   const gmail = gmailClientFromEnv();
+
+  /**
+   * One fresh server instance with every tool on it.
+   *
+   * Both eras are served from this one factory, which is the point: a tool
+   * registered here is reachable from a 2025 client through the sessionful
+   * legacy transport and from a 2026 client through the per-request modern
+   * handler, with no second registration list to keep in step.
+   */
+  const buildServer = (): McpServer => {
+    const server = new McpServer(
+      { name: "treasurer-mcp", version: "0.2.0" },
+      { capabilities: { tools: {} } },
+    );
+
+    if (qboClient) {
+      registerQboAccountTools(server, qboClient);
+      registerQboVendorTools(server, qboClient);
+      registerQboTransactionTools(server, qboClient, { idempotency, gmail });
+      registerQboReportTools(server, qboClient);
+      registerQboReconcileTools(server, qboClient);
+      registerQboClassTools(server, qboClient, { idempotency });
+      registerQboClassReportTools(server, qboClient);
+      registerQboClassWriteTools(server, qboClient);
+      registerQboBudgetTools(server, qboClient);
+    }
+
+    const divvyToken = process.env.DIVVY_API_TOKEN;
+    if (divvyToken) {
+      registerDivvyTools(server, new DivvyClient(divvyToken));
+    }
+
+    return server;
+  };
+
+  /**
+   * The modern leg: MCP revision 2026-07-28, served per request.
+   *
+   * `legacy: "reject"` because the legacy leg below is *sessionful* and keeps
+   * its own sessions, event stream and teardown. `createMcpHandler`'s built-in
+   * legacy posture is stateless-per-request, which would answer a client's GET
+   * and DELETE with `405` and silently drop the sessions this deployment's
+   * clients already hold. So the two legs are routed in front of, rather than
+   * folded into, one another — the arrangement the SDK's own
+   * `isLegacyRequest` recipe describes for exactly this case.
+   */
+  const modern = createMcpHandler(() => buildServer(), { legacy: "reject" });
+  const modernNode = toNodeHandler(modern, {
+    onerror: (error) => console.error(`[http] modern handler error: ${error.message}`),
+  });
+
+  /** What the modern leg advertises, read from the modern leg. See discover.ts. */
+  const discoverReading = cachedDiscoverReading((request) => modern.fetch(request));
 
   // Build the Express app ourselves so we control the JSON body limit.
   // The SDK's createMcpExpressApp hard-codes express.json() at express's
@@ -108,27 +164,6 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     next();
   });
 
-  // Reconcile the client's MCP-Protocol-Version header against the version
-  // this session actually negotiated, so a client that announces a version we
-  // don't speak is answered rather than refused. See protocol-version.ts.
-  app.use("/mcp", (req: Request, _res: Response, next) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const header = req.headers["mcp-protocol-version"] as string | undefined;
-    const decision = reconcileProtocolVersion(
-      header,
-      sessionId ? negotiatedVersions.get(sessionId) : undefined,
-    );
-    if (decision.action === "replace") {
-      setRequestHeader(req, "MCP-Protocol-Version", decision.value);
-      console.error(
-        `[http] protocol-version reconciled session=${sessionId}` +
-          ` client=${header} negotiated=${decision.value}` +
-          ` ua=${req.headers["user-agent"] ?? "-"}`,
-      );
-    }
-    next();
-  });
-
   app.use(express.json({ limit: "25mb" }));
 
   // Mount OAuth routes if Google credentials are configured
@@ -147,6 +182,68 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     console.error("[http] OAuth disabled (no GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET)");
   }
 
+  // --- The era fork ---
+  //
+  // One URL, two eras. Which one a request belongs to is decided once, here,
+  // by the SDK's own classifier — the same step `createMcpHandler` performs
+  // internally — so this branch cannot disagree with how either leg would
+  // have handled the request. A modern-enveloped request is served by the
+  // modern handler and never reaches the session machinery below; everything
+  // else continues to the sessionful legacy leg exactly as before.
+  //
+  // Mounted after `express.json()` (the classifier reads the body) and after
+  // the bearer check (both legs are equally protected; an unauthorized request
+  // is refused before either sees it).
+  app.use("/mcp", async (req: Request, res: Response, next) => {
+    const route = routeEra({
+      httpMethod: req.method,
+      sessionId: req.headers["mcp-session-id"] as string | undefined,
+      protocolVersionHeader: req.headers["mcp-protocol-version"] as string | undefined,
+      mcpMethodHeader: req.headers["mcp-method"] as string | undefined,
+      mcpNameHeader: req.headers["mcp-name"] as string | undefined,
+      body: req.body,
+    });
+
+    if (route.leg === "modern") {
+      // The modern era answers its own errors, including the ones for a
+      // malformed modern claim — the SDK's rule is that every non-legacy
+      // request is the modern path's to answer.
+      if (route.reason === "malformed-modern") {
+        res.locals.refusalReason = `modern claim rejected at ${route.rung} (${route.cell})`;
+      }
+      await modernNode(req, res, req.body);
+      return;
+    }
+
+    // Legacy-era traffic. Carry the routing reason forward so the pre-session
+    // answer and the log line explain the branch that was actually taken
+    // rather than a second guess at it.
+    res.locals.legacyRouteReason = route.reason;
+
+    // Reconcile the client's MCP-Protocol-Version header against the version
+    // this session actually negotiated, so a client that announces a version we
+    // don't speak is answered rather than refused. See protocol-version.ts.
+    // Legacy-only by construction: the modern era has no negotiated session
+    // version to reconcile a header against, and its header is validated
+    // against the body by the handler above.
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const header = req.headers["mcp-protocol-version"] as string | undefined;
+    const decision = reconcileProtocolVersion(
+      header,
+      sessionId ? negotiatedVersions.get(sessionId) : undefined,
+    );
+    if (decision.action === "replace") {
+      setRequestHeader(req, "MCP-Protocol-Version", decision.value);
+      console.error(
+        `[http] protocol-version reconciled session=${sessionId}` +
+          ` client=${header} negotiated=${decision.value}` +
+          ` ua=${req.headers["user-agent"] ?? "-"}`,
+      );
+    }
+
+    next();
+  });
+
   // QBO auth routes — for re-auth when refresh token expires
   const intuitClientId = process.env.INTUIT_CLIENT_ID;
   const intuitClientSecret = process.env.INTUIT_CLIENT_SECRET;
@@ -162,23 +259,44 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   // speak?" without a deploy or a log dig. That list is compiled into the SDK,
   // so before this it could only be learned from the 400 the server emitted
   // when it refused a client — the exact failure #15 is about.
-  app.get("/health", (_req: Request, res: Response) => {
+  //
+  // The modern half of that answer is not a constant here: it is read back
+  // from the modern leg's own `server/discover`, so what `/health` reports and
+  // what a modern client is told are one answer rather than two. See
+  // src/discover.ts.
+  app.get("/health", async (_req: Request, res: Response) => {
+    const reading = await discoverReading();
     res.json({
       ok: true,
       revision: process.env.K_REVISION ?? null,
       protocol: {
-        latest: LATEST_PROTOCOL_VERSION,
-        supported: SUPPORTED_PROTOCOL_VERSIONS,
-        // A version outside `supported` is no longer refused on an established
-        // session: it is reconciled to the version that session negotiated.
-        unsupportedHeaderPolicy: "reconcile-to-negotiated",
-        // This server opens sessions with the `initialize` handshake — the
-        // "legacy" era in MCP 2026-07-28's own terms. A modern client can read
-        // that here instead of inferring it from a refusal. See
-        // src/pre-session.ts for why `server/discover` is answered rather than
-        // implemented.
-        era: "legacy",
-        preSessionMethodPolicy: "jsonrpc-error-naming-initialize",
+        // This endpoint serves both eras on the same URL: a modern client is
+        // routed to a real `server/discover`, a 2025 client keeps the
+        // `initialize` handshake and its session.
+        era: "dual",
+        modern: reading.ok
+          ? {
+              // Straight from the DiscoverResult the modern leg just produced.
+              supportedVersions: reading.advertisement.supportedVersions,
+              capabilities: reading.advertisement.capabilities,
+              serverInfo: reading.advertisement.serverInfo ?? null,
+              entry: "server/discover",
+              serving: "per request, no session",
+            }
+          : { error: reading.error },
+        legacy: {
+          latest: LATEST_PROTOCOL_VERSION,
+          supported: SUPPORTED_PROTOCOL_VERSIONS,
+          entry: "initialize",
+          serving: "sessionful",
+          // A version outside `supported` is not refused on an established
+          // session: it is reconciled to the version that session negotiated.
+          unsupportedHeaderPolicy: "reconcile-to-negotiated",
+        },
+        // What the legacy leg answers a pre-session request it cannot serve.
+        // `server/discover` is no longer one of those — it is served on the
+        // modern leg. See src/pre-session.ts.
+        preSessionMethodPolicy: "jsonrpc-error-naming-both-eras",
       },
     });
   });
@@ -202,10 +320,13 @@ export function startHttpServer(qboConfig?: QboConfig): void {
 
     // New session — the handshake is the only thing this era of the protocol
     // can open one with. Anything else is answered as a JSON-RPC error that
-    // names the way in, never an anonymous 400. See src/pre-session.ts.
+    // names both ways in, never an anonymous 400. See src/pre-session.ts.
     const body = req.body;
     if (!isInitializeRequest(body)) {
-      sendAnswer(res, answerPreSession(body));
+      sendAnswer(
+        res,
+        answerPreSession(body, res.locals.legacyRouteReason as InboundLegacyRouteReason | undefined),
+      );
       return;
     }
 
@@ -234,29 +355,9 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       console.error(`[http] Session closed: ${sid}`);
     };
 
-    // Create a fresh McpServer + clients for this session
-    const server = new McpServer(
-      { name: "treasurer-mcp", version: "0.2.0" },
-      { capabilities: { tools: {} } },
-    );
-
-    if (qboClient) {
-      registerQboAccountTools(server, qboClient);
-      registerQboVendorTools(server, qboClient);
-      registerQboTransactionTools(server, qboClient, { idempotency, gmail });
-      registerQboReportTools(server, qboClient);
-      registerQboReconcileTools(server, qboClient);
-      registerQboClassTools(server, qboClient, { idempotency });
-      registerQboClassReportTools(server, qboClient);
-      registerQboClassWriteTools(server, qboClient);
-      registerQboBudgetTools(server, qboClient);
-    }
-
-    const divvyToken = process.env.DIVVY_API_TOKEN;
-    if (divvyToken) {
-      const divvyClient = new DivvyClient(divvyToken);
-      registerDivvyTools(server, divvyClient);
-    }
+    // A fresh server for this session, from the same factory the modern leg
+    // builds its per-request instances with.
+    const server = buildServer();
 
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -288,6 +389,16 @@ export function startHttpServer(qboConfig?: QboConfig): void {
 
   const httpServer = app.listen(port, "0.0.0.0", () => {
     console.error(`[http] Listening on 0.0.0.0:${port}`);
+    // Say which eras this process actually serves, in the process's own log,
+    // by asking the modern leg rather than announcing a compiled-in constant.
+    void discoverReading().then((reading) => {
+      console.error(
+        reading.ok
+          ? `[http] Serving both MCP eras — modern: ${reading.advertisement.supportedVersions.join(", ")}` +
+              ` (server/discover); legacy: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")} (initialize, sessionful)`
+          : `[http] Modern leg did not answer its own server/discover: ${reading.error}`,
+      );
+    });
   });
 
   // Graceful shutdown for Cloud Run SIGTERM
@@ -296,6 +407,9 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     for (const transport of transports.values()) {
       await transport.close();
     }
+    // Both legs are torn down: the modern handler aborts its in-flight
+    // per-request exchanges and closes their instances.
+    await modern.close();
     httpServer.close();
   });
 }

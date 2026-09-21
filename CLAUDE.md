@@ -54,12 +54,12 @@ gcloud config configurations activate mcp-billcom
 - `src/tools/qbo-reports.ts` — QBO: transaction_report (optional `cleared` reconcile-status filter), profit_loss, balance_sheet. `qbo_transaction_report` returns **flattened, compact rows** (not QBO's nested report JSON) and **pages automatically** — see "Tool result size" below
 - `src/result-size.ts` — the shared tool-result size discipline: `MAX_RESULT_CHARS` budget, `compact()` serialization, `packRows()` paging. Enforced for **every** tool by `runTool`, not opted into per tool
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
-- `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions (flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, cards, members, budgets, list_pending_action
+- `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions and list_cards (both flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, members, budgets, list_pending_action
 - `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
 - `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets and custom-field values 100, each probed), and `walkBillPages()`, which serves a caller's row count by walking BILL's cursor. Every paged BILL call goes through `DivvyClient.getBillPage` — see "Page size" below
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
-- `src/divvy-rows.ts` — the flattened Divvy row (`slimTransaction`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
+- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
 - `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
 - `src/gmail-client.ts` — Gmail attachment fetch for qbo_attach_file (per-account refresh tokens)
@@ -308,6 +308,52 @@ returns all **72** NAP codes in one call (9,204 chars) where it returned the
 same first 20 forever, and `page: nextPage` advances (`Ads/Social Media…` →
 `Bank and Credit Card Fees`) instead of repeating page one. The default
 transaction call is unchanged at 50 rows / one BILL page / 15,466 chars.
+
+## Cards
+
+A cursor the caller cannot pass back is not paging.
+
+`divvy_list_cards` made one unparameterized `GET /v3/spend/cards` and handed
+BILL's answer back whole. BILL's default page is 20, so on books holding 21
+cards the tool returned 20 — plus a `nextPage` of `YXJyYXljb25uZWN0aW9uOjE5`
+(`arrayconnection:19`) that the tool's schema had no parameter to accept
+(issue #43). Nothing in the result said the listing was short: the 21st card
+was simply absent. On a company with 200 cards, 180 would have been.
+
+This is #24's family — a BILL paging fact the tool does not expose — but the
+mirror image of it: there the tool advertised a knob BILL refused, here BILL
+offered a cursor the tool gave nobody a way to follow. #24's fix declared
+BILL's paging once (`src/divvy-paging.ts`) and routed every call through it,
+which is what made this visible.
+
+So the card list now takes the same cursor vocabulary as every other BILL
+listing — `cursorPaging(billPagingLimits('cards'))`, `page`/`pageSize`/`format`
+— and runs through `walkBillPages`. Two consequences:
+
+- The default `pageSize` is BILL's own page maximum for this endpoint (**100**,
+  probed), not BILL's default of 20, so "list the cards" on these books is one
+  BILL call returning every card. A bigger ask walks the cursor, bounded by the
+  10-page cap and the result-size budget, exactly as the transaction list does.
+- It returns **flattened rows** (`slimCard`) through `buildCursorList`, so it
+  inherits the `returned`/`hasMore`/`truncatedBy`/`note` vocabulary and the
+  `empty` block — which is what makes a short listing read as short. A physical
+  card carries no name, no budget and no period on these books, so those keys
+  are omitted rather than carried as nulls; `lastFour` is what names it. There
+  is no `pageTotal`: `spent` is each card's own current period, and cards
+  sharing a budget's funds would be summed as if they were separate money.
+- The zero-row case has a **witness**: every transaction names the card that
+  made it, so an empty card list while transactions name cards is a blind
+  source, not an empty wallet (`source-blind` — the shape #34 had). It is only
+  consulted when the listing has no rows, so the everyday call still costs one
+  BILL request; if that witness call fails, the block says `unverified` rather
+  than claiming something it did not check.
+
+Driven against live BILL from this branch: **21 of 21** cards in one call,
+6,271 chars with `hasMore: false` — where it was 20 of 21, 9,532 chars, and a
+dead-end cursor. `{"pageSize": 5}` returns 5 with a cursor that advances, and
+following it to the end yields 21 distinct cards in 5 calls. `format: "raw"`
+returns BILL's own objects (9,789 chars for all 21). The deployed numbers land
+here once the revision is out.
 
 ## Budgets
 

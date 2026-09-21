@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCursorList, slimTransaction } from "./divvy-rows.js";
+import { buildCursorList, slimCard, slimTransaction } from "./divvy-rows.js";
 import { FILTER_SPECS, FilterCheck, billFilterParam } from "./divvy-filters.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
@@ -218,7 +218,9 @@ test("the over-budget error names knobs the tool actually has", async () => {
 });
 
 test("a tool with no paging arguments is given no knobs to turn", () => {
-  const text = overBudget("divvy_list_cards", 50_000);
+  // `divvy_list_cards` was the example here until it grew real ones (issue
+  // #43); `divvy_list_custom_fields` is a listing BILL does not page.
+  const text = overBudget("divvy_list_custom_fields", 50_000);
   for (const absent of ["maxResults", "startPosition", "offset", "pageSize", "format"]) {
     assert.doesNotMatch(text, new RegExp(absent));
   }
@@ -235,6 +237,7 @@ test("every narrowing sentence names only parameters of its own paging shape", (
     // sentence, schema shape, response fields it may also name
     [LIST_PAGING_NARROWING, LIST_PAGING, ["nextStartPosition"]],
     [CURSOR_PAGING_NARROWING, cursorPaging(billPagingLimits("transactions")), ["nextPage"]],
+    [CURSOR_PAGING_NARROWING, cursorPaging(billPagingLimits("cards")), ["nextPage"]],
     [
       cursorNarrowing({ format: false }),
       cursorPaging(billPagingLimits("customFieldValues"), { format: false }),
@@ -689,4 +692,219 @@ test("with no filters set, nothing is sent to BILL and nothing is claimed", asyn
   assert.equal(calls[0].filters, undefined);
   assert.equal(result.filtering, undefined);
   assert.equal(result.returned, 3);
+});
+
+/* ------------------------------------------------------------------ *
+ * Cards (issue #43): a list that took no arguments at all, so BILL's
+ * own cursor was unfollowable and its default page was the whole
+ * answer — 20 of 21 cards, silently.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A BILL card in the shape `/v3/spend/cards` returns. Every fifth one is
+ * physical, which on these books means no name, no budget and no period —
+ * the case a row must not carry as a column of nulls.
+ */
+function liveCard(i: number) {
+  const physical = i % 5 === 4;
+  return {
+    id: `Q2FyZDoxNTU1MTgy${String(i).padStart(2, "0")}`,
+    uuid: `crd_l9bmqukmfh2it8di10vheehh${String(i).padStart(2, "0")}`,
+    userId: `VXNlcjoyMDI1NjU${i % 10}`,
+    userUuid: `usr_piu3h89oop23nbu5r7hd8stc${String(i).padStart(2, "0")}`,
+    ...(physical
+      ? {}
+      : {
+          // BILL stores several names with a trailing space.
+          name: `${i}U Tournaments `,
+          budgetId: `QnVkZ2V0OjEwMDI5NDU${i % 7}`,
+          budgetUuid: `bgt_7iodn4ddal3rvdf8kschfve3${String(i).padStart(2, "0")}`,
+          validThru: "11/28",
+          shareBudgetFunds: true,
+          recurring: false,
+          recurringLimit: null,
+          currentPeriod: { limit: 0, spent: 5698.56 + i },
+        }),
+    lastFour: String(2000 + i),
+    status: i % 9 === 0 ? "FROZEN" : "ACTIVATED",
+    type: physical ? "PHYSICAL" : "VIRTUAL_VENDOR",
+    createdTime: "2025-11-11T21:58:44.000+00:00",
+    updatedTime: "2025-11-11T21:58:44.000+00:00",
+  };
+}
+
+const cards = (n: number) => Array.from({ length: n }, (_, i) => liveCard(i));
+
+/** A BILL card list holding `total` cards, served in pages of `p.pageSize`. */
+function cardClient(total: number, asked: Array<{ page?: string; pageSize?: string }> = []) {
+  return {
+    asked,
+    listCards: async (p: { page?: string; pageSize?: string } = {}) => {
+      asked.push(p);
+      const from = p.page ? Number(p.page) : 0;
+      const n = Math.min(Number(p.pageSize ?? 20), total - from);
+      return {
+        results: cards(Math.max(0, n)).map((c, i) => ({ ...c, id: `card-${from + i}` })),
+        nextPage: from + n < total ? String(from + n) : undefined,
+      };
+    },
+  };
+}
+
+/**
+ * The bug, in one assertion. The tool made an unparameterized call, so BILL
+ * served its default page of 20 and the 21st card was unreachable: the cursor
+ * it handed back (`arrayconnection:19`) had no parameter to come back in.
+ */
+test("asking for the cards lists all of them, in one BILL call", async () => {
+  const client = cardClient(21);
+  const { handler } = registeredTools(client).get("divvy_list_cards")!;
+  const result = await listResult(handler, {});
+
+  // BILL's own page maximum for this list, not its default of 20.
+  assert.deepEqual(client.asked, [{ page: undefined, pageSize: String(BILL_MAX_PAGE_SIZE.cards) }]);
+  assert.equal(result.returned, 21);
+  assert.equal((result.cards as unknown[]).length, 21);
+  // And it says so: nothing left behind, no cursor to chase.
+  assert.equal(result.hasMore, false);
+  assert.equal(result.nextPage, undefined);
+});
+
+test("a card listing that is short says it is short, and hands back a cursor that works", async () => {
+  const client = cardClient(250);
+  const { handler } = registeredTools(client).get("divvy_list_cards")!;
+  const first = await listResult(handler, { pageSize: 100 });
+
+  assert.equal(first.returned, 100);
+  assert.equal(first.hasMore, true);
+  assert.equal(first.truncatedBy, "window");
+  assert.equal(first.nextPage, "100");
+  assert.match(String(first.note), /page: nextPage/);
+
+  // The cursor is followable — which is the whole of the defect.
+  const second = await listResult(handler, { page: String(first.nextPage), pageSize: 100 });
+  assert.equal(second.returned, 100);
+  assert.equal(client.asked[1].page, "100");
+  const firstIds = (first.cards as Array<{ id: string }>).map((c) => c.id);
+  const secondIds = (second.cards as Array<{ id: string }>).map((c) => c.id);
+  assert.equal(firstIds.filter((id) => secondIds.includes(id)).length, 0, "page 2 repeats page 1");
+});
+
+test("an ask bigger than one BILL page walks its cursor, as the transaction list does", async () => {
+  const client = cardClient(250);
+  const { handler } = registeredTools(client).get("divvy_list_cards")!;
+  const result = await listResult(handler, { pageSize: 120 });
+
+  // Neither call asks BILL for more than its page maximum, and the second asks
+  // for exactly the rows still wanted — so `pageSize` means rows here too.
+  assert.deepEqual(
+    client.asked.map((a) => a.pageSize),
+    ["100", "20"],
+  );
+  assert.equal(result.returned, 120);
+  assert.equal(result.billPages, 2);
+});
+
+test("a card row names the card, and omits what a physical card has none of", () => {
+  const virtual = slimCard(liveCard(1));
+  assert.equal(virtual.id, liveCard(1).id);
+  assert.equal(virtual.uuid, liveCard(1).uuid);
+  assert.equal(virtual.name, "1U Tournaments", "the trailing space BILL stores is trimmed");
+  assert.equal(virtual.lastFour, "2001");
+  assert.equal(virtual.type, "VIRTUAL_VENDOR");
+  assert.equal(virtual.status, "ACTIVATED");
+  // Both spellings, because that is what the transaction filter accepts.
+  assert.equal(virtual.budgetId, liveCard(1).budgetId);
+  assert.equal(virtual.budgetUuid, liveCard(1).budgetUuid);
+  assert.equal(virtual.spent, 5699.56);
+  // Envelope, dropped.
+  for (const gone of ["createdTime", "updatedTime", "userId", "shareBudgetFunds", "recurring"]) {
+    assert.equal(virtual[gone], undefined, `row still carries ${gone}`);
+  }
+
+  const physical = slimCard(liveCard(4));
+  assert.equal(physical.type, "PHYSICAL");
+  assert.equal(physical.lastFour, "2004", "lastFour is what names a card with no name");
+  for (const absent of ["name", "budgetId", "budgetUuid", "validThru", "limit", "spent"]) {
+    assert.ok(!(absent in physical), `physical card carries a null ${absent}`);
+  }
+});
+
+test("rows are a fraction of BILL's card objects, and a long list stays inside the budget", async () => {
+  const raw = cards(21);
+  const rows = raw.map(slimCard);
+  assert.ok(compact(rows).length < compact(raw).length / 1.5, "rows are not meaningfully smaller");
+
+  const client = cardClient(1000);
+  const { handler } = registeredTools(client).get("divvy_list_cards")!;
+  const result = await listResult(handler, { pageSize: 1000 });
+  assert.ok(compact(result).length <= MAX_RESULT_CHARS);
+  assert.equal(result.truncatedBy, "size");
+  // The budget cut this page short, so BILL's cursor points past the rows that
+  // were dropped and is withheld — the same rule as the transaction list.
+  assert.equal(result.nextPage, undefined);
+  assert.match(String(result.note), /smaller `pageSize`/);
+});
+
+/**
+ * The zero-row case, which is where #34's lesson applies to this list: every
+ * transaction names the card that made it, so an empty card list while
+ * transactions name cards is a blind source, not an empty wallet.
+ */
+test("an empty card listing says which kind of nothing it found", async () => {
+  const client = {
+    listCards: async () => ({ results: [], nextPage: undefined }),
+    listTransactions: async () => ({
+      results: [
+        { ...liveTransaction(1), cardUuid: "crd_a", cardName: null, cardLastFour: "4417" },
+        { ...liveTransaction(2), cardUuid: "crd_b", cardName: "Equipment " },
+        { ...liveTransaction(3), cardUuid: "crd_b", cardName: "Equipment " },
+      ],
+      nextPage: undefined,
+    }),
+  };
+  const { handler } = registeredTools(client).get("divvy_list_cards")!;
+  const result = await listResult(handler, {});
+  const empty = result.empty as { meaning: string; note: string; checked: unknown[] };
+
+  assert.equal(result.returned, 0);
+  assert.equal(empty.meaning, "source-blind");
+  assert.deepEqual(empty.checked, [
+    { source: "recent transactions", found: 2, sample: ["card ending 4417", "Equipment"] },
+  ]);
+});
+
+test("a card listing with no witness to consult claims nothing it did not check", async () => {
+  const client = {
+    listCards: async () => ({ results: [], nextPage: undefined }),
+    listTransactions: async () => {
+      throw new Error("BILL 500");
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_cards")!;
+  const result = await listResult(handler, {});
+  assert.equal((result.empty as { meaning: string }).meaning, "unverified");
+});
+
+test("the card list's pageSize is bounded by what it can serve, and raw is opt-in", () => {
+  const { schema } = registeredTools(cardClient(21)).get("divvy_list_cards")!;
+  const limits = billPagingLimits("cards");
+  const pageSize = schema.pageSize as {
+    safeParse(v: unknown): { success: boolean; error?: { issues: Array<{ message: string }> } };
+  };
+  assert.equal(pageSize.safeParse(limits.maxRows).success, true);
+  const tooBig = pageSize.safeParse(limits.maxRows + 1);
+  assert.equal(tooBig.success, false);
+  assert.match(tooBig.error!.issues[0].message, new RegExp(String(limits.billPageSize)));
+  assert.ok(schema.page, "no cursor parameter — the cursor BILL hands back is unfollowable");
+  assert.ok(schema.format, "no way back to BILL's full card objects");
+});
+
+test("format: raw still returns BILL's own card objects", async () => {
+  const client = cardClient(21);
+  const { handler } = registeredTools(client).get("divvy_list_cards")!;
+  const result = await listResult(handler, { format: "raw" });
+  const results = result.results as Array<Record<string, unknown>>;
+  assert.equal(results.length, 21);
+  assert.equal(results[0].createdTime, "2025-11-11T21:58:44.000+00:00");
 });

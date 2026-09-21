@@ -67,6 +67,43 @@ export function slimTransaction(tx: Tx): Record<string, unknown> {
   };
 }
 
+/**
+ * One card as a row.
+ *
+ * The card list handed BILL's objects back whole — 9,532 characters for the 20
+ * cards it returned (issue #43) — and most of that is bookkeeping: the
+ * created/updated timestamps, the numeric `userId` beside the `usr_…` uuid,
+ * `shareBudgetFunds`, `recurring`, `recurringLimit`. A row keeps what names
+ * the card and what a follow-up call needs: both ids, who holds it, the budget
+ * it draws on in both spellings `divvy_list_transactions {"budgetId": …}`
+ * accepts, and the current period's limit and spend.
+ *
+ * A physical card carries no `name`, no budget and no period on these books,
+ * so those keys are omitted rather than carried as `null` — `lastFour` is what
+ * names such a card. Card names are trimmed: BILL stores several with a
+ * trailing space ("10U Tournaments ").
+ */
+export function slimCard(card: Tx): Record<string, unknown> {
+  const period = (card.currentPeriod ?? {}) as { limit?: unknown; spent?: unknown };
+  const num = (v: unknown) => (typeof v === "number" ? v : undefined);
+  const name = typeof card.name === "string" ? card.name.trim() : "";
+  return {
+    id: card.id,
+    uuid: card.uuid,
+    ...(name ? { name } : {}),
+    lastFour: card.lastFour,
+    type: card.type,
+    status: card.status,
+    ...(card.budgetId || card.budgetUuid
+      ? { budgetId: card.budgetId, budgetUuid: card.budgetUuid }
+      : {}),
+    userUuid: card.userUuid,
+    ...(card.validThru ? { validThru: card.validThru } : {}),
+    ...(num(period.limit) !== undefined ? { limit: num(period.limit) } : {}),
+    ...(num(period.spent) !== undefined ? { spent: num(period.spent) } : {}),
+  };
+}
+
 export interface CursorListInput {
   /** Record type, e.g. "Transaction". */
   entity: string;

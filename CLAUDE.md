@@ -348,12 +348,18 @@ listing — `cursorPaging(billPagingLimits('cards'))`, `page`/`pageSize`/`format
   BILL request; if that witness call fails, the block says `unverified` rather
   than claiming something it did not check.
 
-Driven against live BILL from this branch: **21 of 21** cards in one call,
-6,271 chars with `hasMore: false` — where it was 20 of 21, 9,532 chars, and a
-dead-end cursor. `{"pageSize": 5}` returns 5 with a cursor that advances, and
-following it to the end yields 21 distinct cards in 5 calls. `format: "raw"`
-returns BILL's own objects (9,789 chars for all 21). The deployed numbers land
-here once the revision is out.
+Live books, measured on revision `billcom-mcp-00069-cqr`. `divvy_list_cards {}`
+returns **21 of 21** cards in one BILL call, 6,271 chars, `hasMore: false`, in
+0.63s — where it returned 20 of 21 in 9,532 chars with a cursor nothing could
+follow. `{"pageSize": 5}` returns 5 rows with `truncatedBy: "window"` and a
+cursor that advances; followed to the end it yields **21 distinct cards in 5
+calls**. `{"pageSize": 1001}` is refused by the schema before any BILL call
+(`pageSize must be 1000 or fewer rows: BILL's own page holds 100, and one call
+walks at most 10 of them.`). `format: "raw"` still returns BILL's own objects,
+9,789 chars for all 21. A cursor past the end
+(`page: "YXJyYXljb25uZWN0aW9uOjI1"`, i.e. `arrayconnection:25`) returns 0 rows
+and says which nothing it is: `"meaning": "source-blind"`, with the 9 cards
+recent transactions name.
 
 ## Budgets
 

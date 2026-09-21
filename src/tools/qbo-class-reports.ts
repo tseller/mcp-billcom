@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import {
   QboClient,
   CLASS_LEDGER_COLUMNS,
@@ -115,13 +115,14 @@ export function buildClassTransactions(
 }
 
 export function registerQboClassReportTools(server: McpServer, client: QboClient) {
-  server.tool(
+  server.registerTool(
     "qbo_class_transactions",
-    "List transactions with their Class over a date range — the class-aware transaction report. " +
+    {
+      description: "List transactions with their Class over a date range — the class-aware transaction report. " +
       "Built on the GeneralLedger report because QuickBooks' TransactionList report cannot return a class column at all. " +
       "Set untaggedOnly to get every transaction still missing a class: that is the re-tagging worklist, and each row carries the QBO transaction id and type that qbo_set_transaction_class needs. " +
       "Long ranges are paged automatically: when `hasMore` is true, call again with `offset: nextOffset`.",
-    {
+      inputSchema: z.object({
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
       classIds: z
@@ -144,6 +145,7 @@ export function registerQboClassReportTools(server: McpServer, client: QboClient
         .optional()
         .describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
       limit: z.number().int().min(1).optional().describe("Max rows to return in this page"),
+    }),
     },
     (args) =>
       runTool(
@@ -188,10 +190,11 @@ export function registerQboClassReportTools(server: McpServer, client: QboClient
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_profit_loss_by_class",
-    "Profit & Loss broken out by Class — one money column per season plus a 'Not Specified' column for everything still untagged. That untagged column doubles as the progress meter for class tagging. Optionally filter to specific classes.",
     {
+      description: "Profit & Loss broken out by Class — one money column per season plus a 'Not Specified' column for everything still untagged. That untagged column doubles as the progress meter for class tagging. Optionally filter to specific classes.",
+      inputSchema: z.object({
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
       classIds: z.array(z.string()).optional().describe("Only these class ids (from qbo_list_classes)"),
@@ -200,6 +203,7 @@ export function registerQboClassReportTools(server: McpServer, client: QboClient
         .enum(["rows", "raw"])
         .optional()
         .describe("'rows' (default) returns flattened account rows; 'raw' returns QBO's nested report JSON"),
+    }),
     },
     (args) =>
       runTool("qbo_profit_loss_by_class", args, async ({ startDate, endDate, classIds, accountingMethod, format }) => {

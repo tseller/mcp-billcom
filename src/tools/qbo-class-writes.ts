@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { QboClient, QboError } from "../qbo-client.js";
 import {
   applyClassToLines,
@@ -156,10 +156,11 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
     );
   }
 
-  server.tool(
+  server.registerTool(
     "qbo_set_transaction_class",
-    `Set (or clear) the Class on one existing transaction — a purchase, deposit or journal entry. ${SHARED_DESC} Use dryRun first to see exactly which lines would change.`,
     {
+      description: `Set (or clear) the Class on one existing transaction — a purchase, deposit or journal entry. ${SHARED_DESC} Use dryRun first to see exactly which lines would change.`,
+      inputSchema: z.object({
       entityType: ENTITY_ENUM.describe("Which kind of transaction (from the list/get tools)"),
       id: z.string().describe("Transaction id"),
       classId: z
@@ -182,6 +183,7 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
         .boolean()
         .optional()
         .describe("Report what would change and write nothing (default false)"),
+    }),
     },
     (args) =>
       runTool("qbo_set_transaction_class", args, async (a) => {
@@ -198,10 +200,11 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
       }),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_set_transaction_class_batch",
-    `Set the Class on many existing transactions in one call — the bulk re-tagging workhorse. ${SHARED_DESC} Items run sequentially and each reports its own success or failure, so one bad item doesn't abort the rest. Run the whole batch with dryRun first, review the diff, then re-run for real.`,
     {
+      description: `Set the Class on many existing transactions in one call — the bulk re-tagging workhorse. ${SHARED_DESC} Items run sequentially and each reports its own success or failure, so one bad item doesn't abort the rest. Run the whole batch with dryRun first, review the diff, then re-run for real.`,
+      inputSchema: z.object({
       items: z
         .array(
           z.object({
@@ -220,6 +223,7 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
         .boolean()
         .optional()
         .describe("Report what would change for every item and write nothing (default false)"),
+    }),
     },
     (args) =>
       runTool("qbo_set_transaction_class_batch", args, async ({ items, dryRun }) => {

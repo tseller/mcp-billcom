@@ -1,4 +1,4 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
@@ -23,26 +23,29 @@ const defaultPageSize = (list: BillListName, asked: unknown): number =>
   Number(asked) > 0 ? Number(asked) : BILL_MAX_PAGE_SIZE[list];
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
-  server.tool(
+  server.registerTool(
     'divvy_list_budgets',
-    'List Divvy (BILL Spend & Expense) budgets — one row each with the name, both spellings of the id that `divvy_list_transactions {"budgetId": …}` accepts, whether it is retired, and the current period\'s limit and spend. ' +
+    {
+      description: 'List Divvy (BILL Spend & Expense) budgets — one row each with the name, both spellings of the id that `divvy_list_transactions {"budgetId": …}` accepts, whether it is retired, and the current period\'s limit and spend. ' +
       "Use this to resolve a budget name to an id. " +
       "BILL's own budget-list endpoint does not return every budget on these books (issue #34), so the listing is assembled: budgets it does return, plus every budget named by a card or a recent transaction, each read back by id to confirm it exists. " +
       '`sources` states what each one contributed, and `seenOn` on a row says where that budget was named — so a short answer reads as short rather than as "there are none".',
-    {},
+      inputSchema: z.object({}),
+    },
     (args) => runTool('divvy_list_budgets', args, () => assembleBudgets(client)),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_list_transactions',
-    'List Divvy (BILL Spend & Expense) transactions. ' +
+    {
+      description: 'List Divvy (BILL Spend & Expense) transactions. ' +
       'Returns one flattened row per transaction — date, cardholder, merchant, amount, status, receipt and accounting-sync status, both ids, and the filled custom-field values (NAP CODES, Notes) — plus `pageTotal` for the page. ' +
       `Paged: when \`hasMore\` is true, call again with \`page: nextPage\`. \`pageSize\` is rows, not BILL pages — BILL's own page holds ${BILL_MAX_PAGE_SIZE.transactions}, and a bigger ask is served by walking its cursor here rather than failing. ` +
       'Every filter is checked against the rows that come back, and `filtering` states per filter how it was enforced — so a filter the backend does not honor drops the rows here and says so, rather than quietly returning the wrong ones. ' +
       '`billPages` says how many BILL pages one result consumed — more than one when the ask was bigger than a BILL page, or when a filter applied here dropped rows and the page was refilled. ' +
       'Use status:"DECLINED" to surface card declines. ' +
       '`format: "raw"` returns BILL\'s full objects (~2KB of scaffolding each, and rejected outright if the page exceeds the size budget); for one transaction in full, use divvy_get_transaction.',
-    {
+      inputSchema: z.object({
       startDate: z
         .string()
         .optional()
@@ -66,6 +69,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           'Filter by transaction status, e.g. CLEARED or DECLINED. BILL has no server-side filter for this one, so it is applied here after fetch.',
         ),
       ...cursorPaging(billPagingLimits('transactions')),
+    }),
     },
     (args) =>
       runTool(
@@ -117,11 +121,13 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       ),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_get_transaction',
-    'Get a single Divvy transaction by ID. Returns full details including receipt status, custom fields, and sync status.',
     {
+      description: 'Get a single Divvy transaction by ID. Returns full details including receipt status, custom fields, and sync status.',
+      inputSchema: z.object({
       transactionId: z.string().describe('Transaction ID'),
+    }),
     },
     (args) =>
       runTool('divvy_get_transaction', args, ({ transactionId }) =>
@@ -129,13 +135,15 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       ),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_upload_receipt',
-    'Upload a receipt and attach it to a Divvy transaction. Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType.',
     {
+      description: 'Upload a receipt and attach it to a Divvy transaction. Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType.',
+      inputSchema: z.object({
       transactionUuid: z.string().describe('Transaction UUID (the uuid field, not the id field)'),
       imageBase64: z.string().describe('Base64-encoded receipt bytes (image or PDF)'),
       contentType: z.string().optional().describe('Optional MIME override. Only set this if the auto-detected type is wrong.'),
+    }),
     },
     (args) =>
       runTool('divvy_upload_receipt', args, async ({ transactionUuid, imageBase64, contentType }) => {
@@ -178,20 +186,24 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       }),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_list_custom_fields',
-    'List all Divvy custom field definitions (e.g. NAP CODES, Notes). Returns each field\'s customFieldId, name, and type.',
-    {},
+    {
+      description: 'List all Divvy custom field definitions (e.g. NAP CODES, Notes). Returns each field\'s customFieldId, name, and type.',
+      inputSchema: z.object({}),
+    },
     (args) => runTool('divvy_list_custom_fields', args, () => client.listCustomFields()),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_list_custom_field_values',
-    'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label. ' +
-      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFieldValues}, BILL's own page maximum), and when \`nextPage\` comes back, call again with \`page: nextPage\`.`,
     {
+      description: 'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label. ' +
+      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFieldValues}, BILL's own page maximum), and when \`nextPage\` comes back, call again with \`page: nextPage\`.`,
+      inputSchema: z.object({
       customFieldId: z.string().describe('Custom field ID from divvy_list_custom_fields'),
       ...cursorPaging(billPagingLimits('customFieldValues'), { format: false }),
+    }),
     },
     (args) =>
       runTool(
@@ -217,10 +229,11 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       ),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_update_transaction_custom_fields',
-    'Assign custom field values to a Divvy transaction (e.g. set the NAP CODE). Use divvy_list_custom_fields + divvy_list_custom_field_values first to resolve IDs. For SELECT-type fields pass selectedValues (value IDs); for NOTE-type fields pass note. Clearing selectedValues to [] clears the field.',
     {
+      description: 'Assign custom field values to a Divvy transaction (e.g. set the NAP CODE). Use divvy_list_custom_fields + divvy_list_custom_field_values first to resolve IDs. For SELECT-type fields pass selectedValues (value IDs); for NOTE-type fields pass note. Clearing selectedValues to [] clears the field.',
+      inputSchema: z.object({
       transactionUuid: z.string().describe('Transaction UUID (the uuid field, not the id field)'),
       customFields: z
         .array(
@@ -232,6 +245,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
         )
         .min(1)
         .describe('One entry per custom field to set'),
+    }),
     },
     (args) =>
       runTool('divvy_update_transaction_custom_fields', args, ({ transactionUuid, customFields }) =>
@@ -239,24 +253,29 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
       ),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_list_cards',
-    'List all Divvy (BILL Spend & Expense) virtual and physical cards',
-    {},
+    {
+      description: 'List all Divvy (BILL Spend & Expense) virtual and physical cards',
+      inputSchema: z.object({}),
+    },
     (args) => runTool('divvy_list_cards', args, () => client.listCards()),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_list_members',
-    'List all Divvy (BILL Spend & Expense) team members',
-    {},
+    {
+      description: 'List all Divvy (BILL Spend & Expense) team members',
+      inputSchema: z.object({}),
+    },
     (args) => runTool('divvy_list_members', args, () => client.listMembers()),
   );
 
-  server.tool(
+  server.registerTool(
     'divvy_list_pending_action',
-    'List Divvy transactions that need action, in two buckets: (1) pendingFields — required NAP CODES / Notes / receipt are missing, the cardholder or the treasurer can fill them; (2) pendingReview — every required field is filled but a reviewer is still WAITING to approve. Each row carries a `blockers` array naming exactly what is missing, a `waitingReviewers` list for items in the second bucket, and a `reviewUrl` pointing to the transaction in BILL S&E (Tim can tap to open it directly — render this as a Markdown link in any summary you send him). Use this instead of divvy_list_transactions when triaging open work.',
     {
+      description: 'List Divvy transactions that need action, in two buckets: (1) pendingFields — required NAP CODES / Notes / receipt are missing, the cardholder or the treasurer can fill them; (2) pendingReview — every required field is filled but a reviewer is still WAITING to approve. Each row carries a `blockers` array naming exactly what is missing, a `waitingReviewers` list for items in the second bucket, and a `reviewUrl` pointing to the transaction in BILL S&E (Tim can tap to open it directly — render this as a Markdown link in any summary you send him). Use this instead of divvy_list_transactions when triaging open work.',
+      inputSchema: z.object({
       reviewerUuid: z
         .string()
         .optional()
@@ -267,6 +286,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
         .string()
         .optional()
         .describe('Optional lower bound on transaction date (YYYY-MM-DD). Defaults to all history.'),
+    }),
     },
     (args) =>
       runTool('divvy_list_pending_action', args, ({ reviewerUuid, since }) =>

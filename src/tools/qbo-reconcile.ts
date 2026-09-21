@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import {
   QboClient,
   parseTransactionList,
@@ -50,15 +50,17 @@ async function txnsForAccount(
  * otherwise there's a missing/duplicate/mismatched transaction to investigate.
  */
 export function registerQboReconcileTools(server: McpServer, client: QboClient) {
-  server.tool(
+  server.registerTool(
     "qbo_reconcile_worksheet",
-    "Verify one bank/credit-card account against a paper (Chase/Divvy) statement, for the monthly reconcile. Compares the statement's ending balance to QBO's register balance as-of the statement date (from the BalanceSheet — correct on both posting sides, so it handles credit-card payments too) and reports the DIFFERENCE: $0 means every statement transaction is correctly in QBO. Also lists the period's transactions to review if it doesn't balance. NOTE: QBO's API cannot finalize a reconcile — after this shows $0, do the check-off + Finish manually in the QBO web UI. Provide the beginning + ending balance from the paper statement.",
     {
+      description: "Verify one bank/credit-card account against a paper (Chase/Divvy) statement, for the monthly reconcile. Compares the statement's ending balance to QBO's register balance as-of the statement date (from the BalanceSheet — correct on both posting sides, so it handles credit-card payments too) and reports the DIFFERENCE: $0 means every statement transaction is correctly in QBO. Also lists the period's transactions to review if it doesn't balance. NOTE: QBO's API cannot finalize a reconcile — after this shows $0, do the check-off + Finish manually in the QBO web UI. Provide the beginning + ending balance from the paper statement.",
+      inputSchema: z.object({
       accountId: z.string().describe("Bank/credit-card Account ID (from qbo_account_balances)"),
       statementEndDate: z.string().describe("Statement ending date YYYY-MM-DD"),
       statementEndingBalance: z.number().describe("Ending balance from the paper statement. For a credit card, enter it the way QBO's reconcile shows it (amount owed as a negative number), OR as a positive amount-owed — the tool detects and flags a sign mismatch either way."),
       statementBeginningBalance: z.number().optional().describe("Beginning balance from the paper statement — cross-checked against QBO's register balance as-of the day before the period starts."),
       statementStartDate: z.string().optional().describe("Statement start date YYYY-MM-DD — enables the beginning-balance cross-check and bounds the review listing."),
+    }),
     },
     (args) =>
       runTool("qbo_reconcile_worksheet", args, async ({ accountId, statementEndDate, statementEndingBalance, statementBeginningBalance, statementStartDate }) => {
@@ -157,16 +159,18 @@ export function registerQboReconcileTools(server: McpServer, client: QboClient) 
       }),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_cleared_transactions",
-    "List one account's transactions filtered by QBO reconcile status (Reconciled, Cleared, or Uncleared) for a date range. Useful for hunting reconciliation discrepancies. (QBO exposes reconcile status only as a report filter and ignores its account filter, so this fetches company-wide and filters to your account client-side by the register-account column. For credit cards, payments recorded from the bank account post under that bank account, not here.)",
     {
+      description: "List one account's transactions filtered by QBO reconcile status (Reconciled, Cleared, or Uncleared) for a date range. Useful for hunting reconciliation discrepancies. (QBO exposes reconcile status only as a report filter and ignores its account filter, so this fetches company-wide and filters to your account client-side by the register-account column. For credit cards, payments recorded from the bank account post under that bank account, not here.)",
+      inputSchema: z.object({
       accountId: z.string().describe("Account ID"),
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
       status: z.enum(["Reconciled", "Cleared", "Uncleared"]).describe("Reconcile status to filter by"),
       offset: z.number().int().min(0).optional().describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
       limit: z.number().int().min(1).optional().describe("Max rows in this page. The response is also capped by a size budget, whichever is smaller."),
+    }),
     },
     (args) =>
       runTool("qbo_cleared_transactions", args, async ({ accountId, startDate, endDate, status, offset, limit }) => {

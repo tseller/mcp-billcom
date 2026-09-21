@@ -1,5 +1,5 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { McpServer } from "@modelcontextprotocol/server";
 import type { QboConfig, TokenStore } from "./qbo-client.js";
 import { InMemoryTokenStore, QboClient } from "./qbo-client.js";
 import { SecretManagerTokenStore } from "./secret-manager-store.js";

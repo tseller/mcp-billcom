@@ -32,8 +32,7 @@
  * some other version in a header does not make the server behave differently —
  * it only used to make the server hang up.
  */
-
-import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/server";
 
 export { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS };
 

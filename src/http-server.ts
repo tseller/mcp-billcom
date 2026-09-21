@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { McpServer, isInitializeRequest } from "@modelcontextprotocol/server";
 import express from "express";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { QboConfig } from "./qbo-client.js";
 import { QboClient } from "./qbo-client.js";
 import { registerQboAccountTools } from "./tools/qbo-accounts.js";
@@ -47,7 +46,7 @@ function sendAnswer(res: Response, answer: PreSessionAnswer): void {
 }
 
 export function startHttpServer(qboConfig?: QboConfig): void {
-  const transports = new Map<string, StreamableHTTPServerTransport>();
+  const transports = new Map<string, NodeStreamableHTTPServerTransport>();
 
   // The protocol version each live session negotiated at `initialize`. This is
   // the authoritative answer to "what does this session speak" — see
@@ -217,7 +216,7 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       (body as { params?: { protocolVersion?: unknown } }).params?.protocolVersion,
     );
 
-    const transport = new StreamableHTTPServerTransport({
+    const transport = new NodeStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sessionId) => {
         transports.set(sessionId, transport);

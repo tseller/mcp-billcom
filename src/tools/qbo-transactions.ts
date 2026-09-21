@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { QboClient, QboError } from "../qbo-client.js";
 import { sniffContentType } from "../mime.js";
 import { IdempotencyStore, withIdempotency } from "../idempotency.js";
@@ -188,16 +188,18 @@ export function registerQboTransactionTools(
     return withIdempotency(idempotency, tool, key, create);
   }
 
-  server.tool(
+  server.registerTool(
     "qbo_list_purchases",
-    "List expense/purchase transactions from QuickBooks. These include credit card charges, checks, and cash purchases. Filter by date range, account, or vendor. " +
-      LIST_PAGING_DOC,
     {
+      description: "List expense/purchase transactions from QuickBooks. These include credit card charges, checks, and cash purchases. Filter by date range, account, or vendor. " +
+      LIST_PAGING_DOC,
+      inputSchema: z.object({
       startDate: z.string().optional().describe("Start date YYYY-MM-DD"),
       endDate: z.string().optional().describe("End date YYYY-MM-DD"),
       accountId: z.string().optional().describe("Filter by bank/CC account ID"),
       vendorId: z.string().optional().describe("Filter by vendor (EntityRef) ID"),
       ...LIST_PAGING,
+    }),
     },
     (args) =>
       runTool(
@@ -231,19 +233,22 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_get_purchase",
-    "Get a single purchase/expense transaction by ID. Returns full details including line items.",
     {
+      description: "Get a single purchase/expense transaction by ID. Returns full details including line items.",
+      inputSchema: z.object({
       id: z.string().describe("Purchase transaction ID"),
+    }),
     },
     (args) => runTool("qbo_get_purchase", args, ({ id }) => client.getPurchase(id)),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_update_purchase",
-    `Update a purchase transaction — categorize it by setting the expense account, vendor, class and/or memo. Sparse update: only the fields you pass are changed. The current PaymentType and AccountRef are fetched and carried over automatically (QBO rejects a sparse Purchase update without them), and SyncToken is auto-filled from the current version if omitted. Pass each line's lineId to edit that line in place, preserving every field you don't name. ${REPLACE_WARNING}`,
     {
+      description: `Update a purchase transaction — categorize it by setting the expense account, vendor, class and/or memo. Sparse update: only the fields you pass are changed. The current PaymentType and AccountRef are fetched and carried over automatically (QBO rejects a sparse Purchase update without them), and SyncToken is auto-filled from the current version if omitted. Pass each line's lineId to edit that line in place, preserving every field you don't name. ${REPLACE_WARNING}`,
+      inputSchema: z.object({
       id: z.string().describe("Purchase ID"),
       syncToken: z
         .string()
@@ -277,6 +282,7 @@ export function registerQboTransactionTools(
         .describe(
           `Required to replace the whole line array when no lineIds are given. ${REPLACE_WARNING}`,
         ),
+    }),
     },
     (args) =>
       runTool(
@@ -312,10 +318,11 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_create_purchase",
-    "Create an expense/purchase transaction in QuickBooks — the outflow side (bill-pay checks, Divvy eWallet debits, Bill.com payments). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the bank/CC account the money left, the payment type, one or more expense lines, and (for checks) the check number as docNumber.",
     {
+      description: "Create an expense/purchase transaction in QuickBooks — the outflow side (bill-pay checks, Divvy eWallet debits, Bill.com payments). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the bank/CC account the money left, the payment type, one or more expense lines, and (for checks) the check number as docNumber.",
+      inputSchema: z.object({
       paymentType: z
         .enum(["Check", "Cash", "CreditCard"])
         .describe("How it was paid: Check, Cash, or CreditCard"),
@@ -338,6 +345,7 @@ export function registerQboTransactionTools(
         .min(1)
         .describe("Expense lines — at least one required"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
+    }),
     },
     (args) =>
       runTool("qbo_create_purchase", args, async ({ paymentType, accountId, txnDate, vendorId, docNumber, memo, lines, idempotencyKey }) => {
@@ -366,13 +374,15 @@ export function registerQboTransactionTools(
       }),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_list_deposits",
-    "List deposit transactions. Filter by date range. " + LIST_PAGING_DOC,
     {
+      description: "List deposit transactions. Filter by date range. " + LIST_PAGING_DOC,
+      inputSchema: z.object({
       startDate: z.string().optional().describe("Start date YYYY-MM-DD"),
       endDate: z.string().optional().describe("End date YYYY-MM-DD"),
       ...LIST_PAGING,
+    }),
     },
     (args) =>
       runTool("qbo_list_deposits", args, async ({ startDate, endDate, startPosition, maxResults, format }) => {
@@ -401,11 +411,13 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_get_deposit",
-    "Get a single deposit transaction by ID. Returns full details including line items and SyncToken (needed for update_deposit).",
     {
+      description: "Get a single deposit transaction by ID. Returns full details including line items and SyncToken (needed for update_deposit).",
+      inputSchema: z.object({
       id: z.string().describe("Deposit transaction ID"),
+    }),
     },
     (args) => runTool("qbo_get_deposit", args, ({ id }) => client.getDeposit(id)),
   );
@@ -455,10 +467,11 @@ export function registerQboTransactionTools(
     return deposit;
   }
 
-  server.tool(
+  server.registerTool(
     "qbo_create_deposit",
-    "Create a deposit transaction in QuickBooks — the inflow side (e.g. Sports Connect ACH credits into Chase). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the deposit-to bank account and one or more lines, each crediting an income account and optionally attributing an entity (customer/vendor). For many similar deposits, prefer qbo_create_deposits_batch.",
     {
+      description: "Create a deposit transaction in QuickBooks — the inflow side (e.g. Sports Connect ACH credits into Chase). Booking it into the register lets QBO's banking page offer the matching bank-feed item as a one-click Match. Provide the deposit-to bank account and one or more lines, each crediting an income account and optionally attributing an entity (customer/vendor). For many similar deposits, prefer qbo_create_deposits_batch.",
+      inputSchema: z.object({
       depositToAccountId: z
         .string()
         .describe("Bank account the funds land in (DepositToAccountRef value, e.g. 14 for Chase)"),
@@ -466,6 +479,7 @@ export function registerQboTransactionTools(
       memo: z.string().optional().describe("Private note/memo"),
       lines: z.array(depositLineSchema).min(1).describe("Deposit lines — at least one required"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
+    }),
     },
     (args) =>
       runTool("qbo_create_deposit", args, ({ depositToAccountId, txnDate, memo, lines, idempotencyKey }) =>
@@ -475,10 +489,11 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_create_deposits_batch",
-    "Create multiple deposits in one call — each item has the same shape as qbo_create_deposit. Items run sequentially server-side and every item reports its own success/failure, so one bad item doesn't abort the rest. Give each item an idempotencyKey so the whole batch can be safely re-sent after an ambiguous network error: already-created items replay instead of duplicating.",
     {
+      description: "Create multiple deposits in one call — each item has the same shape as qbo_create_deposit. Items run sequentially server-side and every item reports its own success/failure, so one bad item doesn't abort the rest. Give each item an idempotencyKey so the whole batch can be safely re-sent after an ambiguous network error: already-created items replay instead of duplicating.",
+      inputSchema: z.object({
       deposits: z
         .array(
           z.object({
@@ -494,6 +509,7 @@ export function registerQboTransactionTools(
         .min(1)
         .max(50)
         .describe("Deposits to create, in order (max 50 per call)"),
+    }),
     },
     (args) =>
       runTool("qbo_create_deposits_batch", args, async ({ deposits }) => {
@@ -522,10 +538,11 @@ export function registerQboTransactionTools(
       }),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_update_deposit",
-    `Update a deposit transaction — recategorize a line's income account, attributed entity and/or class, or change the memo. Parity with qbo_update_purchase. Sparse update: only the fields you pass are changed. The current DepositToAccountRef is fetched and carried over automatically (QBO requires it even in sparse updates), and SyncToken is auto-filled from the current version if omitted. Pass each line's lineId to edit that line in place, preserving every field you don't name. ${REPLACE_WARNING}`,
     {
+      description: `Update a deposit transaction — recategorize a line's income account, attributed entity and/or class, or change the memo. Parity with qbo_update_purchase. Sparse update: only the fields you pass are changed. The current DepositToAccountRef is fetched and carried over automatically (QBO requires it even in sparse updates), and SyncToken is auto-filled from the current version if omitted. Pass each line's lineId to edit that line in place, preserving every field you don't name. ${REPLACE_WARNING}`,
+      inputSchema: z.object({
       id: z.string().describe("Deposit ID"),
       syncToken: z
         .string()
@@ -567,6 +584,7 @@ export function registerQboTransactionTools(
         .describe(
           `Required to replace the whole line array when no lineIds are given. ${REPLACE_WARNING}`,
         ),
+    }),
     },
     (args) =>
       runTool(
@@ -601,13 +619,15 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_list_transfers",
-    "List bank transfer transactions. Filter by date range. " + LIST_PAGING_DOC,
     {
+      description: "List bank transfer transactions. Filter by date range. " + LIST_PAGING_DOC,
+      inputSchema: z.object({
       startDate: z.string().optional().describe("Start date YYYY-MM-DD"),
       endDate: z.string().optional().describe("End date YYYY-MM-DD"),
       ...LIST_PAGING,
+    }),
     },
     (args) =>
       runTool("qbo_list_transfers", args, async ({ startDate, endDate, startPosition, maxResults, format }) => {
@@ -636,16 +656,18 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_create_transfer",
-    "Create a bank transfer between two of your own accounts (e.g. Chase → Divvy payment booked as a transfer rather than a check). Moves the amount out of fromAccount and into toAccount.",
     {
+      description: "Create a bank transfer between two of your own accounts (e.g. Chase → Divvy payment booked as a transfer rather than a check). Moves the amount out of fromAccount and into toAccount.",
+      inputSchema: z.object({
       fromAccountId: z.string().describe("Source account ID (FromAccountRef value)"),
       toAccountId: z.string().describe("Destination account ID (ToAccountRef value)"),
       amount: z.number().describe("Transfer amount (positive)"),
       txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
       memo: z.string().optional().describe("Private note/memo"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
+    }),
     },
     (args) =>
       runTool("qbo_create_transfer", args, ({ fromAccountId, toAccountId, amount, txnDate, memo, idempotencyKey }) => {
@@ -663,10 +685,11 @@ export function registerQboTransactionTools(
       }),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_create_journal_entry",
-    "Create a journal entry — debit and credit lines that must balance (total debits = total credits). Used for adjustments like moving fall pre-collections into 2510 Deferred Registration Fees and recognizing them when the season starts. Each line specifies a posting type (Debit or Credit), an account, and optionally an attributed entity.",
     {
+      description: "Create a journal entry — debit and credit lines that must balance (total debits = total credits). Used for adjustments like moving fall pre-collections into 2510 Deferred Registration Fees and recognizing them when the season starts. Each line specifies a posting type (Debit or Credit), an account, and optionally an attributed entity.",
+      inputSchema: z.object({
       txnDate: z.string().optional().describe("Transaction date YYYY-MM-DD (default: today in QBO)"),
       memo: z.string().optional().describe("Private note/memo"),
       lines: z
@@ -687,6 +710,7 @@ export function registerQboTransactionTools(
         .min(2)
         .describe("At least two lines; total Debits must equal total Credits"),
       idempotencyKey: z.string().optional().describe(IDEMPOTENCY_KEY_DESC),
+    }),
     },
     (args) =>
       runTool("qbo_create_journal_entry", args, async ({ txnDate, memo, lines, idempotencyKey }) => {
@@ -731,10 +755,11 @@ export function registerQboTransactionTools(
       }),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_attach_file",
-    "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Provide the file ONE of three ways: fileUrl (https URL the server fetches directly), gmailMessageId + gmailAttachmentId (server pulls the attachment straight from Gmail — use the Gmail MCP to find the ids), or fileBase64 (raw bytes, fallback). File bytes are validated by magic numbers (PDF, JPEG, PNG, GIF, WebP, HEIC) before upload. Returns the created Attachable id and filename. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
     {
+      description: "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Provide the file ONE of three ways: fileUrl (https URL the server fetches directly), gmailMessageId + gmailAttachmentId (server pulls the attachment straight from Gmail — use the Gmail MCP to find the ids), or fileBase64 (raw bytes, fallback). File bytes are validated by magic numbers (PDF, JPEG, PNG, GIF, WebP, HEIC) before upload. Returns the created Attachable id and filename. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
+      inputSchema: z.object({
       entityType: z
         .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
         .describe("QBO entity type of the transaction to attach to"),
@@ -772,6 +797,7 @@ export function registerQboTransactionTools(
         .string()
         .optional()
         .describe("Optional MIME override. Only set this if the auto-detected type is wrong."),
+    }),
     },
     (args) =>
       runTool("qbo_attach_file", args, async ({
@@ -860,14 +886,16 @@ export function registerQboTransactionTools(
       }),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_list_attachments",
-    "List the files already attached to a QuickBooks transaction — use before qbo_attach_file to avoid duplicate uploads. Returns each attachment's Attachable id, filename, size, and content type.",
     {
+      description: "List the files already attached to a QuickBooks transaction — use before qbo_attach_file to avoid duplicate uploads. Returns each attachment's Attachable id, filename, size, and content type.",
+      inputSchema: z.object({
       entityType: z
         .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
         .describe("QBO entity type of the transaction"),
       entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
+    }),
     },
     (args) =>
       runTool("qbo_list_attachments", args, async ({ entityType, entityId }) => {

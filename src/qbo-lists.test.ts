@@ -530,7 +530,7 @@ test("every tool goes through the shared response path", () => {
       !/content:\s*\[/.test(src),
       `${file} builds an MCP response directly instead of returning data from runTool`,
     );
-    if (src.includes("server.tool(")) {
+    if (src.includes("server.registerTool(")) {
       assert.match(src, /runTool/, `${file} registers tools without using runTool`);
     }
   }

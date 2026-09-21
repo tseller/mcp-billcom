@@ -541,6 +541,22 @@ modern client read **one** answer, and no protocol revision is hard-coded in
 this repo — `discover.test.ts` greps `discover.ts` to keep it that way, and
 next year's revision needs no edit here.
 
+Live books, measured on revision `billcom-mcp-00074-kuv`. On the **modern** era
+`server/discover` returns `supportedVersions: ["2026-07-28"]`, the `tools`
+capability and `serverInfo` in result `_meta`; `tools/list` returns all **42**
+tools and `tools/call qbo_account_balances` reaches live QuickBooks (Chase
+Checking 118,692.09, Divvy Credit Card Payable 4,190.36). Before this the same
+probe was a `-32601`, and every one of those 42 tools was unreachable on that
+era. On the **legacy** era nothing moved: `initialize` at `2025-06-18` opens a
+session listing the same 42 tools, `scripts/mcp-call.sh` at `2024-11-05` does
+too, and `qbo_transaction_report` for 2026-05-01..2026-06-30 is still 62 rows /
+total 57,381.82 / 19,789 chars with `divvy_list_transactions` on the same range
+still 6 rows / 2,613 chars — the numbers the sections above already record. A
+`tools/list` on a live 2025 session whose client announces `2026-07-28` returns
+those 42 tools and logs `protocol-version reconciled … client=2026-07-28
+negotiated=2025-06-18`; the claim-less `server/discover` residue is the
+`-32601` naming both eras and `routedBecause`.
+
 ## Pre-session requests
 
 Every current Claude client generation opens a conversation by POSTing

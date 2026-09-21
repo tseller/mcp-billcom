@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { ACTIVE_VENDORS, QboClient, vendorNameWhere } from "../qbo-client.js";
 import { runTool } from "../tool-logging.js";
 import { LIST_PAGING_NARROWING, listPaging } from "./list-paging.js";
@@ -11,10 +11,12 @@ const VENDOR_ROWS_DOC =
   "Paged by size as well as row count: when `hasMore` is true, call again with `startPosition: nextStartPosition`.";
 
 export function registerQboVendorTools(server: McpServer, client: QboClient) {
-  server.tool(
+  server.registerTool(
     "qbo_list_vendors",
-    "List active vendors in QuickBooks. " + VENDOR_ROWS_DOC,
-    { ...listPaging(100) },
+    {
+      description: "List active vendors in QuickBooks. " + VENDOR_ROWS_DOC,
+      inputSchema: z.object({ ...listPaging(100) }),
+    },
     (args) =>
       runTool("qbo_list_vendors", args, async ({ startPosition, maxResults, format }) => {
         const start = startPosition ?? 1;
@@ -39,12 +41,14 @@ export function registerQboVendorTools(server: McpServer, client: QboClient) {
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_search_vendors",
-    "Search for vendors by name (partial match). " + VENDOR_ROWS_DOC,
     {
+      description: "Search for vendors by name (partial match). " + VENDOR_ROWS_DOC,
+      inputSchema: z.object({
       name: z.string().describe("Vendor name to search for (supports % wildcards)"),
       ...listPaging(100),
+    }),
     },
     (args) =>
       runTool("qbo_search_vendors", args, async ({ name, startPosition, maxResults, format }) => {
@@ -71,14 +75,16 @@ export function registerQboVendorTools(server: McpServer, client: QboClient) {
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_create_vendor",
-    "Create a new vendor in QuickBooks.",
     {
+      description: "Create a new vendor in QuickBooks.",
+      inputSchema: z.object({
       displayName: z.string().describe("Vendor display name"),
       companyName: z.string().optional().describe("Company name"),
       email: z.string().optional().describe("Email address"),
       phone: z.string().optional().describe("Phone number"),
+    }),
     },
     (args) =>
       runTool("qbo_create_vendor", args, ({ displayName, companyName, email, phone }) => {

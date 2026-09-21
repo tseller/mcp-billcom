@@ -1,5 +1,5 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { McpServer } from "@modelcontextprotocol/server";
 import type { QboConfig, TokenStore } from "./qbo-client.js";
 import { InMemoryTokenStore, QboClient } from "./qbo-client.js";
 import { SecretManagerTokenStore } from "./secret-manager-store.js";
@@ -98,13 +98,20 @@ function registerAllTools(server: McpServer) {
 if (process.env.MCP_TRANSPORT === "http") {
   startHttpServer(qboConfig);
 } else {
-  const server = new McpServer(
-    { name: "treasurer-mcp", version: "0.2.0" },
-    { capabilities: { tools: {} } },
-  );
-  registerAllTools(server);
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("[mcp] Server started (stdio)");
+  // `serveStdio` owns the era decision for the connection: the opening
+  // exchange selects it and one instance from this factory is pinned for the
+  // connection's lifetime. Both eras are served (the default posture), so a
+  // 2026 client's `server/discover` opening works over stdio for the same
+  // reason it works over HTTP — rather than the modern era being a property of
+  // one transport. A hand-connected `StdioServerTransport` would serve the
+  // 2025 era only, whatever SDK it is compiled against.
+  serveStdio(() => {
+    const server = new McpServer(
+      { name: "treasurer-mcp", version: "0.2.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerAllTools(server);
+    return server;
+  });
+  console.error("[mcp] Server started (stdio, both MCP eras)");
 }

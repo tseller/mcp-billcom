@@ -373,13 +373,15 @@ function registeredTools(client: unknown) {
     string,
     { schema: Record<string, unknown>; handler: (args: Record<string, unknown>) => Promise<ToolResult> }
   >();
+  // The v2 SDK registers with `registerTool(name, config, handler)` and takes a
+  // Standard Schema object rather than a raw shape. The per-knob assertions
+  // below read the shape, so unwrap it once here.
   const server = {
-    tool: (
+    registerTool: (
       name: string,
-      _desc: string,
-      schema: Record<string, unknown>,
+      config: { inputSchema?: { shape?: Record<string, unknown> } },
       handler: (args: Record<string, unknown>) => Promise<ToolResult>,
-    ) => tools.set(name, { schema, handler }),
+    ) => tools.set(name, { schema: config.inputSchema?.shape ?? {}, handler }),
   };
   registerDivvyTools(
     server as unknown as Parameters<typeof registerDivvyTools>[0],

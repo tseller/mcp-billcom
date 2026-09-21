@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { QboClient, parseTransactionList } from "../qbo-client.js";
 import { packRows } from "../result-size.js";
 import { runTool } from "../tool-logging.js";
@@ -71,13 +71,14 @@ export function buildTransactionReport(
 }
 
 export function registerQboReportTools(server: McpServer, client: QboClient) {
-  server.tool(
+  server.registerTool(
     "qbo_transaction_report",
-    "Get a company-wide TransactionList report for a date range, optionally filtered by reconcile status. " +
+    {
+      description: "Get a company-wide TransactionList report for a date range, optionally filtered by reconcile status. " +
       "Returns flattened rows (date, type, name, memo, account, split, amount, QBO ids) plus the signed total for the WHOLE range. " +
       "Long ranges are paged automatically: when `hasMore` is true, call again with `offset: nextOffset` to get the rest — no range is too long. " +
       "NOTE: QBO silently ignores this report's account filter, so this returns ALL accounts — to get transactions for a single account (e.g. for reconciliation) use qbo_reconcile_worksheet or qbo_cleared_transactions, which filter by account client-side.",
-    {
+      inputSchema: z.object({
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
       cleared: z
@@ -90,6 +91,7 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
         .enum(["rows", "raw"])
         .optional()
         .describe("`rows` (default) returns flattened transaction rows. `raw` returns QBO's nested report JSON — much larger, and rejected outright if it exceeds the size budget."),
+    }),
     },
     (args) =>
       runTool("qbo_transaction_report", args, async ({ startDate, endDate, cleared, offset, limit, format }) => {
@@ -103,12 +105,14 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_profit_loss",
-    "Get a Profit & Loss report for a date range. Shows income and expenses by category.",
     {
+      description: "Get a Profit & Loss report for a date range. Shows income and expenses by category.",
+      inputSchema: z.object({
       startDate: z.string().describe("Start date YYYY-MM-DD"),
       endDate: z.string().describe("End date YYYY-MM-DD"),
+    }),
     },
     (args) =>
       runTool("qbo_profit_loss", args, ({ startDate, endDate }) =>
@@ -116,11 +120,13 @@ export function registerQboReportTools(server: McpServer, client: QboClient) {
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_balance_sheet",
-    "Get a Balance Sheet report as of a given date.",
     {
+      description: "Get a Balance Sheet report as of a given date.",
+      inputSchema: z.object({
       asOfDate: z.string().describe("As-of date YYYY-MM-DD"),
+    }),
     },
     (args) =>
       runTool("qbo_balance_sheet", args, ({ asOfDate }) =>

@@ -1,5 +1,8 @@
 /**
- * What `/mcp` answers a request that arrives before a session exists.
+ * What `/mcp` answers a request that reaches its **legacy leg** before a
+ * session exists.
+ *
+ * ## What this module used to be, and why it narrowed
  *
  * Every Claude client generation opens a conversation by POSTing
  * `server/discover` to `/mcp` with no session (#21). Our handler required the
@@ -7,57 +10,45 @@
  *
  *     HTTP 400  {"error": "First request must be an initialize request"}
  *
- * That is not a JSON-RPC message at all — no `jsonrpc`, no `id`, no numeric
- * error code — so there is nothing in it a client can act on. It has never
- * been user-visible only because the clients fall back to `initialize` on
- * their own; the whole mitigation is the client happening to retry. Measured
- * on production over 24h (2026-09-17T08:11Z..2026-09-18T08:11Z): 31 of these,
- * across three client families.
+ * — not a JSON-RPC message at all, so nothing in it a client could act on.
+ * This module replaced that with a JSON-RPC `-32601` that named the method,
+ * declared the server legacy-era, and pointed at `initialize`. It said so
+ * because it was true: `server/discover` is a GA'd method of MCP revision
+ * `2026-07-28`, and at the time no released SDK implemented that revision, so
+ * answering a `DiscoverResult` would have advertised an era we could not serve
+ * a single request of.
  *
- * `server/discover` is not an oddity of Tim's connector. It is a GA'd method
- * of MCP revision `2026-07-28` — the revision those clients announce — where
- * "Servers **MUST** implement it". No released `@modelcontextprotocol/sdk`
- * does: 1.30.0 (latest as of 2026-09-18) speaks `2025-11-25` at the newest and
- * the string `server/discover` appears nowhere in it. So this cannot be fixed
- * by upgrading the SDK, and it is not a bug in the client.
+ * That is no longer true. The v2 SDK serves `2026-07-28`, `/mcp` now routes
+ * modern-enveloped traffic to a real modern handler, and `server/discover`
+ * gets a real `DiscoverResult` (#40). So this module keeps only what genuinely
+ * remains unanswered, and the sentence it used to speak — "this server is
+ * legacy-era, use `initialize`" — would now be false. Two things changed:
  *
- * ## Why we answer it rather than implement it
+ * - The way in is **both** eras, not one. A request landing here has been
+ *   classified as legacy-era traffic, which is a statement about the request,
+ *   not about the server.
+ * - A method this endpoint does implement on its modern leg is no longer
+ *   "not implemented by this server". It is not a method of *the legacy era
+ *   this request was routed into* — and the answer says which, and why.
  *
- * `server/discover` returns a `DiscoverResult`, and in the spec's own era
- * model that result is the signal "this is a modern server" — one that serves
- * requests statelessly with per-request `_meta` and no handshake. We cannot
- * serve a single modern request: the SDK compiled into this build implements
- * the `initialize` handshake and nothing else. Answering a `DiscoverResult`
- * would advertise an era we cannot honor and would push a dual-era client
- * *away* from the handshake that currently works — trading a refusal the
- * client recovers from for a claim it would believe.
+ * ## Why the reason is passed in rather than guessed
  *
- * So the honest answer is the one the spec's own HTTP backward-compatibility
- * rule tells a client to read:
- *
- *   "On `400 Bad Request`, the client SHOULD inspect the response body before
- *    falling back. […] If the body is empty or is not a recognized modern
- *    JSON-RPC error, fall back to `initialize` and continue with the legacy
- *    version for subsequent requests."
- *    — Streamable HTTP, Backward Compatibility (2026-07-28)
- *
- * A JSON-RPC `-32601 Method not found` is exactly that: a well-formed body
- * that identifies us as a legacy-era server, names the versions we do speak,
- * and names `initialize` as the way in. The client's recovery becomes
- * something we told it rather than something it guessed, and a human reading
- * the response sees a sentence instead of a byte count.
+ * The routing decision and the explanation of it are one fact. `/mcp` routes
+ * with the SDK's own classifier, and hands the classifier's `reason` straight
+ * to this module, so the sentence a client reads cannot drift from the branch
+ * that was actually taken. Deriving a plausible reason here a second time is
+ * exactly the two-copies shape #15, #24 and #29 were each an instance of.
  *
  * ## The structure, not the instance
  *
- * The fix is deliberately not a case for `server/discover`. The refusal was
- * anonymous for *any* pre-session method, and next year's spec will add
- * another one. So this module is the single answer path for everything
- * `/mcp` turns away before a session exists — unknown methods, malformed
- * bodies, notifications with nowhere to go, and requests naming a session
- * that is gone — and every one of those answers is a JSON-RPC error that says
- * what to do instead.
+ * As before, this is deliberately not a case for `server/discover`. It is the
+ * single answer path for everything `/mcp`'s legacy leg turns away before a
+ * session exists — unknown methods, malformed bodies, notifications with
+ * nowhere to go, and requests naming a session that is gone — and every one of
+ * those answers is a JSON-RPC error that says what to do instead.
  */
 
+import type { LegacyRouteReason } from "./era-routing.js";
 import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "./protocol-version.js";
 
 /** JSON-RPC error codes we answer with. Matches the SDK's own numbering. */
@@ -88,23 +79,73 @@ export interface PreSessionAnswer {
 }
 
 /**
- * How a client gets from here to a working session. Attached to every answer
- * this module produces, so the advice cannot drift from the refusal — the same
- * discipline `src/tools/list-paging.ts` applies to paging advice.
+ * Why this request was routed to the legacy leg, in the SDK classifier's own
+ * vocabulary, said in a sentence a client (or a person) can act on.
+ *
+ * Every arm of `LegacyRouteReason` is named, so a reason added by a later SDK
+ * is reported by name rather than silently read as "no claim".
  */
-function wayIn(): Record<string, unknown> {
+function routedBecause(reason: LegacyRouteReason | undefined): string {
+  switch (reason) {
+    case "session":
+      return "the request names an Mcp-Session-Id, which only the legacy era has";
+    case "no-claim":
+      return "the request body carried no per-request `_meta` protocol-version claim";
+    case "initialize":
+      return "the request is an `initialize` handshake, which is legacy-era by definition";
+    case "notification":
+      return "the request is a notification with no protocol-version claim or header";
+    case "http-method":
+      return "the HTTP method is a body-less 2025-era session operation";
+    case "batch":
+      return "the request is an all-legacy JSON-RPC batch";
+    case "response":
+      return "the request is a JSON-RPC response posted to this endpoint";
+    case undefined:
+      return "the request was not classified as modern-era traffic";
+    default:
+      return `the SDK classified it as legacy-era traffic (${reason as string})`;
+  }
+}
+
+/**
+ * How a client gets from here to a working session, on **either** era.
+ * Attached to every answer this module produces, so the advice cannot drift
+ * from the refusal — the same discipline `src/tools/list-paging.ts` applies to
+ * paging advice.
+ */
+function wayIn(reason?: LegacyRouteReason): Record<string, unknown> {
   return {
-    // Named so a reader (or a client) learns which era this server is without
-    // having to infer it from a version string.
-    era: "legacy",
-    handshake: "initialize",
-    supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
-    latestSupportedVersion: LATEST_PROTOCOL_VERSION,
+    // This endpoint serves both eras of the protocol. `routedTo` is what
+    // happened to *this* request, which is the part a client can change.
+    era: "dual",
+    routedTo: "legacy",
+    routedBecause: routedBecause(reason),
+    eras: {
+      modern: {
+        revision: "2026-07-28 and later",
+        entry: "server/discover",
+        serving: "per request, no session",
+        requires:
+          "a per-request `_meta` protocol-version envelope " +
+          "(`io.modelcontextprotocol/protocolVersion`) in the body, plus the " +
+          "`MCP-Protocol-Version` and `Mcp-Method` headers",
+      },
+      legacy: {
+        revisions: SUPPORTED_PROTOCOL_VERSIONS,
+        latestRevision: LATEST_PROTOCOL_VERSION,
+        entry: "initialize",
+        serving: "sessionful, via the returned Mcp-Session-Id header",
+      },
+    },
     hint:
-      "This server implements the MCP initialize handshake (protocol " +
-      `${LATEST_PROTOCOL_VERSION} and earlier). Open a session by POSTing an ` +
-      "`initialize` request to this endpoint, then send subsequent requests " +
-      "with the returned Mcp-Session-Id header.",
+      "This endpoint serves both MCP eras on the same URL. To open a legacy " +
+      `session (protocol ${LATEST_PROTOCOL_VERSION} and earlier), POST an ` +
+      "`initialize` request here and send subsequent requests with the " +
+      "returned Mcp-Session-Id header. To be served on the modern era " +
+      "instead, send the per-request `_meta` protocol-version envelope and " +
+      "the SEP-2243 standard headers; `server/discover` is answered there " +
+      "with a real DiscoverResult.",
   };
 }
 
@@ -120,15 +161,18 @@ function methodName(body: unknown): string | undefined {
 }
 
 /**
- * The answer for a POST to `/mcp` that carries no session id and is not an
- * `initialize` request.
+ * The answer for a POST to `/mcp` that was routed to the legacy leg, carries
+ * no session id, and is not an `initialize` request.
  *
  * Status stays `400` in every case. That is what the spec's backward-
- * compatibility rule expects a legacy-era server to answer a modern request
- * with, and it is what the clients already recover from; what changes is that
- * the body is now a JSON-RPC error they can read.
+ * compatibility rule expects a legacy-era exchange to answer with, and it is
+ * what the clients already recover from; the body is a JSON-RPC error they can
+ * read, and now names the modern way in as well.
  */
-export function answerPreSession(body: unknown): PreSessionAnswer {
+export function answerPreSession(
+  body: unknown,
+  reason?: LegacyRouteReason,
+): PreSessionAnswer {
   const method = methodName(body);
   const id = requestId(body);
 
@@ -142,7 +186,7 @@ export function answerPreSession(body: unknown): PreSessionAnswer {
         error: {
           code: JSON_RPC.invalidRequest,
           message: "Invalid Request: expected a JSON-RPC message naming a method",
-          data: wayIn(),
+          data: wayIn(reason),
         },
       },
     };
@@ -162,7 +206,7 @@ export function answerPreSession(body: unknown): PreSessionAnswer {
         error: {
           code: JSON_RPC.invalidRequest,
           message: `Cannot accept notification \`${method}\`: no session has been established`,
-          data: wayIn(),
+          data: wayIn(reason),
         },
       },
     };
@@ -170,14 +214,20 @@ export function answerPreSession(body: unknown): PreSessionAnswer {
 
   return {
     status: 400,
-    reason: `unimplemented pre-session method ${method}`,
+    reason: `unimplemented pre-session method ${method} on the legacy leg`,
     body: {
       jsonrpc: "2.0",
       id,
       error: {
         code: JSON_RPC.methodNotFound,
-        message: `Method not found: \`${method}\` is not implemented by this server`,
-        data: { method, ...wayIn() },
+        // Deliberately not "not implemented by this server": a method this
+        // endpoint serves on its modern leg is implemented — this request was
+        // routed to the leg that does not define it, and `data` says which and
+        // how to reach the other one.
+        message:
+          `Method not found: \`${method}\` is not a pre-session method of the ` +
+          "legacy era this request was routed to",
+        data: { method, ...wayIn(reason) },
       },
     },
   };
@@ -187,11 +237,9 @@ export function answerPreSession(body: unknown): PreSessionAnswer {
  * The answer for a request naming a session this instance does not have —
  * expired, or served by an instance that has since been replaced.
  *
- * Kept here so `/mcp` speaks JSON-RPC on every path it refuses: this used to
- * be `{"error": "Session not found"}`, the same unreadable shape for the same
- * reason. `404` and `-32001` match what the SDK's own transport answers, so a
- * client that already recognizes the SDK's session-expiry response recognizes
- * ours.
+ * Kept here so `/mcp` speaks JSON-RPC on every path it refuses. `404` and
+ * `-32001` match what the SDK's own transport answers, so a client that
+ * already recognizes the SDK's session-expiry response recognizes ours.
  */
 export function answerUnknownSession(sessionId: string | undefined): PreSessionAnswer {
   return {
@@ -209,7 +257,8 @@ export function answerUnknownSession(sessionId: string | undefined): PreSessionA
           hint:
             "The session named by Mcp-Session-Id is not known to this server " +
             "(it expired, or the instance holding it was replaced). Start a " +
-            "new one by POSTing an `initialize` request to this endpoint.",
+            "new one by POSTing an `initialize` request to this endpoint. " +
+            "The modern era needs no session at all — see `eras.modern`.",
         },
       },
     },
@@ -227,7 +276,7 @@ export function answerMissingSession(): PreSessionAnswer {
       error: {
         code: JSON_RPC.invalidRequest,
         message: "Invalid Request: missing Mcp-Session-Id header",
-        data: wayIn(),
+        data: wayIn("http-method"),
       },
     },
   };

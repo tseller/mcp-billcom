@@ -12,8 +12,10 @@
     "gmail:link": "node --env-file=.env --import=tsx src/scripts/gmail-link.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "zod": "^3.25.0"
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "express": "^5.2.1",
+    "zod": "^4.2.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

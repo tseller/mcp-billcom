@@ -13,19 +13,22 @@ import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "./protocol
  * captured from production on 2026-09-18 (#21):
  *   [http] POST /mcp rejected 400 rpc=server/discover session=-
  *          protocolVersion=2026-07-28 ua=claude-code/2.1.260 (sdk-ts, …)
- * `server/discover` is a GA'd method of MCP revision 2026-07-28; no released
- * SDK implements it (1.30.0 is on 2025-11-25), so it must be *answered*, not
- * special-cased into existence.
+ *
+ * A probe in *this* shape no longer reaches this module at all: it carries the
+ * per-request `_meta` protocol-version claim, so `/mcp` classifies it as modern
+ * and the modern leg answers it with a real DiscoverResult (#40). What still
+ * arrives here is the claim-less variant below — the same method asked in a
+ * shape that cannot be served on the era it belongs to.
  */
-const DISCOVER = {
+const CLAIMLESS_DISCOVER = {
   jsonrpc: "2.0",
   id: "discover-1",
   method: "server/discover",
-  params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+  params: {},
 };
 
-test("the connector's probe is answered with a JSON-RPC error, not a bare string", () => {
-  const answer = answerPreSession(DISCOVER);
+test("a claim-less modern method is answered with a JSON-RPC error, not a bare string", () => {
+  const answer = answerPreSession(CLAIMLESS_DISCOVER, "no-claim");
   assert.equal(answer.status, 400);
   assert.equal(answer.body.jsonrpc, "2.0");
   assert.equal(answer.body.id, "discover-1");
@@ -33,25 +36,65 @@ test("the connector's probe is answered with a JSON-RPC error, not a bare string
   assert.match(answer.body.error.message, /server\/discover/);
 });
 
-test("the answer names the way in: initialize, and the versions we speak", () => {
-  const data = answerPreSession(DISCOVER).body.error.data!;
-  assert.equal(data.handshake, "initialize");
-  assert.equal(data.era, "legacy");
-  assert.deepEqual(data.supportedVersions, SUPPORTED_PROTOCOL_VERSIONS);
-  assert.equal(data.latestSupportedVersion, LATEST_PROTOCOL_VERSION);
+test("the answer no longer calls this server legacy-era — it names both ways in", () => {
+  const data = answerPreSession(CLAIMLESS_DISCOVER, "no-claim").body.error.data!;
+  // The server serves both eras; `routedTo` is what happened to this request,
+  // which is the part the client can change.
+  assert.equal(data.era, "dual");
+  assert.equal(data.routedTo, "legacy");
+
+  const eras = data.eras as Record<string, Record<string, unknown>>;
+  assert.equal(eras.legacy.entry, "initialize");
+  assert.deepEqual(eras.legacy.revisions, SUPPORTED_PROTOCOL_VERSIONS);
+  assert.equal(eras.legacy.latestRevision, LATEST_PROTOCOL_VERSION);
+  assert.equal(eras.modern.entry, "server/discover");
   assert.match(String(data.hint), /initialize/);
+  assert.match(String(data.hint), /server\/discover/);
 });
 
-test("the version the client announced is not in the list we claim to speak", () => {
-  // The list has to be the SDK's own, not a hand-kept copy that could claim
-  // 2026-07-28 and send the client back down a path we cannot serve.
-  const data = answerPreSession(DISCOVER).body.error.data!;
-  assert.equal((data.supportedVersions as string[]).includes("2026-07-28"), false);
+test("the answer says why this request was routed to the legacy leg", () => {
+  // The reason is the SDK classifier's own, handed through by the route that
+  // took the branch — so the sentence a client reads cannot drift from the
+  // decision that was actually made.
+  const claimless = answerPreSession(CLAIMLESS_DISCOVER, "no-claim").body.error.data!;
+  assert.match(String(claimless.routedBecause), /protocol-version claim/);
+
+  const batched = answerPreSession(CLAIMLESS_DISCOVER, "batch").body.error.data!;
+  assert.match(String(batched.routedBecause), /batch/);
+
+  // Every arm of the SDK's reason union is named rather than collapsing into a
+  // default, so a reason added by a later SDK is reported by name.
+  for (const reason of ["no-claim", "initialize", "notification", "http-method", "batch", "response"] as const) {
+    const data = answerPreSession(CLAIMLESS_DISCOVER, reason).body.error.data!;
+    assert.ok(
+      !/the SDK classified it as/.test(String(data.routedBecause)),
+      `${reason} fell through to the default`,
+    );
+  }
+});
+
+test("the legacy leg's version list still excludes the modern revision", () => {
+  // `initialize` cannot negotiate 2026-07-28 — the modern era has no handshake
+  // — so claiming it in the legacy list would send a client down a path that
+  // leg cannot serve. The modern era is named separately, where it is true.
+  const data = answerPreSession(CLAIMLESS_DISCOVER, "no-claim").body.error.data!;
+  const eras = data.eras as Record<string, Record<string, unknown>>;
+  assert.equal((eras.legacy.revisions as string[]).includes("2026-07-28"), false);
+  assert.match(String(eras.modern.revision), /2026-07-28/);
+});
+
+test("the message does not claim a method this server implements is unimplemented", () => {
+  // `server/discover` *is* implemented here — on the modern leg. Saying it "is
+  // not implemented by this server" would be false, and would push a dual-era
+  // client away from the path that works.
+  const message = answerPreSession(CLAIMLESS_DISCOVER, "no-claim").body.error.message;
+  assert.ok(!/not implemented by this server/.test(message), message);
+  assert.match(message, /legacy era this request was routed to/);
 });
 
 test("it is not a special case for server/discover — any method is answered", () => {
   for (const method of ["tools/list", "server/discover", "some/future-method"]) {
-    const answer = answerPreSession({ jsonrpc: "2.0", id: 7, method });
+    const answer = answerPreSession({ jsonrpc: "2.0", id: 7, method }, "no-claim");
     assert.equal(answer.body.error.code, JSON_RPC.methodNotFound);
     assert.equal(answer.body.error.data!.method, method);
     assert.equal(answer.body.id, 7);
@@ -61,7 +104,7 @@ test("it is not a special case for server/discover — any method is answered", 
 test("a pre-session notification is refused with an id-less JSON-RPC error", () => {
   // JSON-RPC forbids a response carrying an id the client never sent; the
   // Streamable HTTP spec allows the error body with no id.
-  const answer = answerPreSession({ jsonrpc: "2.0", method: "notifications/initialized" });
+  const answer = answerPreSession({ jsonrpc: "2.0", method: "notifications/initialized" }, "notification");
   assert.equal(answer.status, 400);
   assert.equal(answer.body.id, null);
   assert.equal(answer.body.error.code, JSON_RPC.invalidRequest);
@@ -70,17 +113,18 @@ test("a pre-session notification is refused with an id-less JSON-RPC error", () 
 
 test("a body that is not a JSON-RPC message is still answered in JSON-RPC", () => {
   for (const body of [undefined, null, {}, "hello", { id: 1 }, { method: 42 }]) {
-    const answer = answerPreSession(body);
+    const answer = answerPreSession(body, "no-claim");
     assert.equal(answer.status, 400);
     assert.equal(answer.body.error.code, JSON_RPC.invalidRequest);
-    assert.equal(answer.body.error.data!.handshake, "initialize");
+    const eras = answer.body.error.data!.eras as Record<string, Record<string, unknown>>;
+    assert.equal(eras.legacy.entry, "initialize");
   }
 });
 
 test("every answer carries a reason for the log line", () => {
   const answers = [
-    answerPreSession(DISCOVER),
-    answerPreSession({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    answerPreSession(CLAIMLESS_DISCOVER, "no-claim"),
+    answerPreSession({ jsonrpc: "2.0", method: "notifications/initialized" }, "notification"),
     answerPreSession({}),
     answerUnknownSession("52f61bc9"),
     answerMissingSession(),
@@ -109,7 +153,11 @@ test("a missing session header is a JSON-RPC error too", () => {
 test("no answer is the unparseable shape this replaced", () => {
   // `{"error": "First request must be an initialize request"}` — a body with
   // no `jsonrpc`, no numeric code and no id is what made the refusal anonymous.
-  for (const answer of [answerPreSession(DISCOVER), answerUnknownSession("x"), answerMissingSession()]) {
+  for (const answer of [
+    answerPreSession(CLAIMLESS_DISCOVER, "no-claim"),
+    answerUnknownSession("x"),
+    answerMissingSession(),
+  ]) {
     assert.equal(answer.body.jsonrpc, "2.0");
     assert.equal(typeof answer.body.error.code, "number");
     assert.ok("id" in answer.body);

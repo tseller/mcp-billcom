@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { QboClient, parseProfitAndLossByClass, type AccountingMethod } from "../qbo-client.js";
 import { buildBudgetVsActuals, type QboBudget } from "../budget-actuals.js";
 import { packRows } from "../result-size.js";
@@ -32,16 +32,18 @@ const summarize = (b: QboBudget, includeDetail: boolean) => ({
 });
 
 export function registerQboBudgetTools(server: McpServer, client: QboClient) {
-  server.tool(
+  server.registerTool(
     "qbo_list_budgets",
-    `List QuickBooks budgets, optionally with their line detail (amount per account, per class, per period). ${READ_ONLY_NOTE}`,
     {
+      description: `List QuickBooks budgets, optionally with their line detail (amount per account, per class, per period). ${READ_ONLY_NOTE}`,
+      inputSchema: z.object({
       nameContains: z.string().optional().describe("Case-insensitive substring filter on the budget name"),
       includeInactive: z.boolean().optional().describe("Include inactive budgets (default false)"),
       includeDetail: z
         .boolean()
         .optional()
         .describe("Include every BudgetDetail row — account, class, period, amount (default false; can be long)"),
+    }),
     },
     (args) =>
       runTool(
@@ -72,10 +74,11 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
       ),
   );
 
-  server.tool(
+  server.registerTool(
     "qbo_budget_vs_actuals",
-    "Compare a budget to actual income and expenses, broken out by class (season). QuickBooks has no budget-vs-actuals report in its API, so this is computed: the budget's own detail rows (account × class × period) joined against a Profit & Loss summarised by class for the same window. Untagged actuals are reported with a null class so they can't quietly disappear from the comparison.",
     {
+      description: "Compare a budget to actual income and expenses, broken out by class (season). QuickBooks has no budget-vs-actuals report in its API, so this is computed: the budget's own detail rows (account × class × period) joined against a Profit & Loss summarised by class for the same window. Untagged actuals are reported with a null class so they can't quietly disappear from the comparison.",
+      inputSchema: z.object({
       budgetId: z.string().describe("Budget id (from qbo_list_budgets)"),
       startDate: z
         .string()
@@ -99,6 +102,7 @@ export function registerQboBudgetTools(server: McpServer, client: QboClient) {
         .optional()
         .describe("Row offset for paging (default 0). Use the `nextOffset` from a previous call."),
       limit: z.number().int().min(1).optional().describe("Max rows to return in this page"),
+    }),
     },
     (args) =>
       runTool(

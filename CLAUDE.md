@@ -35,7 +35,7 @@ gcloud config configurations activate mcp-billcom
 ## Architecture
 
 - **ESM project** using TypeScript with Node16 module resolution
-- `src/index.ts` — entry point: registers QBO and/or Divvy tools based on available env vars
+- `src/index.ts` — entry point: registers QBO and/or Divvy tools based on available env vars. The stdio path goes through `serveStdio` rather than a hand-connected `StdioServerTransport`, so stdio serves both protocol eras too — see "Protocol eras" below
 - `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
 - `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
 - `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
@@ -60,11 +60,13 @@ gcloud config configurations activate mcp-billcom
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
 - `src/divvy-rows.ts` — the flattened Divvy row (`slimTransaction`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
-- `src/protocol-version.ts` — MCP protocol-version negotiation + header reconciliation (see "Protocol version" below)
+- `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
+- `src/era-routing.ts` — which leg of `/mcp` serves a request: the SDK's `classifyInboundRequest`, plus the one rule that goes in front of it (an `Mcp-Session-Id` means legacy, always). See "Protocol eras" below
+- `src/discover.ts` — what the modern leg advertises, read by **asking** the modern leg rather than restating it beside it. No protocol revision is hard-coded in this repo; a test greps for one
 - `src/idempotency.ts` — idempotency-key store for create tools (Firestore in HTTP mode, in-memory for stdio)
 - `src/gmail-client.ts` — Gmail attachment fetch for qbo_attach_file (per-account refresh tokens)
 - `src/scripts/gmail-link.ts` — one-time bootstrap to mint a Gmail refresh token (`npm run gmail:link`)
-- SDK: `@modelcontextprotocol/sdk` ^1.26.0
+- SDK: the v2 package family — `@modelcontextprotocol/server` ^2.0.0 (`McpServer`, `createMcpHandler`, the classifier) and `@modelcontextprotocol/node` ^2.0.0 (the Node transport + `toNodeHandler`). The monolithic v1 `@modelcontextprotocol/sdk` is gone; it never implemented revision 2026-07-28. Tools register with `registerTool(name, { description, inputSchema }, handler)` and a Standard Schema object (`z.object(...)`), not a raw shape, and zod is 4.x (the v2 floor)
 - All logging goes to stderr (stdout is MCP protocol)
 
 ## Tool result size
@@ -395,19 +397,97 @@ loosened; the server only ever speaks what it advertised in its own
 `initialize` response. Newer and older unknown versions are treated alike, so
 next year's version needs no code change.
 
-Two traps worth knowing:
+This is **legacy-era** machinery and only that: the modern era negotiates no
+session version, so there is nothing for it to reconcile. `src/era-routing.ts`
+keeps it reachable — see "Protocol eras" below, where the same failure
+reappeared once and is now pinned by a test.
 
-- `StreamableHTTPServerTransport` rebuilds the request via `@hono/node-server`,
-  which reads `IncomingMessage.rawHeaders` — **not** the `req.headers` object
-  Express middleware mutates. `setRequestHeader()` writes both; changing only
-  `req.headers` looks like a working fix and changes nothing.
+Three traps worth knowing:
+
+- `NodeStreamableHTTPServerTransport` rebuilds the request via
+  `@hono/node-server`, which reads `IncomingMessage.rawHeaders` — **not** the
+  `req.headers` object Express middleware mutates. `setRequestHeader()` writes
+  both; changing only `req.headers` looks like a working fix and changes
+  nothing.
 - The `[http] … rejected …` logger is mounted **before** body parsing and auth,
   so it names every refusal — including 401s and unparseable bodies, which
   skipped it when it sat after `express.json()`.
+- The reconciler must run on the legacy branch of the era fork, not in front of
+  it. Classification is body-primary, so a live 2025 session whose client
+  echoes `MCP-Protocol-Version: 2026-07-28` reads as a *malformed modern
+  request* unless the session id is read first.
 
-`GET /health` reports the deployed `latest`/`supported` version list, the Cloud
-Run revision and the policy — so "which versions does prod speak?" is a curl,
-not a deploy or a log dig.
+`GET /health` reports the deployed version lists for both eras, the Cloud Run
+revision and the policy — so "which protocol does prod speak?" is a curl, not a
+deploy or a log dig.
+
+## Protocol eras
+
+An **era** is a behavior family, not a version string. `2024-10-07` through
+`2025-11-25` open with the `initialize` handshake and share one wire behavior
+(the SDK calls that family `legacy`). `2026-07-28` starts the `modern` era: no
+handshake, a `server/discover` advertisement instead, a per-request `_meta`
+envelope, and no sessions at all.
+
+`/mcp` serves **both**, on one URL, from one tool registry:
+
+- The **modern** leg is `createMcpHandler(buildServer, { legacy: "reject" })`.
+  `legacy: "reject"` is deliberate — the handler's own legacy posture is
+  stateless-per-request, which answers a client's `GET` and `DELETE` with `405`
+  and would drop the sessions this deployment's clients already hold.
+- The **legacy** leg is the sessionful `NodeStreamableHTTPServerTransport`
+  wiring that was already here, unchanged.
+- `buildServer()` is the single registration list both legs build from, so a
+  tool cannot reach one era and not the other. On stdio, `serveStdio` does the
+  same job: a hand-connected `StdioServerTransport` serves the 2025 era only,
+  whatever SDK it is built against.
+
+`src/era-routing.ts` decides which leg. It delegates to the SDK's own
+`classifyInboundRequest` — the same step `createMcpHandler` performs
+internally, so the branch cannot disagree with either leg — with **one** rule
+in front of it:
+
+> A request naming an `Mcp-Session-Id` is legacy-era traffic. Always.
+
+That rule is not a nicety. The first cut of the era fork classified first, and
+reproduced #15 exactly: the Streamable HTTP spec tells a client to echo
+`MCP-Protocol-Version` on every request after `initialize`, Tim's connector
+echoes `2026-07-28`, and that header with no envelope in the body is — to a
+body-primary classifier — a malformed modern request. Every tool call on a live
+session was refused `-32602` before any tool ran. Captured from a local build:
+
+```
+POST /mcp  Mcp-Session-Id: 8d5380e2-…  MCP-Protocol-Version: 2026-07-28
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+→ 400 -32602 "…names protocol revision 2026-07-28, but the request is missing
+             the required per-request envelope key(s)…"
+[http] … why=modern claim rejected at envelope (modern-header-without-claim)
+```
+
+The narrow fix excepts that one version string and fails again when the spec
+moves. The structural one is that a request which names a session has already
+said which leg owns it, and no header archaeology may overrule it. An
+*unknown* session takes the same branch, so a client whose instance was
+replaced gets the legacy leg's `404` telling it to re-`initialize` rather than
+a modern parameter error.
+
+What the modern era requires on the wire (SEP-2243), worth knowing because
+sending half of it is refused rather than served:
+
+| part | where | if missing |
+| --- | --- | --- |
+| `io.modelcontextprotocol/protocolVersion` in `params._meta` | body | classified **legacy** — no modern claim at all |
+| `MCP-Protocol-Version` header | headers | `-32020`, headers and body disagree |
+| `Mcp-Method` header | headers | `-32020`, on every modern request POST |
+| `Mcp-Name` header | headers | required for the methods that mirror `params.name` (e.g. `tools/call`) |
+
+`src/discover.ts` is how `/health` knows what the modern leg serves: it asks
+it. A claim-less request is refused by a modern-only handler with `-32022` and
+`data.supported` names the endpoint's own revisions; the real `server/discover`
+is then spoken back at it and the `DiscoverResult` reported. So `/health` and a
+modern client read **one** answer, and no protocol revision is hard-coded in
+this repo — `discover.test.ts` greps `discover.ts` to keep it that way, and
+next year's revision needs no edit here.
 
 ## Pre-session requests
 
@@ -423,38 +503,44 @@ mitigation was the client happening to retry (#21).
 
 `server/discover` is not a quirk of Tim's connector. It is a **GA'd method of
 MCP revision `2026-07-28`** — the revision those clients announce in
-`MCP-Protocol-Version` — whose spec says servers **MUST** implement it. No
-released `@modelcontextprotocol/sdk` does: 1.30.0 (latest as of 2026-09-18)
-speaks `2025-11-25` at the newest and the string `server/discover` appears
-nowhere in the package. Upgrading the SDK does not fix this, and the client is
-not misbehaving.
+`MCP-Protocol-Version` — whose spec says servers **MUST** implement it.
 
-We **answer** it rather than implement it, deliberately. `server/discover`
-returns a `DiscoverResult`, which in the spec's own era model is the signal
-"this is a *modern* server" — one that serves requests statelessly with
-per-request `_meta` and no handshake. This build cannot serve a single modern
-request, so answering a `DiscoverResult` would advertise an era we can't honor
-and push a dual-era client *away* from the handshake that works. Instead
-`src/pre-session.ts` answers the body the spec's own HTTP backward-compat rule
-tells a client to read ("on `400`, inspect the response body before falling
-back… if it is not a recognized modern JSON-RPC error, fall back to
-`initialize`"): a JSON-RPC `-32601` naming the method, `era: "legacy"`,
-`handshake: "initialize"`, the versions we do speak, and a sentence saying what
-to send. The client's recovery is now something we told it, not something it
-guessed.
+For a while we **answered** it rather than implemented it, deliberately: no
+released `@modelcontextprotocol/sdk` did (v1.30.0, the last of that line, spoke
+`2025-11-25` at the newest and the string `server/discover` appeared nowhere in
+the package), and returning a `DiscoverResult` is the spec's own signal "this is
+a *modern* server" — which that build could not have honored for a single
+request. So `src/pre-session.ts` answered the body the spec's HTTP
+backward-compat rule tells a client to read: a JSON-RPC `-32601` naming the
+method, the era, the versions we did speak, and a sentence saying what to send.
 
-The fix is not a case for `server/discover`. Every way `/mcp` turns a request
-away before it reaches a session goes through the one module and answers in
-JSON-RPC — an unimplemented method (`-32601`), a body that names no method or a
-notification with nowhere to go (`-32600`), an expired/unknown session
-(`404`/`-32001`, matching the shape the SDK's own transport sends) and a
-missing `Mcp-Session-Id`. So next year's pre-session method is answered without
-a code change. Each answer also carries a `reason`, which the rejection logger
-prints as `why=` — the log line and the response body are two views of one
-decision rather than two texts that can drift.
+**That is over.** The v2 SDK serves `2026-07-28`, `/mcp` routes modern traffic
+to a real modern handler, and `server/discover` now returns a real
+`DiscoverResult` — the revisions, the capabilities, and `serverInfo` in result
+`_meta` (the modern era has no `initialize` response to carry identity in). See
+"Protocol eras" above.
 
-`GET /health` states `protocol.era` and `protocol.preSessionMethodPolicy`, so a
-client (or a person) can learn which era prod is without provoking a refusal.
+What `src/pre-session.ts` still answers is the narrowed residue: a request that
+reached the **legacy leg** and cannot open a session there — including a modern
+method asked in a shape carrying no modern claim. It no longer calls this
+server legacy-era, and no longer says a method we do serve "is not implemented
+by this server"; both would now be false. Instead it names `era: "dual"`,
+`routedTo: "legacy"`, the classifier's own `routedBecause`, and both ways in.
+
+The module is still deliberately not a case for `server/discover`. Every way
+`/mcp`'s legacy leg turns a request away before a session exists goes through
+it and answers in JSON-RPC — a method that era does not define (`-32601`), a
+body that names no method or a notification with nowhere to go (`-32600`), an
+expired/unknown session (`404`/`-32001`, matching the shape the SDK's own
+transport sends) and a missing `Mcp-Session-Id`. Each answer also carries a
+`reason`, which the rejection logger prints as `why=` — the log line and the
+response body are two views of one decision rather than two texts that can
+drift.
+
+`GET /health` states `protocol.era` (`"dual"`), the modern leg's own
+`DiscoverResult` fields, the legacy version list and
+`protocol.preSessionMethodPolicy`, so a client (or a person) can learn what
+prod serves without provoking a refusal.
 
 ## Environment Variables
 

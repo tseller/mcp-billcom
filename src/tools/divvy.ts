@@ -3,8 +3,9 @@ import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
-import { buildCursorList, slimTransaction } from '../divvy-rows.js';
+import { buildCursorList, slimCard, slimTransaction } from '../divvy-rows.js';
 import { FilterCheck } from '../divvy-filters.js';
+import type { Witness } from '../empty-listing.js';
 import { assembleBudgets } from '../divvy-budgets.js';
 import {
   BILL_MAX_PAGE_SIZE,
@@ -21,6 +22,37 @@ import { CURSOR_PAGING_NARROWING, cursorNarrowing, cursorPaging } from './list-p
  */
 const defaultPageSize = (list: BillListName, asked: unknown): number =>
   Number(asked) > 0 ? Number(asked) : BILL_MAX_PAGE_SIZE[list];
+
+/**
+ * An independent answer to "does this company have any cards?", for the
+ * zero-row case only — every transaction names the card that made it, so a
+ * card list that comes back empty while transactions name cards is a blind
+ * source rather than an empty wallet. That is exactly how BILL's budget list
+ * failed (issue #34), on the same books, with the same shape of silence.
+ *
+ * Only consulted when the listing has no rows, so the everyday call still
+ * costs one BILL request. A witness that cannot be fetched is no witness: the
+ * failure returns none, and the `empty` block then says `unverified` rather
+ * than claiming something it did not check.
+ */
+async function cardsNamedByTransactions(client: DivvyClient): Promise<Witness[]> {
+  try {
+    const page = await client.listTransactions({
+      pageSize: String(BILL_MAX_PAGE_SIZE.transactions),
+    });
+    const rows = Array.isArray(page.results) ? page.results : [];
+    const named = new Map<string, string>();
+    for (const tx of rows as Array<Record<string, unknown>>) {
+      const id = (tx.cardUuid ?? tx.cardId) as string | undefined;
+      if (!id || named.has(id)) continue;
+      const name = typeof tx.cardName === 'string' ? tx.cardName.trim() : '';
+      named.set(id, name || (tx.cardLastFour ? `card ending ${tx.cardLastFour}` : id));
+    }
+    return [{ source: 'recent transactions', found: named.size, sample: [...named.values()] }];
+  } catch {
+    return [];
+  }
+}
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.tool(
@@ -241,9 +273,51 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
 
   server.tool(
     'divvy_list_cards',
-    'List all Divvy (BILL Spend & Expense) virtual and physical cards',
-    {},
-    (args) => runTool('divvy_list_cards', args, () => client.listCards()),
+    'List Divvy (BILL Spend & Expense) virtual and physical cards. ' +
+      "Returns one flattened row per card — name (a physical card has none, so `lastFour` names it), last four, type, status, the cardholder's uuid, the budget it draws on in both spellings `divvy_list_transactions {\"budgetId\": …}` accepts, and the current period's limit and spend. " +
+      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.cards}, BILL's own page maximum for this list), and when \`hasMore\` is true, call again with \`page: nextPage\`. ` +
+      'A listing that returns nothing says which kind of nothing it found (`empty`), checked against the cards named by recent transactions. ' +
+      '`format: "raw"` returns BILL\'s full card objects — several times larger, and rejected outright if the page exceeds the size budget.',
+    {
+      ...cursorPaging(billPagingLimits('cards')),
+    },
+    (args) =>
+      runTool(
+        'divvy_list_cards',
+        args,
+        // This tool took no arguments at all: it made one unparameterized call,
+        // so BILL served its default page of 20 and handed back a cursor the
+        // caller had no way to pass back — 20 of 21 cards, silently (issue
+        // #43). The default `target` is BILL's own page maximum for this list
+        // (100), so the everyday ask on these books is one call and every card.
+        async ({ format, page, pageSize }) => {
+          const walked = await walkBillPages<Record<string, unknown>>({
+            list: 'cards',
+            target: defaultPageSize('cards', pageSize),
+            page,
+            fetch: (p) => client.listCards(p),
+            measure: (card) => compact(format === 'raw' ? card : slimCard(card)).length,
+            budgetChars: rowBudget(),
+          });
+
+          if (format === 'raw') {
+            return { ...walked.last, results: walked.rows, nextPage: walked.nextPage };
+          }
+          return buildCursorList({
+            entity: 'Card',
+            key: 'cards',
+            rows: walked.rows.map(slimCard),
+            nextPage: walked.nextPage,
+            // A per-page sum of card balances states nothing true: `spent` is
+            // each card's own current period, and cards sharing a budget's
+            // funds would be added together as if they were separate money.
+            sumField: null,
+            billPages: walked.billPages,
+            witnesses: walked.rows.length === 0 ? await cardsNamedByTransactions(client) : undefined,
+          });
+        },
+        { narrowing: CURSOR_PAGING_NARROWING },
+      ),
   );
 
   server.tool(

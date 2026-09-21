@@ -9,9 +9,17 @@
  *
  * That turned into 16 silent tool failures in 30 days for Tim's Claude
  * connector (#15): the connector announces `2026-07-28`, a version no released
- * `@modelcontextprotocol/sdk` speaks (1.30.0, the latest as of 2026-09-17, is
- * still on `2025-11-25`), so nothing ran, nothing was logged about the tool,
- * and the Claude UI showed a bare "the tool errored".
+ * SDK spoke at the time (v1.30.0, the last of that line, was still on
+ * `2025-11-25`), so nothing ran, nothing was logged about the tool, and the
+ * Claude UI showed a bare "the tool errored".
+ *
+ * This server now *does* serve `2026-07-28`, on its own leg (#40) — but that
+ * does not retire any of what follows. The legacy `initialize` handshake
+ * cannot negotiate the modern revision, so the list below deliberately stops
+ * where it did, and a 2025 session whose client echoes a modern version string
+ * in its header is still exactly this problem. `src/era-routing.ts` is what
+ * keeps such a request on this leg rather than re-reading it as a malformed
+ * modern one.
  *
  * The structural problem is that the same fact — what version this session
  * speaks — is stated in two places that can disagree: the version the server

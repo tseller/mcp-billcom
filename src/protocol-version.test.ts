@@ -14,8 +14,13 @@ import {
  * 2026-09-17 (#15):
  *   [http] POST /mcp rejected 400 rpc=server/discover session=-
  *          protocolVersion=2026-07-28 ua=Claude-User
- * No released @modelcontextprotocol/sdk speaks it — 1.30.0, the latest, is
+ * No released SDK spoke it at the time — v1.30.0, the last of that line, was
  * still on 2025-11-25 — so it must not be an allow-listed special case.
+ *
+ * This server serves 2026-07-28 now (#40), on its own leg. It is still not a
+ * version the *legacy* handshake can negotiate, which is what these tests are
+ * about: `initialize` has no modern revision to settle on, so a session that
+ * announces one in a header is still reconciled rather than refused.
  */
 const CONNECTOR_VERSION = "2026-07-28";
 

@@ -38,7 +38,7 @@ gcloud config configurations activate mcp-billcom
 - `src/index.ts` — entry point: registers QBO and/or Divvy tools based on available env vars. The stdio path goes through `serveStdio` rather than a hand-connected `StdioServerTransport`, so stdio serves both protocol eras too — see "Protocol eras" below
 - `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
 - `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
-- `src/http-server.ts` — Streamable HTTP transport for Cloud Run deployment
+- `src/http-server.ts` — the Cloud Run deployment's `/mcp`: the sessionful legacy Streamable HTTP transport, the per-request modern handler, and the `/health` both are reported on. `buildServer()` here is the single tool-registration list both eras build from — see "Protocol eras" below
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts (flattened rows + paging), account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors (both flattened rows + paging), create_vendor
 - `src/tools/list-paging.ts` — the paging vocabularies, each paired with the sentence that names its knobs when a result is over budget (so advice and schema can't drift): `listPaging(defaultMaxResults)` (`startPosition`/`maxResults`/`format`, the QBO entity queries), `OFFSET_PAGING_NARROWING` (the `offset`/`limit` report tools) and `cursorPaging(limits)` (`page`/`pageSize`/`format`, BILL's opaque cursor — the `pageSize` bound comes from `src/divvy-paging.ts` rather than being restated here)
@@ -434,10 +434,16 @@ A Streamable HTTP client echoes an `MCP-Protocol-Version` header on every
 request after `initialize`, and the SDK transport refuses a version it doesn't
 know with `400 Bad Request: Unsupported protocol version` **before any tool
 runs**. Tim's Claude connector announces `2026-07-28`, which no released SDK
-speaks (1.30.0, latest as of 2026-09-17, is still on `2025-11-25`) — so
-upgrading the SDK does not fix it. That produced 16 silent tool failures in 30
-days: nothing ran, nothing was logged about the tool, and the Claude UI showed
-a bare "the tool errored".
+spoke at the time (v1.30.0, the last of that line, was still on `2025-11-25`) —
+so upgrading the SDK did not fix it. That produced 16 silent tool failures in
+30 days: nothing ran, nothing was logged about the tool, and the Claude UI
+showed a bare "the tool errored".
+
+This server serves `2026-07-28` now, on its own leg (#40) — and that retires
+none of what follows. The `initialize` handshake still cannot negotiate a
+modern revision (the modern era has no handshake at all), so the supported list
+below deliberately stops where it did, and a live 2025 session whose client
+echoes a modern version string is still exactly this failure.
 
 The cause was that the same fact — what version this session speaks — lived in
 two places that could drift: the version negotiated at `initialize` and the

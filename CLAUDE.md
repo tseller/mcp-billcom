@@ -56,7 +56,7 @@ gcloud config configurations activate mcp-billcom
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions and list_cards (both flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, members, budgets, list_pending_action
 - `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
-- `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets and custom-field values 100, each probed), and `walkBillPages()`, which serves a caller's row count by walking BILL's cursor. Every paged BILL call goes through `DivvyClient.getBillPage` — see "Page size" below
+- `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets, custom fields and custom-field values 100, each probed), `walkBillPages()`, which serves a caller's row count by walking BILL's cursor, and `DIVVY_LIST_TOOLS`/`UNPAGED_DIVVY_LISTS`, the table that requires every `divvy_list_*` tool to declare its paging or its reason for having none. Every paged BILL call goes through `DivvyClient.getBillPage` — see "Page size" and "Every listing declares its paging" below
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
 - `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
@@ -278,10 +278,14 @@ So that tool could not page: every call returned the same first 20 NAP codes.
   and none of the dead ones.
 - `BILL_MAX_PAGE_SIZE` — BILL's own maximum per endpoint, probed rather than
   assumed (it validates `max`, so the 400 is the boundary): transactions **50**,
-  cards **100**, budgets **100**, custom-field values **100**. `divvy-budgets.ts`
-  reads its three page sizes from here instead of restating them.
+  cards **100**, budgets **100**, custom-field values **100**, custom fields
+  **100**. `divvy-budgets.ts` reads its three page sizes from here instead of
+  restating them.
 - `billPagingLimits(list)` — what the schema advertises, so the number in the
   description and the number enforced are the same number.
+- `DIVVY_LIST_TOOLS` / `UNPAGED_DIVVY_LISTS` — which tool serves which BILL
+  list, and which listing-shaped tool takes no cursor *and why*. See "Every
+  listing declares its paging" below.
 
 And `pageSize` is **rows, not BILL pages**. BILL's page is a transport detail,
 so an ask larger than one is served by `walkBillPages()` — which requests
@@ -362,6 +366,65 @@ walks at most 10 of them.`). `format: "raw"` still returns BILL's own objects,
 (`page: "YXJyYXljb25uZWN0aW9uOjI1"`, i.e. `arrayconnection:25`) returns 0 rows
 and says which nothing it is: `"meaning": "source-blind"`, with the 9 cards
 recent transactions name.
+
+## Every listing declares its paging
+
+The same omission shipped three times: a BILL listing with no way to accept
+BILL's cursor. `divvy_list_custom_field_values` spelled the parameters
+`page`/`page_size`, which BILL reads as nothing (#24). `divvy_list_cards` took
+no arguments at all, so BILL's default page of 20 was the whole answer and the
+21st card was unreachable (#43). `divvy_list_custom_fields` took no arguments
+either (#46) — and this is the family's quietest member, because on these books
+there was no missing row to point at.
+
+Probed against live books 2026-09-23, `GET /v3/spend/custom-fields` pages
+exactly like its siblings:
+
+| ask | result |
+| --- | --- |
+| `?max=1` | 1 field + `nextPage: arrayconnection:0` |
+| `?max=1&nextPage=arrayconnection:0` | the **second** field, `nextPage: null` |
+| `?max=1&page=arrayconnection:0` | page one again, forever |
+| `?max=1&page_size=5` | ignored |
+| `?max=101` | `400 max: must be less than or equal to 100` |
+
+So BILL hands this list a cursor and the tool had nowhere to put one. Two field
+definitions on these books is the only reason nobody had lost a row — which is
+precisely how the card list looked until the books grew past 20.
+
+Each of the three was fixed as an instance because nothing pinned the rule.
+`FILTER_SPECS` makes it impossible to advertise a filter without declaring how a
+row is checked against it; there was no equivalent making it impossible to
+advertise a listing without declaring how it pages. There is now:
+
+- `DIVVY_LIST_TOOLS` (`src/divvy-paging.ts`) maps each listing tool to the BILL
+  list it serves, and so to that endpoint's own probed maximum.
+- `UNPAGED_DIVVY_LISTS` holds the listing-shaped tools that take no cursor,
+  **with the reason** — `divvy_list_budgets` is assembled from several sources
+  rather than being one BILL page (#34), `divvy_list_members` calls an endpoint
+  BILL answers 404 (#38 owns it), `divvy_list_pending_action` walks the
+  transaction list itself and buckets what it finds.
+- A test in `divvy-lists.test.ts` walks the **registered** tools and requires
+  every `divvy_list_*` to appear in exactly one of the two — and, if paged, to
+  really carry `page`/`pageSize` bounded by its own endpoint's maximum, not
+  another's. A listing added tomorrow fails the suite until someone says which
+  it is. Removing the new entry fails by name:
+  `` `divvy_list_custom_fields` is a Divvy listing that is neither declared as a
+  BILL paged list nor declared unpaged with a reason ``.
+
+Live books, measured on revision `billcom-mcp-00071-d7w`. `divvy_list_custom_fields {}`
+returns both field definitions (NAP CODES, Notes) in one BILL call, 694 chars in
+0.39s, with no cursor left over — the same answer as before, which is the point:
+the everyday call did not change. What changed is that `{"pageSize": 1}` now
+returns `NAP CODES` **and** the cursor `YXJyYXljb25uZWN0aW9uOjA=`, and passing
+that back as `{"pageSize": 1, "page": "YXJyYXljb25uZWN0aW9uOjA="}` returns
+`Notes` with `nextPage: null` — a second page the tool previously had no
+parameter to ask for. `{"pageSize": 1001}` is refused by the schema before any
+BILL call (`pageSize must be 1000 or fewer rows: BILL's own page holds 100, and
+one call walks at most 10 of them.`), and `tools/list` advertises the tool's
+parameters as `page`, `pageSize` where it advertised none. The sibling listings
+are unmoved on the same revision: 21 of 21 cards, 6 transactions for
+2026-05-01..2026-06-30, all 72 NAP code values.
 
 ## Budgets
 

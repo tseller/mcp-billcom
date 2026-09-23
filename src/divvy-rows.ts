@@ -104,6 +104,42 @@ export function slimCard(card: Tx): Record<string, unknown> {
   };
 }
 
+/**
+ * One custom-field *definition* as a row.
+ *
+ * BILL sends each definition with its budget-scoping arrays (`selectedBudgetIds`
+ * / `selectedBudgetUuids` / `requiredBudgetIds` / `requiredBudgetUuids`, empty on
+ * every field on these books), a `createdTime` from 2021 and a `global` flag
+ * that only restates the empty scoping. A row keeps what names the field and
+ * what a follow-up call needs: both ids — `divvy_list_custom_field_values` and
+ * `divvy_update_transaction_custom_fields` are driven from them — the name, the
+ * type, and whether it is required.
+ *
+ * The flags that are false on every field are omitted rather than carried as a
+ * column of `false`, the same rule the card row and the QBO `active` column
+ * follow; a scoping array is carried only when it actually scopes something.
+ */
+export function slimCustomField(field: Tx): Record<string, unknown> {
+  const scoped = (v: unknown) => (Array.isArray(v) && v.length > 0 ? v : undefined);
+  const name = typeof field.name === "string" ? field.name.trim() : field.name;
+  return {
+    id: field.id,
+    uuid: field.uuid,
+    name,
+    type: field.type,
+    required: field.required,
+    ...(field.multiSelect ? { multiSelect: true } : {}),
+    ...(field.allowCustomValues ? { allowCustomValues: true } : {}),
+    ...(field.retired ? { retired: true } : {}),
+    ...(scoped(field.selectedBudgetUuids)
+      ? { selectedBudgetUuids: field.selectedBudgetUuids }
+      : {}),
+    ...(scoped(field.requiredBudgetUuids)
+      ? { requiredBudgetUuids: field.requiredBudgetUuids }
+      : {}),
+  };
+}
+
 export interface CursorListInput {
   /** Record type, e.g. "Transaction". */
   entity: string;

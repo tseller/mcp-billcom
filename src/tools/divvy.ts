@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
-import { buildCursorList, slimCard, slimTransaction } from '../divvy-rows.js';
+import { buildCursorList, slimCard, slimCustomField, slimTransaction } from '../divvy-rows.js';
 import { FilterCheck } from '../divvy-filters.js';
 import type { Witness } from '../empty-listing.js';
 import { assembleBudgets } from '../divvy-budgets.js';
@@ -24,35 +24,63 @@ const defaultPageSize = (list: BillListName, asked: unknown): number =>
   Number(asked) > 0 ? Number(asked) : BILL_MAX_PAGE_SIZE[list];
 
 /**
- * An independent answer to "does this company have any cards?", for the
- * zero-row case only — every transaction names the card that made it, so a
- * card list that comes back empty while transactions name cards is a blind
- * source rather than an empty wallet. That is exactly how BILL's budget list
+ * An independent answer to "does this company have any of these?", for the
+ * zero-row case only.
+ *
+ * A transaction is the witness for several listings at once: it names the card
+ * that made it AND the custom fields that were filled on it. So a card list — or
+ * a custom-field list — that comes back empty while transactions name them is a
+ * blind source rather than an empty book. That is exactly how BILL's budget list
  * failed (issue #34), on the same books, with the same shape of silence.
  *
- * Only consulted when the listing has no rows, so the everyday call still
- * costs one BILL request. A witness that cannot be fetched is no witness: the
- * failure returns none, and the `empty` block then says `unverified` rather
- * than claiming something it did not check.
+ * Only consulted when a listing has no rows, so the everyday call still costs
+ * one BILL request. A witness that cannot be fetched is no witness: the failure
+ * returns none, and the `empty` block then says `unverified` rather than
+ * claiming something it did not check.
+ *
+ * `name(tx)` returns the names this transaction contributes, de-duplicated here.
  */
-async function cardsNamedByTransactions(client: DivvyClient): Promise<Witness[]> {
+async function namedByRecentTransactions(
+  client: DivvyClient,
+  name: (tx: Record<string, unknown>) => string[],
+): Promise<Witness[]> {
   try {
     const page = await client.listTransactions({
       pageSize: String(BILL_MAX_PAGE_SIZE.transactions),
     });
     const rows = Array.isArray(page.results) ? page.results : [];
-    const named = new Map<string, string>();
+    const named = new Set<string>();
     for (const tx of rows as Array<Record<string, unknown>>) {
-      const id = (tx.cardUuid ?? tx.cardId) as string | undefined;
-      if (!id || named.has(id)) continue;
-      const name = typeof tx.cardName === 'string' ? tx.cardName.trim() : '';
-      named.set(id, name || (tx.cardLastFour ? `card ending ${tx.cardLastFour}` : id));
+      for (const n of name(tx)) if (n) named.add(n);
     }
-    return [{ source: 'recent transactions', found: named.size, sample: [...named.values()] }];
+    return [{ source: 'recent transactions', found: named.size, sample: [...named] }];
   } catch {
     return [];
   }
 }
+
+/** The cards recent transactions name — the witness for `divvy_list_cards`. */
+const cardsNamedByTransactions = (client: DivvyClient) =>
+  namedByRecentTransactions(client, (tx) => {
+    const id = (tx.cardUuid ?? tx.cardId) as string | undefined;
+    if (!id) return [];
+    const name = typeof tx.cardName === 'string' ? tx.cardName.trim() : '';
+    return [name || (tx.cardLastFour ? `card ending ${tx.cardLastFour}` : id)];
+  });
+
+/**
+ * The custom fields recent transactions name — the witness for
+ * `divvy_list_custom_fields`. BILL re-sends the whole field *definition* on
+ * every transaction row, so a transaction is a genuinely independent sighting
+ * of a definition the list endpoint failed to return.
+ */
+const customFieldsNamedByTransactions = (client: DivvyClient) =>
+  namedByRecentTransactions(client, (tx) => {
+    const fields = Array.isArray(tx.customFields) ? tx.customFields : [];
+    return (fields as Array<{ name?: unknown }>)
+      .map((f) => (typeof f.name === 'string' ? f.name.trim() : ''))
+      .filter(Boolean);
+  });
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.registerTool(
@@ -221,8 +249,10 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
   server.registerTool(
     'divvy_list_custom_fields',
     {
-      description: 'List all Divvy custom field definitions (e.g. NAP CODES, Notes). Returns each field\'s customFieldId, name, and type. ' +
-      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFields}, BILL's own page maximum), and when \`nextPage\` comes back, call again with \`page: nextPage\`.`,
+      description: 'List all Divvy custom field definitions (e.g. NAP CODES, Notes). ' +
+      'Returns one flattened row per field — both ids (`uuid` is what `divvy_list_custom_field_values` and `divvy_update_transaction_custom_fields` take), the name, the type and whether it is required. ' +
+      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFields}, BILL's own page maximum), and when \`hasMore\` is true, call again with \`page: nextPage\`. ` +
+      'A listing that returns nothing says which kind of nothing it found (`empty`), checked against the fields named by recent transactions.',
       inputSchema: z.object({
         ...cursorPaging(billPagingLimits('customFields'), { format: false }),
       }),
@@ -242,10 +272,22 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
             target: defaultPageSize('customFields', pageSize),
             page,
             fetch: (p) => client.listCustomFields(p),
-            measure: (f) => compact(f).length,
+            measure: (f) => compact(slimCustomField(f)).length,
             budgetChars: rowBudget(),
           });
-          return { ...walked.last, results: walked.rows, nextPage: walked.nextPage };
+          return buildCursorList({
+            entity: 'CustomField',
+            key: 'customFields',
+            rows: walked.rows.map(slimCustomField),
+            nextPage: walked.nextPage,
+            // A field definition carries no amount; there is nothing to sum.
+            sumField: null,
+            billPages: walked.billPages,
+            witnesses:
+              walked.rows.length === 0
+                ? await customFieldsNamedByTransactions(client)
+                : undefined,
+          });
         },
         { narrowing: cursorNarrowing({ format: false }) },
       ),

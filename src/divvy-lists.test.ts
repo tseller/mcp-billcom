@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCursorList, slimCard, slimTransaction } from "./divvy-rows.js";
+import { buildCursorList, slimCard, slimCustomField, slimTransaction } from "./divvy-rows.js";
 import { FILTER_SPECS, FilterCheck, billFilterParam } from "./divvy-filters.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
@@ -742,14 +742,65 @@ test("asking for the custom fields asks BILL for a page, and can follow its curs
   assert.deepEqual(client.asked, [
     { page: undefined, pageSize: String(BILL_MAX_PAGE_SIZE.customFields) },
   ]);
-  assert.equal((first.results as unknown[]).length, 100);
+  assert.equal(first.returned, 100);
+  assert.equal(first.hasMore, true);
+  assert.equal(first.truncatedBy, "window");
   assert.equal(first.nextPage, "100");
+  assert.match(String(first.note), /page: nextPage/);
 
   const second = await listResult(handler, { page: String(first.nextPage) });
   assert.equal(client.asked[1].page, "100");
-  const firstIds = (first.results as Array<{ id: string }>).map((f) => f.id);
-  const secondIds = (second.results as Array<{ id: string }>).map((f) => f.id);
+  const firstIds = (first.customFields as Array<{ id: string }>).map((f) => f.id);
+  const secondIds = (second.customFields as Array<{ id: string }>).map((f) => f.id);
   assert.equal(firstIds.filter((id) => secondIds.includes(id)).length, 0, "page 2 repeats page 1");
+});
+
+test("a custom-field row keeps both ids and drops the flags that are false on every field", () => {
+  const row = slimCustomField(customField(0));
+  assert.equal(row.id, customField(0).id);
+  assert.equal(row.uuid, customField(0).uuid, "the uuid the value/update tools take");
+  assert.equal(row.name, "NAP CODES");
+  assert.equal(row.type, "CUSTOM_SELECTOR");
+  assert.equal(row.required, true);
+  for (const gone of ["createdTime", "global", "multiSelect", "retired", "selectedBudgetUuids"]) {
+    assert.ok(!(gone in row), `row still carries ${gone}`);
+  }
+  // A flag that IS true is kept — the omission is about constants, not content.
+  assert.equal(slimCustomField({ ...customField(1), multiSelect: true }).multiSelect, true);
+  assert.equal(slimCustomField({ ...customField(1), retired: true }).retired, true);
+});
+
+/**
+ * #34's lesson on this listing: BILL re-sends the whole field definition on
+ * every transaction row, so an empty definitions list while transactions name
+ * NAP CODES and Notes is a blind source, not a company with no custom fields.
+ */
+test("an empty custom-field listing says which kind of nothing it found", async () => {
+  const client = {
+    listCustomFields: async () => ({ results: [], nextPage: undefined }),
+    listTransactions: async () => ({ results: [liveTransaction(1)], nextPage: undefined }),
+  };
+  const { handler } = registeredTools(client).get("divvy_list_custom_fields")!;
+  const result = await listResult(handler, {});
+  const empty = result.empty as { meaning: string; checked: unknown[] };
+
+  assert.equal(result.returned, 0);
+  assert.equal(empty.meaning, "source-blind");
+  assert.deepEqual(empty.checked, [
+    { source: "recent transactions", found: 2, sample: ["NAP CODES", "Notes"] },
+  ]);
+});
+
+test("a custom-field listing with no witness to consult claims nothing it did not check", async () => {
+  const client = {
+    listCustomFields: async () => ({ results: [], nextPage: undefined }),
+    listTransactions: async () => {
+      throw new Error("BILL 500");
+    },
+  };
+  const { handler } = registeredTools(client).get("divvy_list_custom_fields")!;
+  const result = await listResult(handler, {});
+  assert.equal((result.empty as { meaning: string }).meaning, "unverified");
 });
 
 test("the custom-field list walks BILL's cursor for an ask bigger than one page", async () => {
@@ -761,7 +812,8 @@ test("the custom-field list walks BILL's cursor for an ask bigger than one page"
     client.asked.map((a) => a.pageSize),
     ["100", "20"],
   );
-  assert.equal((result.results as unknown[]).length, 120);
+  assert.equal(result.returned, 120);
+  assert.equal(result.billPages, 2);
 });
 
 test("the custom-field list's pageSize is bounded by what it can serve", () => {

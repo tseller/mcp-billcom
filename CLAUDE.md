@@ -59,7 +59,7 @@ gcloud config configurations activate mcp-billcom
 - `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets, custom fields and custom-field values 100, each probed), `walkBillPages()`, which serves a caller's row count by walking BILL's cursor, and `DIVVY_LIST_TOOLS`/`UNPAGED_DIVVY_LISTS`, the table that requires every `divvy_list_*` tool to declare its paging or its reason for having none. Every paged BILL call goes through `DivvyClient.getBillPage` — see "Page size" and "Every listing declares its paging" below
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
-- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
+- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
 - `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/era-routing.ts` — which leg of `/mcp` serves a request: the SDK's `classifyInboundRequest`, plus the one rule that goes in front of it (an `Mcp-Session-Id` means legacy, always). See "Protocol eras" below
 - `src/discover.ts` — what the modern leg advertises, read by **asking** the modern leg rather than restating it beside it. No protocol revision is hard-coded in this repo; a test greps for one
@@ -412,19 +412,42 @@ advertise a listing without declaring how it pages. There is now:
   `` `divvy_list_custom_fields` is a Divvy listing that is neither declared as a
   BILL paged list nor declared unpaged with a reason ``.
 
-Live books, measured on revision `billcom-mcp-00071-d7w`. `divvy_list_custom_fields {}`
-returns both field definitions (NAP CODES, Notes) in one BILL call, 694 chars in
-0.39s, with no cursor left over — the same answer as before, which is the point:
-the everyday call did not change. What changed is that `{"pageSize": 1}` now
-returns `NAP CODES` **and** the cursor `YXJyYXljb25uZWN0aW9uOjA=`, and passing
-that back as `{"pageSize": 1, "page": "YXJyYXljb25uZWN0aW9uOjA="}` returns
-`Notes` with `nextPage: null` — a second page the tool previously had no
-parameter to ask for. `{"pageSize": 1001}` is refused by the schema before any
-BILL call (`pageSize must be 1000 or fewer rows: BILL's own page holds 100, and
-one call walks at most 10 of them.`), and `tools/list` advertises the tool's
-parameters as `page`, `pageSize` where it advertised none. The sibling listings
-are unmoved on the same revision: 21 of 21 cards, 6 transactions for
-2026-05-01..2026-06-30, all 72 NAP code values.
+The definitions list also goes through `buildCursorList`, so it speaks the same
+result vocabulary as the card list — `returned` / `hasMore` / `truncatedBy` /
+`note` — and inherits the `empty` block. Its witness is the transaction list:
+BILL re-sends the whole field *definition* on every transaction row, so an
+empty definitions list while transactions name NAP CODES and Notes is
+`source-blind`, not a company with no custom fields. `slimCustomField` drops
+what BILL repeats on every definition (the 2021 `createdTime`, the `global`
+flag that only restates the empty scoping, the four budget-scoping arrays that
+are empty on every field here) and keeps **both** ids, because
+`divvy_list_custom_field_values` and `divvy_update_transaction_custom_fields`
+are driven from the uuid. There is no `pageTotal`: a field definition carries
+no amount.
+
+What the pin does **not** yet cover is that result shape.
+`divvy_list_custom_field_values` satisfies the test — it is declared, and it
+really pages — while still handing BILL's envelope back, so a page past the end
+of the NAP codes is a bare `{"results":[]}` with no `empty` block. That is
+issue #55: the pin checks the input vocabulary, and the same widening is owed
+to the output.
+
+Live books, measured on revision `billcom-mcp-00072-lpt`.
+`divvy_list_custom_fields {}` returns both definitions (NAP CODES, Notes) in one
+BILL call, `returned: 2`, `hasMore: false`, **315 chars** in 0.31s — down from
+694 when it handed BILL's envelope back, because the scoping arrays and the 2021
+`createdTime` were more than half the payload. `{"pageSize": 1}` returns
+`NAP CODES` with `hasMore: true`, `truncatedBy: "window"` and the cursor
+`YXJyYXljb25uZWN0aW9uOjA=`; passing that back returns `Notes` with
+`hasMore: false` — a second page the tool previously had no parameter to ask
+for. A cursor past the end returns `returned: 0` and says which nothing it is:
+`"meaning": "source-blind"`, with the 2 fields recent transactions name.
+`{"pageSize": 1001}` is refused by the schema before any BILL call
+(`pageSize must be 1000 or fewer rows: BILL's own page holds 100, and one call
+walks at most 10 of them.`), and `tools/list` advertises the tool's parameters
+as `page`, `pageSize` where it advertised none. The sibling listings are unmoved
+on the same revision: 21 of 21 cards (6,271 chars), 6 transactions for
+2026-05-01..2026-06-30 (2,613 chars), all 72 NAP code values (9,204 chars).
 
 ## Budgets
 

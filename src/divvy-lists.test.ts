@@ -17,8 +17,11 @@ import {
   BILL_CURSOR_PARAM,
   BILL_MAX_PAGE_SIZE,
   BILL_PAGE_SIZE_PARAM,
+  DIVVY_LIST_TOOLS,
   MAX_BILL_PAGES_PER_CALL,
+  UNPAGED_DIVVY_LISTS,
   billPagingLimits,
+  type BillListName,
 } from "./divvy-paging.js";
 
 /**
@@ -219,8 +222,10 @@ test("the over-budget error names knobs the tool actually has", async () => {
 
 test("a tool with no paging arguments is given no knobs to turn", () => {
   // `divvy_list_cards` was the example here until it grew real ones (issue
-  // #43); `divvy_list_custom_fields` is a listing BILL does not page.
-  const text = overBudget("divvy_list_custom_fields", 50_000);
+  // #43), and `divvy_list_custom_fields` until it grew them too (issue #46).
+  // `divvy_list_members` is the honest case: BILL answers its endpoint 404, so
+  // there is no page to ask for a second of (issue #38).
+  const text = overBudget("divvy_list_members", 50_000);
   for (const absent of ["maxResults", "startPosition", "offset", "pageSize", "format"]) {
     assert.doesNotMatch(text, new RegExp(absent));
   }
@@ -241,6 +246,11 @@ test("every narrowing sentence names only parameters of its own paging shape", (
     [
       cursorNarrowing({ format: false }),
       cursorPaging(billPagingLimits("customFieldValues"), { format: false }),
+      ["nextPage"],
+    ],
+    [
+      cursorNarrowing({ format: false }),
+      cursorPaging(billPagingLimits("customFields"), { format: false }),
       ["nextPage"],
     ],
   ];
@@ -641,11 +651,12 @@ test("every paged BILL call spells the cursor and page size the way BILL reads t
     await client.listCards({ page: "c2", pageSize: "100" });
     await client.listBudgetsPage({ page: "c3", pageSize: "100" });
     await client.listCustomFieldValues("cf_1", { page: "c4", pageSize: "100" });
+    await client.listCustomFields({ page: "c5", pageSize: "100" });
   } finally {
     globalThis.fetch = realFetch;
   }
 
-  assert.equal(urls.length, 4);
+  assert.equal(urls.length, 5);
   for (const [i, url] of urls.entries()) {
     assert.equal(url.searchParams.get(BILL_CURSOR_PARAM), `c${i + 1}`);
     assert.ok(url.searchParams.get(BILL_PAGE_SIZE_PARAM), `no ${BILL_PAGE_SIZE_PARAM} on ${url}`);
@@ -677,6 +688,149 @@ test("the custom-field values list pages — and its pageSize is bounded too", a
   assert.equal(pageSize.safeParse(limits.maxRows + 1).success, false);
   // This list has no `format`, and must not be given one it does not implement.
   assert.equal(schema.format, undefined);
+});
+
+/* ------------------------------------------------------------------ *
+ * Custom field definitions (issue #46): the last BILL listing that
+ * took no arguments at all.
+ * ------------------------------------------------------------------ */
+
+/** A BILL custom-field definition, in the shape /v3/spend/custom-fields returns. */
+const customField = (i: number) => ({
+  id: `VGFnVHlwZTozNzM2${String(i).padStart(2, "0")}`,
+  uuid: `tty_tfg5dd0d99325fomhor9osjch${String(i).padStart(2, "0")}`,
+  name: i === 0 ? "NAP CODES" : `Field ${i}`,
+  type: "CUSTOM_SELECTOR",
+  multiSelect: false,
+  required: true,
+  global: true,
+  retired: false,
+  createdTime: "2021-02-09T18:14:49.137+00:00",
+});
+
+/** BILL's custom-field list holding `total` definitions, served in pages. */
+function customFieldClient(total: number, asked: Array<{ page?: string; pageSize?: string }> = []) {
+  return {
+    asked,
+    listCustomFields: async (p: { page?: string; pageSize?: string } = {}) => {
+      asked.push(p);
+      const from = p.page ? Number(p.page) : 0;
+      const n = Math.max(0, Math.min(Number(p.pageSize ?? 20), total - from));
+      return {
+        results: Array.from({ length: n }, (_, i) => customField(from + i)),
+        nextPage: from + n < total ? String(from + n) : undefined,
+      };
+    },
+  };
+}
+
+/**
+ * The defect, in one assertion. The tool made one unparameterized call and
+ * handed BILL's envelope back — so on books with more field definitions than
+ * BILL's page, the extra ones were simply absent and the cursor BILL returned
+ * had no parameter to come back in. Probed live 2026-09-23: `?max=1` on these
+ * books returns one field and `nextPage: arrayconnection:0`, so BILL does page
+ * this list; there were only two fields to page through, which is the only
+ * reason nobody had lost a row yet.
+ */
+test("asking for the custom fields asks BILL for a page, and can follow its cursor", async () => {
+  const client = customFieldClient(250);
+  const { handler } = registeredTools(client).get("divvy_list_custom_fields")!;
+  const first = await listResult(handler, {});
+
+  // BILL's own page maximum for this list, not an unparameterized call.
+  assert.deepEqual(client.asked, [
+    { page: undefined, pageSize: String(BILL_MAX_PAGE_SIZE.customFields) },
+  ]);
+  assert.equal((first.results as unknown[]).length, 100);
+  assert.equal(first.nextPage, "100");
+
+  const second = await listResult(handler, { page: String(first.nextPage) });
+  assert.equal(client.asked[1].page, "100");
+  const firstIds = (first.results as Array<{ id: string }>).map((f) => f.id);
+  const secondIds = (second.results as Array<{ id: string }>).map((f) => f.id);
+  assert.equal(firstIds.filter((id) => secondIds.includes(id)).length, 0, "page 2 repeats page 1");
+});
+
+test("the custom-field list walks BILL's cursor for an ask bigger than one page", async () => {
+  const client = customFieldClient(250);
+  const { handler } = registeredTools(client).get("divvy_list_custom_fields")!;
+  const result = await listResult(handler, { pageSize: 120 });
+
+  assert.deepEqual(
+    client.asked.map((a) => a.pageSize),
+    ["100", "20"],
+  );
+  assert.equal((result.results as unknown[]).length, 120);
+});
+
+test("the custom-field list's pageSize is bounded by what it can serve", () => {
+  const { schema } = registeredTools(customFieldClient(2)).get("divvy_list_custom_fields")!;
+  const limits = billPagingLimits("customFields");
+  const pageSize = schema.pageSize as {
+    safeParse(v: unknown): { success: boolean; error?: { issues: Array<{ message: string }> } };
+  };
+  assert.equal(pageSize.safeParse(limits.maxRows).success, true);
+  const tooBig = pageSize.safeParse(limits.maxRows + 1);
+  assert.equal(tooBig.success, false);
+  // BILL's own boundary, in the message: `max=101` is a 400 on this endpoint.
+  assert.match(tooBig.error!.issues[0].message, new RegExp(String(limits.billPageSize)));
+  assert.ok(schema.page, "no cursor parameter — the cursor BILL hands back is unfollowable");
+  // This list returns BILL's definitions as they are; there is no row shape to
+  // opt out of, so it must not advertise a `format` it does not implement.
+  assert.equal(schema.format, undefined);
+});
+
+/**
+ * The structural pin (issue #46's second goal). Three listings shipped with no
+ * way to accept BILL's cursor — custom-field values (#24), cards (#43) and
+ * custom-field definitions (#46) — and each was fixed as an instance because
+ * nothing required a BILL listing to declare its paging the way FILTER_SPECS
+ * requires a filter to declare how it is checked.
+ *
+ * This is that requirement. Every registered `divvy_list_*` tool must appear
+ * either in DIVVY_LIST_TOOLS — and then really carry the shared cursor
+ * vocabulary, bounded by that list's own maximum — or in UNPAGED_DIVVY_LISTS
+ * with the reason it has nothing to page. A listing added tomorrow fails here
+ * until someone says which it is.
+ */
+test("every Divvy listing declares its paging, or declares why it has none", () => {
+  const tools = registeredTools({});
+  const listings = [...tools.keys()].filter((name) => name.startsWith("divvy_list_"));
+  assert.ok(listings.length >= 6, `only found ${listings.length} listings`);
+
+  for (const name of listings) {
+    const paged = (DIVVY_LIST_TOOLS as Record<string, BillListName>)[name];
+    const exempt = UNPAGED_DIVVY_LISTS[name];
+    assert.ok(
+      (paged === undefined) !== (exempt === undefined),
+      `\`${name}\` is a Divvy listing that is neither declared as a BILL paged list ` +
+        `nor declared unpaged with a reason — the omission that shipped three times ` +
+        `(#24, #43, #46)`,
+    );
+    if (!paged) {
+      assert.ok(exempt.length > 20, `\`${name}\` is exempted with no real reason given`);
+      continue;
+    }
+
+    const { schema } = tools.get(name)!;
+    const limits = billPagingLimits(paged);
+    assert.ok(schema.page, `\`${name}\` pages BILL's ${paged} but takes no \`page\` cursor`);
+    const pageSize = schema.pageSize as {
+      safeParse(v: unknown): { success: boolean; error?: { issues: Array<{ message: string }> } };
+    } | undefined;
+    assert.ok(pageSize, `\`${name}\` takes no \`pageSize\``);
+    // Bounded by this list's own maximum, not by some other endpoint's.
+    assert.equal(pageSize!.safeParse(limits.maxRows).success, true, `\`${name}\` refuses its own max`);
+    const tooBig = pageSize!.safeParse(limits.maxRows + 1);
+    assert.equal(tooBig.success, false, `\`${name}\` accepts more rows than it can serve`);
+    assert.match(tooBig.error!.issues[0].message, new RegExp(String(limits.billPageSize)));
+  }
+
+  // And nothing is declared for a tool that is not registered.
+  for (const name of [...Object.keys(DIVVY_LIST_TOOLS), ...Object.keys(UNPAGED_DIVVY_LISTS)]) {
+    assert.ok(listings.includes(name), `\`${name}\` is declared but no tool registers it`);
+  }
 });
 
 test("with no filters set, nothing is sent to BILL and nothing is claimed", async () => {

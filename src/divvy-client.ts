@@ -188,8 +188,21 @@ export class DivvyClient {
     return this.post(`/v3/spend/transactions/${transactionUuid}/receipts`, { url: uploadUrl });
   }
 
-  async listCustomFields(): Promise<unknown> {
-    return this.get('/v3/spend/custom-fields');
+  /**
+   * One page of /v3/spend/custom-fields — the field *definitions*.
+   *
+   * This was an unparameterized `get`, i.e. #43's shape on a quieter endpoint:
+   * BILL pages this list like every other (probed live 2026-09-23, `?max=1`
+   * returns one field and the cursor `arrayconnection:0`, `?max=101` is a
+   * `400 max: must be less than or equal to 100`, and `?page=` / `?page_size=`
+   * are read by nothing), so a company with more field definitions than BILL's
+   * page would have been served a short list with an unfollowable cursor.
+   */
+  async listCustomFields(params?: {
+    page?: string;
+    pageSize?: string;
+  }): Promise<BillPage<Record<string, unknown>>> {
+    return this.getBillPage('/v3/spend/custom-fields', params);
   }
 
   async listCustomFieldValues(

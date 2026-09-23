@@ -30,6 +30,7 @@
  *   /v3/spend/cards                   max <= 100   (101 is a 400)
  *   /v3/spend/budgets                 max <= 100   (101 is a 400)
  *   /v3/spend/custom-fields/…/values  max <= 100   (101 is a 400)
+ *   /v3/spend/custom-fields           max <= 100   (101 is a 400)
  *
  * A caller's `pageSize` is deliberately NOT that maximum. BILL's page is a
  * transport detail; `pageSize` is how many rows the caller wants back. An ask
@@ -49,10 +50,54 @@ export const BILL_MAX_PAGE_SIZE = {
   transactions: 50,
   cards: 100,
   budgets: 100,
+  customFields: 100,
   customFieldValues: 100,
 } as const;
 
 export type BillListName = keyof typeof BILL_MAX_PAGE_SIZE;
+
+/**
+ * Which Divvy tool serves which BILL list.
+ *
+ * This exists because the same omission happened three times — a listing tool
+ * shipped with no way to accept BILL's cursor — and each time it was fixed as
+ * an instance:
+ *
+ *  - `divvy_list_custom_field_values` spelled the parameters `page`/`page_size`
+ *    and could not page at all (issue #24);
+ *  - `divvy_list_cards` took no arguments, so BILL's default page of 20 was the
+ *    whole answer and the 21st card was unreachable (issue #43);
+ *  - `divvy_list_custom_fields` took no arguments either — BILL hands it a
+ *    cursor at `?max=1` and the tool had nowhere to put one (issue #46).
+ *
+ * Nothing pinned "a BILL listing declares the shared cursor shape", the way
+ * `FILTER_SPECS` is pinned to the transaction tool's schema. This table is that
+ * pin: `divvy-lists.test.ts` walks the registered tools and requires every
+ * `divvy_list_*` to appear here (and to carry `page`/`pageSize` bounded by this
+ * list's own maximum) or in `UNPAGED_DIVVY_LISTS` with a reason. A listing added
+ * tomorrow cannot quietly ship without a cursor: the test fails until someone
+ * says which of the two it is.
+ */
+export const DIVVY_LIST_TOOLS = {
+  divvy_list_transactions: "transactions",
+  divvy_list_cards: "cards",
+  divvy_list_custom_fields: "customFields",
+  divvy_list_custom_field_values: "customFieldValues",
+} as const satisfies Record<string, BillListName>;
+
+/**
+ * The Divvy tools that read like a listing and take no cursor — each with the
+ * reason it does not, because "this one has nothing to page" is a claim that
+ * has now been wrong three times and must be argued rather than assumed.
+ */
+export const UNPAGED_DIVVY_LISTS: Record<string, string> = {
+  divvy_list_budgets:
+    "not one BILL list: BILL's budget endpoint is blind to most of these budgets, so the listing is assembled from several sources and read back by id (issue #34). Its own BILL calls page through `budgets`.",
+  divvy_list_members:
+    "GET /v3/spend/members answers 404 on these books — there is no list to page yet. Issue #38 owns it, and a cursor here would be a knob over a hole.",
+  divvy_list_pending_action:
+    "a triage view over the transaction list rather than a BILL endpoint: it walks `transactions` itself and buckets what it finds, so the rows it returns are not one BILL page.",
+};
 
 /**
  * How many BILL pages one tool call may consume. A bound, not a target: a call

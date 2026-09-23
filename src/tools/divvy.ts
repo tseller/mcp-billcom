@@ -221,10 +221,34 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
   server.registerTool(
     'divvy_list_custom_fields',
     {
-      description: 'List all Divvy custom field definitions (e.g. NAP CODES, Notes). Returns each field\'s customFieldId, name, and type.',
-      inputSchema: z.object({}),
+      description: 'List all Divvy custom field definitions (e.g. NAP CODES, Notes). Returns each field\'s customFieldId, name, and type. ' +
+      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFields}, BILL's own page maximum), and when \`nextPage\` comes back, call again with \`page: nextPage\`.`,
+      inputSchema: z.object({
+        ...cursorPaging(billPagingLimits('customFields'), { format: false }),
+      }),
     },
-    (args) => runTool('divvy_list_custom_fields', args, () => client.listCustomFields()),
+    (args) =>
+      runTool(
+        'divvy_list_custom_fields',
+        args,
+        // The last BILL listing with no paging vocabulary (issue #46). It made
+        // one unparameterized call and handed BILL's envelope back, so a cursor
+        // BILL gave it had nowhere to go — #43's shape on a quieter endpoint.
+        // These books hold two field definitions, so nothing was missing today;
+        // what was missing was any way to ask for a second page.
+        async ({ page, pageSize }) => {
+          const walked = await walkBillPages<Record<string, unknown>>({
+            list: 'customFields',
+            target: defaultPageSize('customFields', pageSize),
+            page,
+            fetch: (p) => client.listCustomFields(p),
+            measure: (f) => compact(f).length,
+            budgetChars: rowBudget(),
+          });
+          return { ...walked.last, results: walked.rows, nextPage: walked.nextPage };
+        },
+        { narrowing: cursorNarrowing({ format: false }) },
+      ),
   );
 
   server.registerTool(

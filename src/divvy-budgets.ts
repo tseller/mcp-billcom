@@ -28,7 +28,7 @@
  * same discipline for the zero-row case).
  */
 
-import { BILL_MAX_PAGE_SIZE } from "./divvy-paging.js";
+import { BILL_MAX_PAGE_SIZE, PagingCheck } from "./divvy-paging.js";
 import { describeEmpty, type Witness } from "./empty-listing.js";
 
 export type Raw = Record<string, unknown>;
@@ -94,20 +94,26 @@ function addRef(into: Map<string, BudgetRef>, ref: BudgetRef): void {
   }
 }
 
+/**
+ * Walks one source's BILL pages. `PagingCheck` is what decides whether a cursor
+ * advanced: this loop used to stop on `next === cursor`, which a backend
+ * re-serving a page under a fresh cursor string walks straight past — it would
+ * then add the same budgets again on every one of `maxPages` requests (issue
+ * #33). Comparing the pages themselves is the check that does not depend on the
+ * backend being tidy about its cursor strings.
+ */
 async function walk<T>(
   fetchPage: (cursor?: string) => Promise<BillPage<T>>,
   maxPages: number,
 ): Promise<{ rows: T[]; pages: number }> {
   const rows: T[] = [];
-  let cursor: string | undefined;
+  const paging = new PagingCheck();
   let pages = 0;
   while (pages < maxPages) {
-    const page = await fetchPage(cursor);
+    const page = await fetchPage(paging.page);
     pages += 1;
-    if (Array.isArray(page.results)) rows.push(...page.results);
-    const next = page.nextPage;
-    if (!next || next === cursor) break;
-    cursor = next;
+    rows.push(...paging.observe(page.results, page.nextPage));
+    if (!paging.hasMore) break;
   }
   return { rows, pages };
 }

@@ -364,7 +364,8 @@ export class PagingCheck {
         sizeVerdict === false
           ? `not honored — asked BILL for at most ${this.widestAsked} row(s) a page as \`${BILL_PAGE_SIZE_PARAM}\` ` +
             `and it returned ${this.widest}; the page-size parameter is being ignored`
-          : `server — sent as \`${BILL_PAGE_SIZE_PARAM}\`; BILL returned at most ${this.widest} row(s) a page`;
+          : `server — sent as \`${BILL_PAGE_SIZE_PARAM}\`; asked for ${this.asked.pageSize} row(s) a page and ` +
+            `BILL returned at most ${this.widest}`;
     }
 
     if (this.looped) {

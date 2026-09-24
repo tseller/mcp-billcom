@@ -56,10 +56,10 @@ gcloud config configurations activate mcp-billcom
 - `src/tools/qbo-reconcile.ts` — QBO: reconcile_worksheet (stitches Uncleared/Cleared TransactionList calls into a per-account reconcile worksheet, computes the difference vs the paper statement's beginning/ending balance), cleared_transactions (list by reconcile status). QBO's Accounting API has **no public Reconcile entity** — you cannot mark items cleared or finalize a reconcile via API; that step is manual in the QBO web UI. The API only exposes reconcile status as the TransactionList report's `cleared` filter (`Reconciled`/`Cleared`/`Uncleared`), filter-only (never per-row), so a worksheet must run one call per status and stitch. Report parsing lives in `parseTransactionList` (src/qbo-client.ts)
 - `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions and list_cards (both flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, members, budgets, list_pending_action
 - `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
-- `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets, custom fields and custom-field values 100, each probed), `walkBillPages()`, which serves a caller's row count by walking BILL's cursor, and `DIVVY_LIST_TOOLS`/`UNPAGED_DIVVY_LISTS`, the table that requires every `divvy_list_*` tool to declare its paging or its reason for having none. Every paged BILL call goes through `DivvyClient.getBillPage` — see "Page size" and "Every listing declares its paging" below
+- `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets, custom fields and custom-field values 100, each probed), `walkBillPages()`, which serves a caller's row count by walking BILL's cursor, and `DIVVY_LIST_TOOLS`/`UNPAGED_DIVVY_LISTS`, the table that requires every `divvy_list_*` tool to declare its paging or its reason for having none. Every paged BILL call goes through `DivvyClient.getBillPage`. It also holds the *witness* each knob is declared with — `PAGING_SPECS` (the query parameter it becomes, and the question asked of the page that comes back) and `PagingCheck`, which every walk runs so a cursor that does not advance stops the walk instead of looping — see "Page size", "Every listing declares its paging" and "A paging knob is witnessed, not assumed" below
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
-- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one
+- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`, and `truncatedBy` has a third value (`cursor`) for the cursor that did not advance. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one. It carries the `paging` block the same way it carries `filtering`
 - `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/era-routing.ts` — which leg of `/mcp` serves a request: the SDK's `classifyInboundRequest`, plus the one rule that goes in front of it (an `Mcp-Session-Id` means legacy, always). See "Protocol eras" below
 - `src/discover.ts` — what the modern leg advertises, read by **asking** the modern leg rather than restating it beside it. No protocol revision is hard-coded in this repo; a test greps for one
@@ -448,6 +448,111 @@ walks at most 10 of them.`), and `tools/list` advertises the tool's parameters
 as `page`, `pageSize` where it advertised none. The sibling listings are unmoved
 on the same revision: 21 of 21 cards (6,271 chars), 6 transactions for
 2026-05-01..2026-06-30 (2,613 chars), all 72 NAP code values (9,204 chars).
+
+## A paging knob is witnessed, not assumed
+
+A filter is only a filter if the rows obey it; a paging parameter is only paging
+if the *pages* obey it. Those are one rule, and only the first half was pinned.
+
+`divvy_list_custom_field_values` advertised `page` and `pageSize` and sent them
+as `page` / `page_size`. BILL's v3 `/spend/custom-fields/{id}/values` reads
+**neither** — it wants `nextPage` and `max` — and answers 200 with page one
+rather than rejecting a parameter it does not know. So the tool's own instruction
+("use `page` from `nextPage` in the previous response to walk the full list")
+could not be followed: a caller resolving a NAP code got the same first 20 values
+on every call behind a `nextPage` that never advanced — an infinite loop wearing
+the shape of a working paged API (issue #33). Probed against live books
+2026-09-17:
+
+| ask | result |
+| --- | --- |
+| `?page_size=3` / `?pageSize=3` | 20 rows — BILL's default, `max` is the name |
+| `?max=3` | 3 rows |
+| `?max=3&page=<cursor>` | page **one** again, and `nextPage` echoes the cursor sent |
+| `?max=3&nextPage=<cursor>` | the next 3 rows |
+
+The names were fixed as part of #24 — declared once in `src/divvy-paging.ts`,
+with every paged call routed through `DivvyClient.getBillPage`. That is the
+instance. The structure that let it ship is that the tool **sent a paging
+parameter and assumed**: nothing in a 200 response distinguishes a knob BILL
+read from one it ignored, and renaming two parameters leaves the next wrong name
+just as silent — which is why this shape has now recurred four times (#29, #24,
+#43, #46).
+
+So paging is declared the way filters are (`FILTER_SPECS`), as a pair —
+`PAGING_SPECS` in `src/divvy-paging.ts`:
+
+- `param` / `send(value)` — the query parameter BILL is asked on, and the value;
+- `honored(page)` — the same question asked of the page that came back.
+
+The witness for a cursor is the cheap and honest one: **a cursor is derived from
+a page, so a cursor that re-serves the rows it was derived from has not
+advanced.** To have that comparison available on the *next* call, the cursor
+handed out is BILL's own with a fingerprint of that page sealed onto it
+(`<billCursor>~<fingerprint>`), stripped again in `billPagingParams` so BILL only
+ever sees a cursor it issued. A bare BILL cursor pasted by hand still works — it
+carries no witness, and the result says that rather than claiming the cursor
+advanced.
+
+`PagingCheck` is an accumulator, not a function, because one call can walk
+several BILL pages: every page is fingerprinted, so a cursor looping back onto a
+page already seen is caught wherever in the walk it happens. That is strictly
+stronger than the `next === cursor` string comparison `listPendingAction` and the
+budget walker used, which a backend re-serving a page under a *fresh* cursor
+string satisfies — it would bucket every row again on each of its 50 (or 10)
+requests. Both now use the accumulator.
+
+What a caller sees:
+
+- A cursor that did not advance **stops the walk**: the repeated rows are dropped
+  rather than handed back as new ones, no `nextPage` is returned, `truncatedBy` is
+  `cursor`, and `hasMore` stays **true** — there are more rows and no way to ask
+  for them, so claiming the list ended would be the quieter lie.
+- A `paging` block states per knob how it was really enforced, in `filtering`'s
+  vocabulary (`server`, or a sentence starting `not honored`). It is reported
+  where the caller turned the knob, or where a verdict is `false` — an ordinary
+  result is not padded with a sentence about a parameter nobody passed.
+- The `pageSize` verdict is **one-sided on purpose**: more rows than `max` asked
+  for proves it was ignored, while fewer is just as likely to be the last page.
+- An empty page witnesses nothing about the cursor (BILL does end a list with
+  one), so it says so instead of reading as a loop.
+
+It runs inside `walkBillPages` — the one funnel every paged BILL listing already
+goes through — so transactions, cards, custom fields, values and any listing
+added later inherit it without opting in, exactly as they inherit the
+result-size budget. A test walks the registered tools and requires every
+`page`/`pageSize` a listing advertises to appear in `PAGING_SPECS` with both a
+parameter and a witness, and nothing to be declared that no tool offers.
+
+Live books, measured on revision `billcom-mcp-00074-5nn`. Walking NAP CODES
+(`{"customFieldId":"tty_tfg5dd0d99325fomhor9osjchg","pageSize":10}`) terminates
+in **8 calls** holding **72 values, 72 distinct**, the last page `hasMore: false`
+with no cursor — where the same walk before #24 re-served the first 20 forever.
+The default call is still one BILL call for all 72 (9,204 chars, 0.30s) and
+carries no `paging` block, because no knob was turned and nothing was witnessed
+wrong. A cursor that does **not** advance — BILL's cursor for page two carrying
+page two's own fingerprint, which is the state BILL re-serving that page produces
+— returns `results: []`, no `nextPage`, `truncatedBy: "cursor"` and:
+
+```
+"page": "not honored — BILL re-served the same 10 row(s) as a page already
+         returned, so the `nextPage` cursor did not advance. Those rows were
+         dropped rather than handed back as new ones, and the walk stops here
+         rather than looping; the rest of this list cannot be reached by paging"
+```
+
+The same cursor *without* the seal returns its 10 rows and says what it cannot
+know: `server — sent as `nextPage`; this cursor was not issued by this tool, so
+whether it advanced could not be witnessed`. A fiscal year of transactions at
+`pageSize: "100"` is unmoved at 86 rows over 2 BILL pages (34,598 chars, up 234
+for the `paging` block) and now states the cross-page verdict — `1 cursor page(s)
+fetched here, each carrying rows other than the page its cursor came from` —
+beside `asked for 100 row(s) a page and BILL returned at most 50`. The sibling
+listings on the same revision: 21 of 21 cards (6,271 chars), both custom-field
+definitions (315 chars), 6 transactions for 2026-05-01..2026-06-30 (2,613
+chars), `divvy_list_pending_action` 1 pending / 0 to review (448 chars), and the
+assembled budget listing 15 budgets over its 7 walked pages (3,161 chars) — the
+walkers that had the `next === cursor` hole, still walking.
 
 ## Budgets
 

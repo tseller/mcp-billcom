@@ -1,8 +1,8 @@
 import { FilterCheck } from './divvy-filters.js';
 import {
-  BILL_CURSOR_PARAM,
   BILL_MAX_PAGE_SIZE,
-  BILL_PAGE_SIZE_PARAM,
+  PagingCheck,
+  billPagingParams,
   type BillPage,
 } from './divvy-paging.js';
 
@@ -80,6 +80,11 @@ export class DivvyClient {
    * BILL answers 200 to and ignores — so that list returned its first page
    * whatever cursor it was given. A name BILL does not read is invisible from
    * the response, which is exactly why it is no longer a per-method decision.
+   *
+   * The two names come from `billPagingParams`, i.e. from the same declaration
+   * that says how each one is witnessed in the answer (`PAGING_SPECS`) — so a
+   * knob cannot be sent from a place that never checks it. That is also where a
+   * cursor's seal is stripped: BILL only ever sees a cursor it issued.
    */
   private async getBillPage<T = Record<string, unknown>>(
     path: string,
@@ -87,8 +92,7 @@ export class DivvyClient {
   ): Promise<BillPage<T>> {
     return this.get(path, {
       filters: params?.filters,
-      [BILL_CURSOR_PARAM]: params?.page,
-      [BILL_PAGE_SIZE_PARAM]: params?.pageSize,
+      ...billPagingParams({ page: params?.page, pageSize: params?.pageSize }),
     });
   }
 
@@ -251,17 +255,21 @@ export class DivvyClient {
   }> {
     const pendingFields: PendingActionRow[] = [];
     const pendingReview: PendingActionRow[] = [];
-    let cursor: string | undefined;
     let safety = 50;
     const check = new FilterCheck({ startDate: params?.since });
+    // This walk used to stop on `next === cursor` — a cursor string BILL
+    // repeats. A backend re-serving the same page under a FRESH cursor string
+    // satisfies that test and walks on, 50 times, bucketing every row again;
+    // `PagingCheck` compares the pages instead of the strings (issue #33).
+    const paging = new PagingCheck();
     do {
       const resp = (await this.getBillPage('/v3/spend/transactions', {
         filters: check.billParam,
-        page: cursor,
+        page: paging.page,
         pageSize: String(BILL_MAX_PAGE_SIZE.transactions),
       })) as { results?: RawTransaction[]; nextPage?: string };
       const results = check.keep(
-        (Array.isArray(resp.results) ? resp.results : []) as unknown as Record<string, unknown>[],
+        paging.observe(resp.results, resp.nextPage) as unknown as Record<string, unknown>[],
       ) as unknown as RawTransaction[];
       for (const tx of results) {
         if (TERMINAL_STATUSES.has(tx.status ?? '')) continue;
@@ -280,9 +288,7 @@ export class DivvyClient {
           pendingReview.push(row);
         }
       }
-      const next = resp.nextPage;
-      if (!next || next === cursor) break;
-      cursor = next;
+      if (!paging.hasMore) break;
       safety -= 1;
     } while (safety > 0);
     return { pendingFields, pendingReview };

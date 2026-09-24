@@ -21,6 +21,7 @@ import {
   MAX_BILL_PAGES_PER_CALL,
   UNPAGED_DIVVY_LISTS,
   billPagingLimits,
+  openCursor,
   type BillListName,
 } from "./divvy-paging.js";
 
@@ -120,7 +121,15 @@ function liveTransaction(i: number) {
   };
 }
 
-const page = (n: number) => Array.from({ length: n }, (_, i) => liveTransaction(i));
+/**
+ * `n` transactions starting at `from`. The offset matters wherever a fixture
+ * serves several pages: BILL's rows differ from page to page, and a stub that
+ * re-serves identical rows under a fresh cursor is the very thing `PagingCheck`
+ * now stops the walk on (issue #33), so a multi-page fixture has to be as
+ * distinct as the real list is.
+ */
+const page = (n: number, from = 0) =>
+  Array.from({ length: n }, (_, i) => liveTransaction(from + i));
 
 test("the default call at BILL's own maximum page size fits the budget; raw does not", () => {
   const raw = page(50);
@@ -490,7 +499,7 @@ test("when BILL ignores a filter the page is refilled from the cursor, and says 
     assert.ok(row.date >= "2026-05-01" && row.date <= "2026-06-30", `row outside range: ${row.date}`);
   }
   assert.match(String((result.filtering as Record<string, string>).endDate), /not being honored/);
-  assert.equal(result.nextPage, "cursor-3");
+  assert.equal(openCursor(String(result.nextPage)).cursor, "cursor-3");
 });
 
 test("the walk is bounded — an always-ignored filter stops rather than paging forever", async () => {
@@ -528,9 +537,10 @@ test("an ask bigger than one BILL page returns rows, by walking BILL's cursor", 
   const asked: string[] = [];
   const client = {
     listTransactions: async (p: { pageSize?: string; page?: string }) => {
+      const from = asked.length * 50;
       asked.push(String(p.pageSize));
       const n = Number(p.pageSize);
-      return { results: page(n), nextPage: `cursor-${asked.length + 1}` };
+      return { results: page(n, from), nextPage: `cursor-${asked.length + 1}` };
     },
   };
   const { handler } = registeredTools(client).get("divvy_list_transactions")!;
@@ -540,7 +550,7 @@ test("an ask bigger than one BILL page returns rows, by walking BILL's cursor", 
   assert.deepEqual(asked, ["50", "50"]);
   assert.equal(result.returned, 100);
   assert.equal(result.billPages, 2);
-  assert.equal(result.nextPage, "cursor-3");
+  assert.equal(openCursor(String(result.nextPage)).cursor, "cursor-3");
 });
 
 /**
@@ -552,8 +562,9 @@ test("a partial page is asked of BILL as a partial page, so returned never excee
   const asked: string[] = [];
   const client = {
     listTransactions: async (p: { pageSize?: string }) => {
+      const from = asked.length * 50;
       asked.push(String(p.pageSize));
-      return { results: page(Number(p.pageSize)), nextPage: "more" };
+      return { results: page(Number(p.pageSize), from), nextPage: "more" };
     },
   };
   const { handler } = registeredTools(client).get("divvy_list_transactions")!;
@@ -562,7 +573,7 @@ test("a partial page is asked of BILL as a partial page, so returned never excee
   assert.deepEqual(asked, ["50", "20"]);
   assert.equal(result.returned, 70);
   assert.equal(result.billPages, 2);
-  assert.equal(result.nextPage, "more");
+  assert.equal(openCursor(String(result.nextPage)).cursor, "more");
 });
 
 /** The default is one BILL page's worth, so the everyday call stays one call. */
@@ -589,8 +600,9 @@ test("the walk stops once the rows in hand already fill the result budget", asyn
   let calls = 0;
   const client = {
     listTransactions: async (p: { pageSize?: string }) => {
+      const from = calls * 50;
       calls += 1;
-      return { results: page(Number(p.pageSize)), nextPage: `cursor-${calls + 1}` };
+      return { results: page(Number(p.pageSize), from), nextPage: `cursor-${calls + 1}` };
     },
   };
   const { handler } = registeredTools(client).get("divvy_list_transactions")!;
@@ -679,7 +691,7 @@ test("the custom-field values list pages — and its pageSize is bounded too", a
   const result = await listResult(handler, { customFieldId: "cf_1", page: "cursor-2", pageSize: 1 });
 
   assert.deepEqual(asked, [{ page: "cursor-2", pageSize: "1" }]);
-  assert.equal(result.nextPage, "next-cursor");
+  assert.equal(openCursor(String(result.nextPage)).cursor, "next-cursor");
   assert.equal((result.results as unknown[]).length, 1);
 
   const limits = billPagingLimits("customFieldValues");
@@ -745,7 +757,9 @@ test("asking for the custom fields asks BILL for a page, and can follow its curs
   assert.equal(first.returned, 100);
   assert.equal(first.hasMore, true);
   assert.equal(first.truncatedBy, "window");
-  assert.equal(first.nextPage, "100");
+  // BILL's own cursor, with the identity of the page it follows sealed onto it
+  // — and the request below shows it is BILL's own cursor that goes back out.
+  assert.equal(openCursor(String(first.nextPage)).cursor, "100");
   assert.match(String(first.note), /page: nextPage/);
 
   const second = await listResult(handler, { page: String(first.nextPage) });
@@ -984,7 +998,9 @@ test("a card listing that is short says it is short, and hands back a cursor tha
   assert.equal(first.returned, 100);
   assert.equal(first.hasMore, true);
   assert.equal(first.truncatedBy, "window");
-  assert.equal(first.nextPage, "100");
+  // BILL's own cursor, with the identity of the page it follows sealed onto it
+  // — and the request below shows it is BILL's own cursor that goes back out.
+  assert.equal(openCursor(String(first.nextPage)).cursor, "100");
   assert.match(String(first.note), /page: nextPage/);
 
   // The cursor is followable — which is the whole of the defect.

@@ -147,6 +147,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           const walked = await walkBillPages<Record<string, unknown>>({
             list: 'transactions',
             target: defaultPageSize('transactions', pageSize),
+            pageSizeAsked: pageSize === undefined ? undefined : String(pageSize),
             page,
             fetch: (p) => client.listTransactions({ filters: check.billParam, ...p }),
             keep: (rows) => check.keep(rows),
@@ -165,6 +166,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
               results: walked.rows,
               nextPage: walked.nextPage,
               ...(check.any ? { filtering: check.report() } : {}),
+              ...(walked.paging ? { paging: walked.paging } : {}),
             };
           }
           return buildCursorList({
@@ -174,6 +176,8 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
             nextPage: walked.nextPage,
             filters,
             filtering: check.any ? check.report() : undefined,
+            paging: walked.paging,
+            cursorStalled: walked.cursorStalled,
             billPages: walked.billPages,
           });
         },
@@ -270,6 +274,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           const walked = await walkBillPages<Record<string, unknown>>({
             list: 'customFields',
             target: defaultPageSize('customFields', pageSize),
+            pageSizeAsked: pageSize === undefined ? undefined : String(pageSize),
             page,
             fetch: (p) => client.listCustomFields(p),
             measure: (f) => compact(slimCustomField(f)).length,
@@ -282,6 +287,8 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
             nextPage: walked.nextPage,
             // A field definition carries no amount; there is nothing to sum.
             sumField: null,
+            paging: walked.paging,
+            cursorStalled: walked.cursorStalled,
             billPages: walked.billPages,
             witnesses:
               walked.rows.length === 0
@@ -316,12 +323,23 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           const walked = await walkBillPages<Record<string, unknown>>({
             list: 'customFieldValues',
             target: defaultPageSize('customFieldValues', pageSize),
+            pageSizeAsked: pageSize === undefined ? undefined : String(pageSize),
             page,
             fetch: (p) => client.listCustomFieldValues(customFieldId, p),
             measure: (v) => compact(v).length,
             budgetChars: rowBudget(),
           });
-          return { ...walked.last, results: walked.rows, nextPage: walked.nextPage };
+          // This one still hands BILL's envelope back (issue #55 owns widening
+          // it to the shared `returned`/`hasMore`/`empty` vocabulary), so the
+          // paging verdict rides beside it: a cursor that did not advance must
+          // be visible here of all places, since this is the tool it looped on.
+          return {
+            ...walked.last,
+            results: walked.rows,
+            nextPage: walked.nextPage,
+            ...(walked.paging ? { paging: walked.paging } : {}),
+            ...(walked.cursorStalled ? { truncatedBy: 'cursor' } : {}),
+          };
         },
         { narrowing: cursorNarrowing({ format: false }) },
       ),
@@ -376,6 +394,7 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           const walked = await walkBillPages<Record<string, unknown>>({
             list: 'cards',
             target: defaultPageSize('cards', pageSize),
+            pageSizeAsked: pageSize === undefined ? undefined : String(pageSize),
             page,
             fetch: (p) => client.listCards(p),
             measure: (card) => compact(format === 'raw' ? card : slimCard(card)).length,
@@ -383,7 +402,12 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           });
 
           if (format === 'raw') {
-            return { ...walked.last, results: walked.rows, nextPage: walked.nextPage };
+            return {
+              ...walked.last,
+              results: walked.rows,
+              nextPage: walked.nextPage,
+              ...(walked.paging ? { paging: walked.paging } : {}),
+            };
           }
           return buildCursorList({
             entity: 'Card',
@@ -394,6 +418,8 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
             // each card's own current period, and cards sharing a budget's
             // funds would be added together as if they were separate money.
             sumField: null,
+            paging: walked.paging,
+            cursorStalled: walked.cursorStalled,
             billPages: walked.billPages,
             witnesses: walked.rows.length === 0 ? await cardsNamedByTransactions(client) : undefined,
           });
